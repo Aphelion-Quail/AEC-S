@@ -1,23 +1,102 @@
 import { existsSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { Project, Task } from "./types.js";
-import { execChecked, execCommand } from "./exec.js";
+import { execChecked, execCommand, execCommandToFile } from "./exec.js";
 import { matchesAny } from "./glob.js";
 
 const projectLocks = new Map<string, Promise<void>>();
+const LOCK_RETRY_MS = 100;
+const LOCK_TIMEOUT_MS = 2 * 60 * 1_000;
+const LOCK_LEASE_MS = 30 * 60 * 1_000;
 
-export async function withProjectGitLock<T>(projectId: string, fn: () => Promise<T>): Promise<T> {
-  const previous = projectLocks.get(projectId) ?? Promise.resolve();
+export async function withProjectGitLock<T>(project: Project, fn: () => Promise<T>): Promise<T> {
+  const previous = projectLocks.get(project.id) ?? Promise.resolve();
   let release!: () => void;
   const current = new Promise<void>((resolve) => (release = resolve));
   const queued = previous.then(() => current);
-  projectLocks.set(projectId, queued);
+  projectLocks.set(project.id, queued);
   await previous;
+  let lock: { databasePath: string; token: string } | undefined;
   try {
+    lock = await acquireProjectFileLock(project);
     return await fn();
   } finally {
+    if (lock) releaseProjectFileLock(lock);
     release();
-    if (projectLocks.get(projectId) === queued) projectLocks.delete(projectId);
+    if (projectLocks.get(project.id) === queued) projectLocks.delete(project.id);
+  }
+}
+
+async function acquireProjectFileLock(project: Project): Promise<{ databasePath: string; token: string }> {
+  const commonDirValue = await execChecked(git(project.repoPath, ["rev-parse", "--git-common-dir"]));
+  const commonDir = isAbsolute(commonDirValue) ? commonDirValue : resolve(project.repoPath, commonDirValue);
+  const databasePath = join(commonDir, "aec-project-git-lock.sqlite");
+  const token = `${process.pid}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
+  const lockDb = new DatabaseSync(databasePath);
+  lockDb.exec("PRAGMA busy_timeout=1000");
+  lockDb.exec(`CREATE TABLE IF NOT EXISTS project_lock (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT,
+    pid INTEGER,
+    lease_until INTEGER
+  )`);
+  lockDb.prepare("INSERT OR IGNORE INTO project_lock(id, owner, pid, lease_until) VALUES (1, NULL, NULL, NULL)").run();
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+  try {
+    while (Date.now() < deadline) {
+      let transactionOpen = false;
+      try {
+        lockDb.exec("BEGIN IMMEDIATE");
+        transactionOpen = true;
+        const row = lockDb.prepare("SELECT owner, pid, lease_until FROM project_lock WHERE id=1").get() as
+          | { owner: string | null; pid: number | null; lease_until: number | null }
+          | undefined;
+        const expired = !row?.owner || !row.lease_until || row.lease_until <= Date.now();
+        const dead = row?.pid ? !processIsAlive(row.pid) : true;
+        if (expired || dead) {
+          lockDb.prepare("UPDATE project_lock SET owner=?, pid=?, lease_until=? WHERE id=1")
+            .run(token, process.pid, Date.now() + LOCK_LEASE_MS);
+          lockDb.exec("COMMIT");
+          transactionOpen = false;
+          lockDb.close();
+          return { databasePath, token };
+        }
+        lockDb.exec("COMMIT");
+        transactionOpen = false;
+      } catch (error) {
+        if (transactionOpen) {
+          try { lockDb.exec("ROLLBACK"); } catch { /* connection may already have rolled back */ }
+        }
+        const code = (error as { code?: string }).code;
+        if (code !== "SQLITE_BUSY" && code !== "SQLITE_LOCKED") throw error;
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, LOCK_RETRY_MS));
+    }
+  } finally {
+    try {
+      lockDb.close();
+    } catch { /* already closed after successful acquisition */ }
+  }
+  throw new Error(`Timed out waiting for Project Git lock: ${project.id}`);
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseProjectFileLock(lock: { databasePath: string; token: string }): void {
+  const lockDb = new DatabaseSync(lock.databasePath);
+  try {
+    lockDb.exec("PRAGMA busy_timeout=5000");
+    lockDb.prepare("UPDATE project_lock SET owner=NULL, pid=NULL, lease_until=NULL WHERE id=1 AND owner=?").run(lock.token);
+  } finally {
+    lockDb.close();
   }
 }
 
@@ -47,12 +126,17 @@ export async function createWorktree(
   workspacePath: string,
   branch: string,
 ): Promise<string> {
-  return await withProjectGitLock(project.id, async () => {
+  return await withProjectGitLock(project, async () => {
     await assertGitRepository(project.repoPath);
     if (project.deliveryMode === "github") await execChecked(git(project.repoPath, ["fetch", project.remoteName, project.targetBranch], 300));
     const baseRef = projectBaseRef(project);
     const baseSha = await branchHead(project.repoPath, baseRef);
-    if (existsSync(join(workspacePath, ".git"))) return baseSha;
+    if (existsSync(join(workspacePath, ".git"))) {
+      // A recovered worktree may predate the current target HEAD. Its merge-base
+      // is the source fact for the existing diff; returning the new target here
+      // would silently fold unrelated commits into the task.
+      return await execChecked(git(workspacePath, ["merge-base", "HEAD", baseRef]));
+    }
     const branchExists = (await execCommand(git(project.repoPath, ["show-ref", "--verify", `refs/heads/${branch}`]))).exitCode === 0;
     const args = branchExists
       ? ["worktree", "add", workspacePath, branch]
@@ -63,27 +147,47 @@ export async function createWorktree(
 }
 
 export async function changedPaths(workspacePath: string, baseSha: string): Promise<string[]> {
-  const tracked = await execChecked(git(workspacePath, ["diff", "--name-only", baseSha, "--"]));
-  const status = await execChecked(git(workspacePath, ["status", "--porcelain", "--untracked-files=all"]));
+  const tracked = await execCommand(git(workspacePath, ["diff", "--name-only", "-z", baseSha, "--"]));
+  if (tracked.exitCode !== 0) throw new Error(tracked.stderr.trim() || "Unable to inspect changed paths");
+  const status = await execCommand(
+    git(workspacePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+  );
+  if (status.exitCode !== 0) throw new Error(status.stderr.trim() || "Unable to inspect workspace status");
   const paths = new Set<string>();
-  for (const line of tracked.split(/\r?\n/)) if (line.trim()) paths.add(line.trim());
-  for (const line of status.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    const value = line.slice(3).trim();
-    const path = value.includes(" -> ") ? value.split(" -> ").at(-1)! : value;
-    paths.add(path.replace(/^"|"$/g, ""));
+  for (const path of tracked.stdout.split("\0")) if (path) paths.add(path);
+  const entries = status.stdout.split("\0");
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    if (!entry) continue;
+    const code = entry.slice(0, 2);
+    const path = entry.slice(3);
+    if (path) paths.add(path);
+    if (code.includes("R") || code.includes("C")) {
+      const sourcePath = entries[index + 1];
+      if (sourcePath) paths.add(sourcePath);
+      index += 1;
+    }
   }
   return [...paths].sort();
 }
 
+export async function workspaceHasChanges(workspacePath: string): Promise<boolean> {
+  const result = await execCommand(
+    git(workspacePath, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]),
+  );
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Unable to inspect workspace status");
+  return result.stdout.length > 0;
+}
+
 export async function changedPathsBetween(repoPath: string, fromSha: string, toSha: string): Promise<string[]> {
   if (fromSha === toSha) return [];
-  const output = await execChecked(git(repoPath, ["diff", "--name-only", `${fromSha}..${toSha}`, "--"]));
-  return output.split(/\r?\n/).map((value) => value.trim()).filter(Boolean).sort();
+  const result = await execCommand(git(repoPath, ["diff", "--name-only", "-z", `${fromSha}..${toSha}`, "--"]));
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Unable to inspect target changes");
+  return result.stdout.split("\0").filter(Boolean).sort();
 }
 
 export function outOfScopePaths(task: Task, paths: string[]): string[] {
-  if (task.scope.writeGlobs.length === 0) return paths;
+  if (task.scope.writeGlobs.length === 0) return [];
   return paths.filter((path) => !matchesAny(path, task.scope.writeGlobs));
 }
 
@@ -93,19 +197,25 @@ export function changesAffectTask(task: Task, paths: string[]): boolean {
   return paths.some((path) => matchesAny(path, relevant));
 }
 
-export async function writeDiff(workspacePath: string, baseSha: string): Promise<string> {
+export async function writeDiff(workspacePath: string, baseSha: string, outputPath: string): Promise<void> {
   await execChecked(git(workspacePath, ["add", "--all"]));
-  return await execChecked(git(workspacePath, ["diff", "--cached", "--binary", baseSha, "--"]));
+  const result = await execCommandToFile(
+    git(workspacePath, ["diff", "--cached", "--binary", baseSha, "--"]),
+    outputPath,
+  );
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Unable to write task diff");
 }
 
 export async function commitTask(workspacePath: string, task: Task): Promise<string> {
-  const existing = await execCommand(git(workspacePath, ["log", "-1", "--format=%B"]));
-  if (existing.exitCode === 0 && existing.stdout.includes(`AEC-Task: ${task.id}`)) {
-    return await branchHead(workspacePath, "HEAD");
-  }
   await execChecked(git(workspacePath, ["add", "--all"]));
   const staged = await execCommand(git(workspacePath, ["diff", "--cached", "--quiet"]));
-  if (staged.exitCode === 0) throw new Error("Task produced no changes to commit");
+  if (staged.exitCode === 0) {
+    const existing = await execCommand(git(workspacePath, ["log", "-1", "--format=%B"]));
+    if (existing.exitCode === 0 && existing.stdout.includes(`AEC-Task: ${task.id}`)) {
+      return await branchHead(workspacePath, "HEAD");
+    }
+    throw new Error("Task produced no changes to commit");
+  }
   await execChecked({
     ...git(workspacePath, [
       "-c",
@@ -124,7 +234,7 @@ export async function commitTask(workspacePath: string, task: Task): Promise<str
 }
 
 export async function rebaseOntoTarget(project: Project, workspacePath: string): Promise<void> {
-  await withProjectGitLock(project.id, async () => {
+  await withProjectGitLock(project, async () => {
     await execChecked({ ...git(workspacePath, ["rebase", projectBaseRef(project)]), timeoutSeconds: 300 });
   });
 }
@@ -150,7 +260,7 @@ export async function abortRebase(workspacePath: string): Promise<void> {
 }
 
 export async function localMerge(project: Project, branch: string, expectedTaskSha: string): Promise<string> {
-  return await withProjectGitLock(project.id, async () => {
+  return await withProjectGitLock(project, async () => {
     const currentHead = await branchHead(project.repoPath, project.targetBranch);
     if (currentHead === expectedTaskSha) return currentHead;
     const checkedOut = await currentBranch(project.repoPath);
@@ -165,7 +275,7 @@ export async function localMerge(project: Project, branch: string, expectedTaskS
 }
 
 export async function cleanupWorktree(project: Project, workspacePath: string, branch?: string): Promise<void> {
-  await withProjectGitLock(project.id, async () => {
+  await withProjectGitLock(project, async () => {
     if (existsSync(workspacePath)) {
       await execChecked(git(project.repoPath, ["worktree", "remove", "--force", workspacePath]));
     }
@@ -176,7 +286,12 @@ export async function cleanupWorktree(project: Project, workspacePath: string, b
 
 export async function fetchRemote(project: Project): Promise<void> {
   if (!project.remoteName) return;
-  await withProjectGitLock(project.id, async () => {
-    await execChecked({ ...git(project.repoPath, ["fetch", project.remoteName, project.targetBranch]), timeoutSeconds: 300 });
+  await withProjectGitLock(project, async () => {
+    await fetchRemoteUnlocked(project);
   });
+}
+
+export async function fetchRemoteUnlocked(project: Project): Promise<void> {
+  if (!project.remoteName) return;
+  await execChecked({ ...git(project.repoPath, ["fetch", project.remoteName, project.targetBranch]), timeoutSeconds: 300 });
 }

@@ -2,12 +2,14 @@ import { DatabaseSync } from "node:sqlite";
 import type {
   Agent,
   AgentInput,
+  AgentUpdate,
   Decision,
   DecisionInput,
   EventRecord,
   JsonObject,
   Project,
   ProjectInput,
+  ProjectUpdate,
   Run,
   Task,
   TaskInput,
@@ -15,6 +17,7 @@ import type {
   Workspace,
   WorkspaceStatus,
 } from "./types.js";
+import { agentInputSchema, decisionInputSchema, projectInputSchema, taskInputSchema } from "./input.js";
 import { newId, nowIso } from "./ids.js";
 import { ensureAecPaths, getAecPaths, type AecPaths } from "./paths.js";
 
@@ -48,19 +51,37 @@ export class AecDatabase {
     this.db.close();
   }
 
+  private transactionDepth = 0;
+
   transaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE");
+    const outermost = this.transactionDepth === 0;
+    const savepoint = `aec_nested_${this.transactionDepth}`;
+    if (outermost) this.db.exec("BEGIN IMMEDIATE");
+    else this.db.exec(`SAVEPOINT ${savepoint}`);
+    this.transactionDepth += 1;
     try {
       const value = fn();
-      this.db.exec("COMMIT");
+      if (outermost) this.db.exec("COMMIT");
+      else this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
       return value;
     } catch (error) {
-      this.db.exec("ROLLBACK");
+      if (outermost) this.db.exec("ROLLBACK");
+      else {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        this.db.exec(`RELEASE SAVEPOINT ${savepoint}`);
+      }
       throw error;
+    } finally {
+      this.transactionDepth -= 1;
     }
   }
 
   private migrate(): void {
+    const currentVersion = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version ?? 0);
+    const latestVersion = 4;
+    if (currentVersion > latestVersion) {
+      throw new Error(`AEC database schema ${currentVersion} is newer than supported schema ${latestVersion}`);
+    }
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
@@ -125,6 +146,8 @@ export class AecDatabase {
         rotation_count INTEGER NOT NULL,
         base_sha TEXT NOT NULL,
         codex_session_id TEXT,
+        worker_result_json TEXT,
+        worker_result_path TEXT,
         validation_json TEXT NOT NULL,
         review_json TEXT,
         effects_json TEXT NOT NULL,
@@ -175,6 +198,18 @@ export class AecDatabase {
         resolved_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS agent_leases (
+        job_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status, priority, created_at);
       CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, started_at);
       CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, lease_until);
@@ -185,9 +220,20 @@ export class AecDatabase {
     if (!runColumns.some((column) => column.name === "lease_owner")) {
       this.db.exec("ALTER TABLE runs ADD COLUMN lease_owner TEXT");
     }
+    if (!runColumns.some((column) => column.name === "worker_result_json")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_json TEXT");
+    }
+    if (!runColumns.some((column) => column.name === "worker_result_path")) {
+      this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_path TEXT");
+    }
+    const appliedAt = nowIso();
+    const migration = this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)");
+    for (let version = currentVersion + 1; version <= latestVersion; version += 1) migration.run(version, appliedAt);
+    this.db.exec(`PRAGMA user_version = ${latestVersion}`);
   }
 
   createProject(input: ProjectInput): Project {
+    input = projectInputSchema.parse(input) as ProjectInput;
     const project: Project = {
       id: input.id ?? newId("project"),
       name: input.name,
@@ -204,7 +250,11 @@ export class AecDatabase {
       createdAt: nowIso(),
     };
     this.db
-      .prepare(`INSERT INTO projects VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .prepare(`INSERT INTO projects(
+        id, name, repo_path, target_branch, remote_name, delivery_mode, intent,
+        default_validation_json, full_validation_json, required_checks_json,
+        high_risk_globs_json, max_concurrency, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         project.id,
         project.name,
@@ -240,6 +290,29 @@ export class AecDatabase {
     );
   }
 
+  updateProject(id: string, patch: ProjectUpdate): Project {
+    const current = this.getProject(id);
+    if (!current) throw new Error(`Project not found: ${id}`);
+    const { createdAt: _createdAt, ...currentInput } = current;
+    const next = projectInputSchema.parse({ ...currentInput, ...patch, id, name: current.name, repoPath: current.repoPath }) as ProjectInput;
+    this.db.prepare(`UPDATE projects SET target_branch=?, remote_name=?, delivery_mode=?, intent=?,
+      default_validation_json=?, full_validation_json=?, required_checks_json=?, high_risk_globs_json=?, max_concurrency=? WHERE id=?`)
+      .run(
+        next.targetBranch ?? current.targetBranch,
+        next.remoteName ?? current.remoteName,
+        next.deliveryMode ?? current.deliveryMode,
+        next.intent ?? current.intent,
+        JSON.stringify(next.defaultValidation ?? current.defaultValidation),
+        JSON.stringify(next.fullValidation ?? current.fullValidation),
+        JSON.stringify(next.requiredChecks ?? current.requiredChecks),
+        JSON.stringify(next.highRiskGlobs ?? current.highRiskGlobs),
+        next.maxConcurrency ?? current.maxConcurrency,
+        id,
+      );
+    this.appendEvent({ projectId: id, type: "project.updated", payload: { fields: Object.keys(patch) } });
+    return this.getProject(id)!;
+  }
+
   private projectFromRow(row: Row): Project {
     return {
       id: String(row.id),
@@ -259,6 +332,7 @@ export class AecDatabase {
   }
 
   createTask(input: TaskInput): Task {
+    input = taskInputSchema.parse(input) as TaskInput;
     const timestamp = nowIso();
     const task: Task = {
       id: input.id ?? newId("task"),
@@ -333,13 +407,15 @@ export class AecDatabase {
     ).map((row) => this.taskFromRow(row));
   }
 
-  updateTaskStatus(id: string, status: TaskStatus, extra?: { summary?: string; mergeSha?: string }): void {
+  updateTaskStatus(id: string, status: TaskStatus, extra?: { summary?: string | null; mergeSha?: string | null }): void {
     const task = this.getTask(id);
     if (!task) throw new Error(`Task not found: ${id}`);
     const updatedAt = nowIso();
+    const summary = extra && Object.hasOwn(extra, "summary") ? extra.summary ?? null : task.terminalSummary ?? null;
+    const mergeSha = extra && Object.hasOwn(extra, "mergeSha") ? extra.mergeSha ?? null : task.mergeSha ?? null;
     this.db
-      .prepare("UPDATE tasks SET status = ?, terminal_summary = COALESCE(?, terminal_summary), merge_sha = COALESCE(?, merge_sha), updated_at = ? WHERE id = ?")
-      .run(status, extra?.summary ?? null, extra?.mergeSha ?? null, updatedAt, id);
+      .prepare("UPDATE tasks SET status = ?, terminal_summary = ?, merge_sha = ?, updated_at = ? WHERE id = ?")
+      .run(status, summary, mergeSha, updatedAt, id);
     this.appendEvent({
       projectId: task.projectId,
       taskId: id,
@@ -373,6 +449,7 @@ export class AecDatabase {
   }
 
   createAgent(input: AgentInput): Agent {
+    input = agentInputSchema.parse(input) as AgentInput;
     const agent: Agent = {
       id: input.id ?? newId("agent"),
       name: input.name,
@@ -386,7 +463,10 @@ export class AecDatabase {
       config: input.config ?? {},
     };
     this.db
-      .prepare("INSERT INTO agents VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .prepare(`INSERT INTO agents(
+        id, name, adapter, roles_json, capabilities_json, enabled, availability,
+        max_concurrency, current_load, config_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         agent.id,
         agent.name,
@@ -412,8 +492,68 @@ export class AecDatabase {
     return (this.db.prepare("SELECT * FROM agents ORDER BY name, id").all() as Row[]).map((row) => this.agentFromRow(row));
   }
 
-  setAgentLoad(id: string, load: number): void {
-    this.db.prepare("UPDATE agents SET current_load = ? WHERE id = ?").run(load, id);
+  updateAgent(id: string, patch: AgentUpdate): Agent {
+    const current = this.getAgent(id);
+    if (!current) throw new Error(`Agent not found: ${id}`);
+    const { currentLoad: _currentLoad, ...currentInput } = current;
+    const next = agentInputSchema.parse({ ...currentInput, ...patch, id, name: current.name, adapter: current.adapter }) as AgentInput;
+    this.db.prepare(`UPDATE agents SET roles_json=?, capabilities_json=?, enabled=?, availability=?,
+      max_concurrency=?, config_json=? WHERE id=?`)
+      .run(
+        JSON.stringify(next.roles ?? current.roles),
+        JSON.stringify(next.capabilities ?? current.capabilities),
+        (next.enabled ?? current.enabled) ? 1 : 0,
+        next.availability ?? current.availability,
+        next.maxConcurrency ?? current.maxConcurrency,
+        JSON.stringify(next.config ?? current.config),
+        id,
+      );
+    this.appendEvent({ type: "agent.updated", payload: { agentId: id, fields: Object.keys(patch) } });
+    return this.getAgent(id)!;
+  }
+
+  reserveAgentSlot(agentId: string, runId: string, jobId: string): boolean {
+    return this.transaction(() => {
+      const agent = this.getAgent(agentId);
+      if (!agent || !agent.enabled || agent.availability !== "available") return false;
+      const count = Number((this.db.prepare("SELECT COUNT(*) AS count FROM agent_leases WHERE agent_id=?").get(agentId) as Row).count);
+      if (count >= agent.maxConcurrency) return false;
+      const result = this.db.prepare("INSERT OR IGNORE INTO agent_leases(job_id, agent_id, run_id, created_at) VALUES (?, ?, ?, ?)")
+        .run(jobId, agentId, runId, nowIso());
+      this.db.prepare("UPDATE agents SET current_load=(SELECT COUNT(*) FROM agent_leases WHERE agent_id=?) WHERE id=?")
+        .run(agentId, agentId);
+      return result.changes === 1;
+    });
+  }
+
+  ensureAgentSlot(agentId: string, runId: string, jobId: string): void {
+    this.transaction(() => {
+      this.db.prepare("INSERT OR IGNORE INTO agent_leases(job_id, agent_id, run_id, created_at) VALUES (?, ?, ?, ?)")
+        .run(jobId, agentId, runId, nowIso());
+      this.db.prepare("UPDATE agents SET current_load=(SELECT COUNT(*) FROM agent_leases WHERE agent_id=?) WHERE id=?")
+        .run(agentId, agentId);
+    });
+  }
+
+  releaseAgentSlot(jobId: string): void {
+    this.transaction(() => {
+      const row = this.db.prepare("SELECT agent_id FROM agent_leases WHERE job_id=?").get(jobId) as Row | undefined;
+      this.db.prepare("DELETE FROM agent_leases WHERE job_id=?").run(jobId);
+      if (row) {
+        const agentId = String(row.agent_id);
+        this.db.prepare("UPDATE agents SET current_load=(SELECT COUNT(*) FROM agent_leases WHERE agent_id=?) WHERE id=?")
+          .run(agentId, agentId);
+      }
+    });
+  }
+
+  listAgentLeases(): Array<{ jobId: string; agentId: string; runId: string; createdAt: string }> {
+    return (this.db.prepare("SELECT * FROM agent_leases ORDER BY created_at").all() as Row[]).map((row) => ({
+      jobId: String(row.job_id),
+      agentId: String(row.agent_id),
+      runId: String(row.run_id),
+      createdAt: String(row.created_at),
+    }));
   }
 
   private agentFromRow(row: Row): Agent {
@@ -435,9 +575,9 @@ export class AecDatabase {
     this.db
       .prepare(`INSERT INTO runs (
         id, task_id, agent_id, workspace_id, phase, status, attempt, repair_count,
-        rotation_count, base_sha, codex_session_id, validation_json, review_json,
+        rotation_count, base_sha, codex_session_id, worker_result_json, worker_result_path, validation_json, review_json,
         effects_json, job_json, log_dir, diff_path, error_json, started_at, updated_at, lease_until, lease_owner
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(...this.runValues(run));
     const task = this.getTask(run.taskId);
     this.appendEvent({
@@ -450,15 +590,24 @@ export class AecDatabase {
     return run;
   }
 
-  saveRun(run: Run): void {
+  saveRun(run: Run, expectedOwner = run.leaseOwner): boolean {
     const values = this.runValues(run);
-    this.db
+    const result = this.db
       .prepare(`UPDATE runs SET
         task_id=?, agent_id=?, workspace_id=?, phase=?, status=?, attempt=?, repair_count=?,
-        rotation_count=?, base_sha=?, codex_session_id=?, validation_json=?, review_json=?,
+        rotation_count=?, base_sha=?, codex_session_id=?, worker_result_json=?, worker_result_path=?, validation_json=?, review_json=?,
         effects_json=?, job_json=?, log_dir=?, diff_path=?, error_json=?, started_at=?, updated_at=?, lease_until=?, lease_owner=?
-        WHERE id=?`)
-      .run(...values.slice(1), run.id);
+        WHERE id=? AND lease_owner IS ?`)
+      .run(...values.slice(1), run.id, expectedOwner ?? null);
+    return result.changes === 1;
+  }
+
+  resumeInterruptedRun(id: string, owner: string, leaseUntil: string): boolean {
+    const result = this.db
+      .prepare(`UPDATE runs SET status='active', lease_owner=?, lease_until=?, updated_at=?
+        WHERE id=? AND status='interrupted' AND lease_owner IS NULL`)
+      .run(owner, leaseUntil, nowIso(), id);
+    return result.changes === 1;
   }
 
   private runValues(run: Run): SqlValue[] {
@@ -474,6 +623,8 @@ export class AecDatabase {
       run.rotationCount,
       run.baseSha,
       run.codexSessionId ?? null,
+      run.workerResult ? JSON.stringify(run.workerResult) : null,
+      run.workerResultPath ?? null,
       JSON.stringify(run.validation),
       run.review ? JSON.stringify(run.review) : null,
       JSON.stringify(run.effects),
@@ -496,6 +647,13 @@ export class AecDatabase {
     return result.changes === 1;
   }
 
+  renewRunLease(id: string, owner: string, leaseUntil: string): boolean {
+    const result = this.db
+      .prepare("UPDATE runs SET lease_until = ?, updated_at = ? WHERE id = ? AND status = 'active' AND lease_owner = ?")
+      .run(leaseUntil, nowIso(), id, owner);
+    return result.changes === 1;
+  }
+
   getRun(id: string): Run | undefined {
     const row = this.db.prepare("SELECT * FROM runs WHERE id = ?").get(id) as Row | undefined;
     return row ? this.runFromRow(row) : undefined;
@@ -513,8 +671,23 @@ export class AecDatabase {
     return rows.map((row) => this.runFromRow(row));
   }
 
+  listLatestRuns(projectId?: string): Run[] {
+    const sql = `SELECT runs.* FROM runs
+      JOIN tasks ON tasks.id = runs.task_id
+      WHERE runs.id = (
+        SELECT candidate.id FROM runs AS candidate
+        WHERE candidate.task_id = runs.task_id
+        ORDER BY candidate.started_at DESC, candidate.rowid DESC LIMIT 1
+      )${projectId ? " AND tasks.project_id = ?" : ""}
+      ORDER BY runs.started_at`;
+    const rows = projectId
+      ? this.db.prepare(sql).all(projectId) as Row[]
+      : this.db.prepare(sql).all() as Row[];
+    return rows.map((row) => this.runFromRow(row));
+  }
+
   listActiveRuns(): Run[] {
-    return (this.db.prepare("SELECT * FROM runs WHERE status = 'active' ORDER BY started_at").all() as Row[]).map((row) =>
+    return (this.db.prepare("SELECT * FROM runs WHERE status = 'active' OR (status = 'interrupted' AND phase = 'cleanup') ORDER BY started_at").all() as Row[]).map((row) =>
       this.runFromRow(row),
     );
   }
@@ -532,6 +705,8 @@ export class AecDatabase {
       rotationCount: Number(row.rotation_count),
       baseSha: String(row.base_sha),
       ...(row.codex_session_id ? { codexSessionId: String(row.codex_session_id) } : {}),
+      ...(row.worker_result_json ? { workerResult: json(row.worker_result_json, undefined) } : {}),
+      ...(row.worker_result_path ? { workerResultPath: String(row.worker_result_path) } : {}),
       validation: json(row.validation_json, []),
       ...(row.review_json ? { review: json(row.review_json, undefined) } : {}),
       effects: json(row.effects_json, {}),
@@ -548,7 +723,9 @@ export class AecDatabase {
 
   createWorkspace(workspace: Workspace): Workspace {
     this.db
-      .prepare("INSERT INTO workspaces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .prepare(`INSERT INTO workspaces(
+        id, project_id, task_id, run_id, path, branch, base_sha, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         workspace.id,
         workspace.projectId,
@@ -593,6 +770,14 @@ export class AecDatabase {
   }
 
   createDecision(input: DecisionInput): Decision {
+    input = decisionInputSchema.parse(input) as DecisionInput;
+    const project = this.getProject(input.projectId);
+    if (!project) throw new Error(`Project not found: ${input.projectId}`);
+    if (input.taskId) {
+      const task = this.getTask(input.taskId);
+      if (!task) throw new Error(`Task not found: ${input.taskId}`);
+      if (task.projectId !== input.projectId) throw new Error("Decision Task must belong to the same Project");
+    }
     const decision: Decision = {
       id: input.id ?? newId("decision"),
       projectId: input.projectId,
@@ -607,7 +792,10 @@ export class AecDatabase {
       ...(input.status === "resolved" ? { resolvedAt: nowIso() } : {}),
     };
     this.db
-      .prepare("INSERT INTO decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .prepare(`INSERT INTO decisions(
+        id, project_id, task_id, kind, status, title, body, options_json,
+        resolution_json, created_at, resolved_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         decision.id,
         decision.projectId,
@@ -655,10 +843,12 @@ export class AecDatabase {
   resolveDecision(id: string, resolution: JsonObject): Decision {
     const decision = this.getDecision(id);
     if (!decision) throw new Error(`Decision not found: ${id}`);
+    if (decision.status === "resolved") throw new Error(`Decision is already resolved: ${id}`);
     const resolvedAt = nowIso();
-    this.db
-      .prepare("UPDATE decisions SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ?")
+    const result = this.db
+      .prepare("UPDATE decisions SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ? AND status = 'pending'")
       .run(JSON.stringify(resolution), resolvedAt, id);
+    if (result.changes !== 1) throw new Error(`Decision is already resolved: ${id}`);
     this.appendEvent({
       projectId: decision.projectId,
       taskId: decision.taskId,
@@ -719,11 +909,17 @@ export class AecDatabase {
     }));
   }
 
+  pruneEvents(retain = 50_000): number {
+    const result = this.db.prepare(`DELETE FROM events WHERE id < COALESCE(
+      (SELECT id FROM events ORDER BY id DESC LIMIT 1 OFFSET ?), 0
+    )`).run(Math.max(0, retain - 1));
+    return Number(result.changes);
+  }
+
   statusSnapshot(projectId?: string): JsonObject {
     const projects = projectId ? [this.getProject(projectId)].filter(Boolean) : this.listProjects();
     const tasks = this.listTasks(projectId);
-    const taskIds = new Set(tasks.map((task) => task.id));
-    const runs = this.listRuns().filter((run) => taskIds.has(run.taskId));
+    const runs = this.listLatestRuns(projectId);
     return {
       projects,
       tasks,

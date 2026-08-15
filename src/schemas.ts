@@ -3,11 +3,20 @@ import { writeJsonAtomic } from "./files.js";
 export const workerResultSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["status", "summary", "notes"],
+  required: ["status", "summary", "notes", "blocker"],
   properties: {
     status: { type: "string", enum: ["complete", "blocked"] },
     summary: { type: "string" },
     notes: { type: "array", items: { type: "string" } },
+    blocker: {
+      type: ["object", "null"],
+      additionalProperties: false,
+      required: ["kind", "question"],
+      properties: {
+        kind: { type: "string", enum: ["technical", "architecture", "product", "tradeoff"] },
+        question: { type: "string" },
+      },
+    },
   },
 } as const;
 
@@ -23,13 +32,13 @@ export const reviewResultSchema = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["severity", "summary"],
+        required: ["severity", "summary", "file", "line", "requiredChange"],
         properties: {
           severity: { type: "string", enum: ["blocking", "warning"] },
           summary: { type: "string" },
-          file: { type: "string" },
-          line: { type: "integer", minimum: 1 },
-          requiredChange: { type: "string" },
+          file: { type: ["string", "null"] },
+          line: { type: ["integer", "null"], minimum: 1 },
+          requiredChange: { type: ["string", "null"] },
         },
       },
     },

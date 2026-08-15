@@ -1,10 +1,28 @@
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
+import { after } from "node:test";
+import { fileURLToPath } from "node:url";
+
+const temporaryDirectories: string[] = [];
+
+after(() => {
+  for (const directory of temporaryDirectories.reverse()) rmSync(directory, { recursive: true, force: true });
+});
 
 export function tempDir(prefix: string): string {
-  return mkdtempSync(join(tmpdir(), prefix));
+  const directory = mkdtempSync(join(tmpdir(), prefix));
+  temporaryDirectories.push(directory);
+  return directory;
+}
+
+export function builtCliPath(): string {
+  return fileURLToPath(new URL("../src/cli.js", import.meta.url));
+}
+
+export function fixturePath(name: string): string {
+  return fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url));
 }
 
 export function createGitRepository(): string {

@@ -1,14 +1,15 @@
 import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import type { JobInput, JobResult, JobState } from "./types.js";
 import { newId, nowIso } from "./ids.js";
 import { readJson, writeJsonAtomic } from "./files.js";
+import { jobInputSchema } from "./input.js";
 
 export async function runJobFile(inputPath: string): Promise<void> {
-  const input = readJson<JobInput>(inputPath);
+  const input = jobInputSchema.parse(readJson<unknown>(inputPath)) as JobInput;
   mkdirSync(dirname(input.stdoutPath), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(input.stderrPath), { recursive: true, mode: 0o700 });
   const startedAt = nowIso();
@@ -27,13 +28,14 @@ export async function runJobFile(inputPath: string): Promise<void> {
       cwd: input.command.cwd,
       env: { ...process.env, ...input.command.env },
       stdio: ["pipe", stdout, stderr],
+      detached: process.platform !== "win32",
     });
     let timedOut = false;
     let forceKill: NodeJS.Timeout | undefined;
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      forceKill = setTimeout(() => child.kill("SIGKILL"), 2_000);
+      killProcessTree(child.pid, "SIGTERM", () => child.kill("SIGTERM"));
+      forceKill = setTimeout(() => killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL")), 2_000);
       forceKill.unref();
     }, (input.command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
@@ -66,16 +68,42 @@ export async function runJobFile(inputPath: string): Promise<void> {
   }
 }
 
-function processAlive(pid: number): boolean {
+const processStateCache = new Map<number, { checkedAt: number; alive: boolean }>();
+
+export function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  const cached = processStateCache.get(pid);
+  if (cached && Date.now() - cached.checkedAt < 1_000) return cached.alive;
+  let alive = true;
+  if (process.platform !== "win32") {
+    const status = spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 1_000,
+    });
+    const state = status.stdout.trim();
+    alive = status.status === 0 && state.length > 0 && !state.startsWith("Z");
+  }
+  processStateCache.set(pid, { checkedAt: Date.now(), alive });
+  return alive;
 }
 
-export function startSupervisedJob(input: JobInput, inputPath: string): JobState {
+function killProcessTree(pid: number | undefined, signal: NodeJS.Signals, fallback: () => boolean): void {
+  if (!pid || process.platform === "win32") {
+    fallback();
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    fallback();
+  }
+}
+
+export function startSupervisedJob(input: JobInput, inputPath: string, jobId = newId("job")): JobState {
   writeJsonAtomic(inputPath, input);
   const compiledEntry = fileURLToPath(new URL("./cli.js", import.meta.url));
   const entry = process.env.AEC_CLI_ENTRY ?? (existsSync(compiledEntry) ? compiledEntry : process.argv[1]);
@@ -86,7 +114,7 @@ export function startSupervisedJob(input: JobInput, inputPath: string): JobState
   });
   child.unref();
   return {
-    id: newId("job"),
+    id: jobId,
     inputPath,
     resultPath: input.resultPath,
     ...(child.pid ? { pid: child.pid } : {}),
@@ -94,9 +122,18 @@ export function startSupervisedJob(input: JobInput, inputPath: string): JobState
   };
 }
 
-export async function waitForJob(job: JobState, timeoutSeconds: number): Promise<JobResult> {
+export async function waitForJob(
+  job: JobState,
+  timeoutSeconds: number,
+  heartbeat?: () => void,
+): Promise<JobResult> {
   const deadline = Date.now() + timeoutSeconds * 1_000 + 5_000;
+  let nextHeartbeat = Date.now();
   while (Date.now() < deadline) {
+    if (heartbeat && Date.now() >= nextHeartbeat) {
+      heartbeat();
+      nextHeartbeat = Date.now() + 10_000;
+    }
     if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
     if (job.pid && !processAlive(job.pid)) {
       await new Promise((resolve) => setTimeout(resolve, 100));

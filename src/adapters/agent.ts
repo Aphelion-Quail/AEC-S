@@ -88,7 +88,19 @@ class CodexAdapter implements AgentAdapter {
     const output = join(options.runDir, `${options.kind}-result-${Date.now()}.json`);
     const model = typeof this.agent.config.model === "string" ? this.agent.config.model : undefined;
     const ignoreUserConfig = this.agent.config.ignoreUserConfig === true;
-    const common = ["--ask-for-approval", "never", "exec"];
+    const sandbox = options.kind === "review" ? "read-only" : "workspace-write";
+    // These are Codex global options, so they must precede `exec`. In particular,
+    // `exec resume` does not expose its own --sandbox/--cd flags and must receive
+    // the same explicit boundary as a fresh invocation.
+    const common = [
+      "--ask-for-approval",
+      "never",
+      "--sandbox",
+      sandbox,
+      "--cd",
+      options.workspacePath,
+      "exec",
+    ];
     if (options.kind === "repair" && options.sessionId) {
       const args = [
         ...common,
@@ -109,18 +121,13 @@ class CodexAdapter implements AgentAdapter {
         structuredOutputPath: output,
       };
     }
-    const sandbox = options.kind === "review" ? "read-only" : "workspace-write";
     const args = [
       ...common,
       "--json",
-      "--sandbox",
-      sandbox,
       "--output-schema",
       options.schemaPath,
       "--output-last-message",
       output,
-      "--cd",
-      options.workspacePath,
       ...(model ? ["--model", model] : []),
       ...(ignoreUserConfig ? ["--ignore-user-config"] : []),
       "-",

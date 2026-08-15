@@ -1,14 +1,85 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { AecDatabase } from "../src/db.js";
 import { AecEngine } from "../src/engine.js";
-import { createGitRepository, tempDir } from "./helpers.js";
+import { branchHead, commitTask, createWorktree, localMerge } from "../src/git.js";
+import type { Run, Workspace } from "../src/types.js";
+import { builtCliPath, createGitRepository, fixturePath, tempDir } from "./helpers.js";
 
-const cli = resolve("dist/src/cli.js");
-const fakeAgent = resolve("dist/test/fixtures/fake-agent.js");
+const cli = builtCliPath();
+const fakeAgent = fixturePath("fake-agent.js");
+
+async function prepareExternallyMergedRun(status: Run["status"], phase: Run["phase"], markTaskSucceeded = true) {
+  const repo = createGitRepository();
+  const home = tempDir("aec-merge-recovery-");
+  const db = new AecDatabase(home);
+  const project = db.createProject({ name: `merge-${phase}`, repoPath: repo });
+  const agent = db.createAgent({ name: "executor", adapter: "command", roles: ["executor"], config: { binary: process.execPath } });
+  const engine = new AecEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: `task-${phase}`,
+    projectId: project.id,
+    title: `Recover ${phase}`,
+    goal: "Recover merged Git fact",
+    scope: { writeGlobs: ["merged.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["merged.txt is merged"],
+  }]);
+  engine.promoteTasks();
+  const baseSha = await branchHead(repo, "main");
+  const timestamp = new Date().toISOString();
+  const runId = `run-${phase}`;
+  const workspaceId = `workspace-${phase}`;
+  const workspacePath = join(home, "workspaces", project.id, task!.id, runId);
+  const logDir = join(home, "runs", runId);
+  mkdirSync(logDir, { recursive: true });
+  const run: Run = {
+    id: runId,
+    taskId: task!.id,
+    agentId: agent.id,
+    workspaceId,
+    phase,
+    status,
+    attempt: 1,
+    repairCount: 0,
+    rotationCount: 0,
+    baseSha,
+    validation: [],
+    effects: {},
+    logDir,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+  };
+  const workspace: Workspace = {
+    id: workspaceId,
+    projectId: project.id,
+    taskId: task!.id,
+    runId,
+    path: workspacePath,
+    branch: `aec/${task!.id}`,
+    baseSha,
+    status: "creating",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  db.createRun(run);
+  db.createWorkspace(workspace);
+  db.updateTaskStatus(task!.id, "running");
+  await createWorktree(project, workspace.path, workspace.branch);
+  db.updateWorkspaceStatus(workspace.id, "active");
+  writeFileSync(join(workspace.path, "merged.txt"), "merged once\n");
+  const commitSha = await commitTask(workspace.path, task!);
+  await localMerge(project, workspace.branch, commitSha);
+  run.effects = {
+    commit: { operationId: `${project.id}:${task!.id}:${run.id}:commit`, status: "completed", externalRef: commitSha },
+    merge: { operationId: `${project.id}:${task!.id}:${run.id}:merge`, status: phase === "cleanup" ? "completed" : "started", ...(phase === "cleanup" ? { externalRef: commitSha } : {}) },
+  };
+  if (phase === "cleanup" && markTaskSucceeded) db.updateTaskStatus(task!.id, "succeeded", { mergeSha: commitSha });
+  db.saveRun(run);
+  return { db, engine: new AecEngine(db), project, task: task!, run, workspace, repo, commitSha };
+}
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
@@ -32,6 +103,15 @@ test("resumes a supervised Agent job after the controlling process is killed", a
       binary: process.execPath,
       execute: { program: process.execPath, args: [fakeAgent, "slow", "{workspace}", "{output}"] },
       repair: { program: process.execPath, args: [fakeAgent, "slow", "{workspace}", "{output}"] },
+    },
+  });
+  db.createAgent({
+    name: "reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    config: {
+      binary: process.execPath,
+      review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
   const engine = new AecEngine(db);
@@ -82,6 +162,15 @@ test("two AEC processes cannot execute the same Run concurrently", async () => {
       execute: { program: process.execPath, args: [fakeAgent, "slow", "{workspace}", "{output}"] },
     },
   });
+  db.createAgent({
+    name: "reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    config: {
+      binary: process.execPath,
+      review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
+    },
+  });
   const [task] = new AecEngine(db).submitGraph(project.id, [{
     id: "task-single-owner",
     projectId: project.id,
@@ -104,4 +193,31 @@ test("two AEC processes cannot execute the same Run concurrently", async () => {
   assert.equal(inspect.listRuns(task.id).length, 1);
   assert.equal(inspect.getTask(task.id)?.status, "succeeded");
   inspect.close();
+});
+
+test("reconciles a local merge completed before its effect was persisted", async () => {
+  const fixture = await prepareExternallyMergedRun("active", "merge");
+  await fixture.engine.runTask(fixture.task.id);
+  assert.equal(fixture.db.getTask(fixture.task.id)?.status, "succeeded");
+  assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.effects.merge?.externalRef, fixture.commitSha);
+  assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.status, "completed");
+  fixture.db.close();
+});
+
+test("retries interrupted cleanup without downgrading a succeeded Task", async () => {
+  const fixture = await prepareExternallyMergedRun("interrupted", "cleanup");
+  await fixture.engine.runOnce();
+  assert.equal(fixture.db.getTask(fixture.task.id)?.status, "succeeded");
+  assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.status, "completed");
+  assert.equal(fixture.db.getWorkspace(fixture.workspace.id)?.status, "cleaned");
+  fixture.db.close();
+});
+
+test("repairs the Task terminal state when merge completion was persisted first", async () => {
+  const fixture = await prepareExternallyMergedRun("interrupted", "cleanup", false);
+  await fixture.engine.runTask(fixture.task.id);
+  assert.equal(fixture.db.getTask(fixture.task.id)?.status, "succeeded");
+  assert.equal(fixture.db.getTask(fixture.task.id)?.mergeSha, fixture.commitSha);
+  assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.status, "completed");
+  fixture.db.close();
 });

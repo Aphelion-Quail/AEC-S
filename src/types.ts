@@ -36,6 +36,8 @@ export type Project = Required<Omit<ProjectInput, "id">> & {
   createdAt: string;
 };
 
+export type ProjectUpdate = Partial<Omit<ProjectInput, "id" | "repoPath" | "name">>;
+
 export type TaskStatus =
   | "queued"
   | "ready"
@@ -94,6 +96,8 @@ export type Agent = Required<Omit<AgentInput, "id">> & {
   currentLoad: number;
 };
 
+export type AgentUpdate = Partial<Omit<AgentInput, "id" | "name" | "adapter">>;
+
 export type RunPhase =
   | "prepare"
   | "execute"
@@ -136,9 +140,9 @@ export type ValidationResult = {
 export type ReviewFinding = {
   severity: "blocking" | "warning";
   summary: string;
-  file?: string;
-  line?: number;
-  requiredChange?: string;
+  file?: string | null;
+  line?: number | null;
+  requiredChange?: string | null;
 };
 
 export type ReviewResult = {
@@ -152,6 +156,10 @@ export type WorkerResult = {
   status: "complete" | "blocked";
   summary: string;
   notes: string[];
+  blocker?: {
+    kind: "technical" | "architecture" | "product" | "tradeoff";
+    question: string;
+  } | null;
 };
 
 export type JobState = {
@@ -177,6 +185,8 @@ export type Run = {
   rotationCount: number;
   baseSha: string;
   codexSessionId?: string;
+  workerResult?: WorkerResult;
+  workerResultPath?: string;
   validation: ValidationResult[];
   review?: ReviewResult;
   effects: RunEffects;
