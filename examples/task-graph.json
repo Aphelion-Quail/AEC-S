@@ -1,0 +1,26 @@
+{
+  "projectId": "example-project",
+  "tasks": [
+    {
+      "id": "example-core-task",
+      "projectId": "example-project",
+      "title": "Implement focused core change",
+      "goal": "Implement the requested behavior without changing the public API.",
+      "scope": {
+        "writeGlobs": ["src/core/**", "test/core/**"],
+        "impactGlobs": ["src/shared/**"],
+        "tags": ["core"]
+      },
+      "dependsOn": [],
+      "constraints": ["Do not change the public API"],
+      "acceptanceCriteria": ["Focused tests pass", "Independent review passes"],
+      "validationCommands": [
+        { "program": "npm", "args": ["test", "--", "core"], "timeoutSeconds": 900 }
+      ],
+      "requiredCapabilities": ["typescript", "git"],
+      "requiresFullValidation": false,
+      "priority": 10,
+      "decisionIds": []
+    }
+  ]
+}

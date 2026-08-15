@@ -1,0 +1,13 @@
+{
+  "id": "codex-reviewer",
+  "name": "Codex Reviewer",
+  "adapter": "codex",
+  "roles": ["reviewer"],
+  "capabilities": ["typescript", "git"],
+  "enabled": true,
+  "availability": "available",
+  "maxConcurrency": 2,
+  "config": {
+    "binary": "codex"
+  }
+}

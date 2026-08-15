@@ -1,0 +1,6 @@
+{
+  "projectId": "example-project",
+  "kind": "architecture",
+  "title": "Compatibility has priority",
+  "body": "Persistence changes must preserve backward compatibility."
+}

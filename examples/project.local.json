@@ -1,0 +1,16 @@
+{
+  "id": "example-project",
+  "name": "Example Project",
+  "repoPath": "/absolute/path/to/trusted/repository",
+  "targetBranch": "main",
+  "deliveryMode": "local",
+  "intent": "Keep behavior compatible and changes narrowly scoped.",
+  "defaultValidation": [
+    { "program": "npm", "args": ["run", "check"], "timeoutSeconds": 900 }
+  ],
+  "fullValidation": [
+    { "program": "npm", "args": ["run", "test:all"], "timeoutSeconds": 1800 }
+  ],
+  "highRiskGlobs": ["src/core/**", "migrations/**"],
+  "maxConcurrency": 2
+}

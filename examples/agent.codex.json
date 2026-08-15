@@ -1,0 +1,13 @@
+{
+  "id": "codex-primary",
+  "name": "Codex Primary",
+  "adapter": "codex",
+  "roles": ["executor"],
+  "capabilities": ["typescript", "git"],
+  "enabled": true,
+  "availability": "available",
+  "maxConcurrency": 2,
+  "config": {
+    "binary": "codex"
+  }
+}
