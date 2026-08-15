@@ -35,6 +35,68 @@ function registerFakeAgents(db: AecDatabase, executeMode = "execute", reviewMode
   });
 }
 
+async function runScheduledPair(input: {
+  globalConcurrency: number;
+  projectConcurrency: number;
+  conflicting?: boolean;
+}): Promise<string[]> {
+  const repo = createGitRepository();
+  const home = tempDir("aec-scheduler-pair-");
+  const timeline = join(home, "timeline.txt");
+  const db = new AecDatabase(home);
+  const project = db.createProject({
+    name: "scheduler-pair",
+    repoPath: repo,
+    maxConcurrency: input.projectConcurrency,
+  });
+  db.createAgent({
+    id: "pair-executor",
+    name: "pair executor",
+    adapter: "command",
+    roles: ["executor"],
+    maxConcurrency: 2,
+    config: {
+      binary: process.execPath,
+      execute: { program: process.execPath, args: [fakeAgent, "timeline-fast", "{workspace}", "{output}", timeline] },
+    },
+  });
+  db.createAgent({
+    id: "pair-reviewer",
+    name: "pair reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    maxConcurrency: 2,
+    config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
+  });
+  const engine = new AecEngine(db, { globalConcurrency: input.globalConcurrency });
+  engine.submitGraph(project.id, [
+    {
+      id: "pair-one",
+      projectId: project.id,
+      title: "Pair one",
+      goal: "Create one/result.txt",
+      scope: { writeGlobs: ["one/result.txt"], impactGlobs: [], tags: [] },
+      acceptanceCriteria: ["one exists"],
+    },
+    {
+      id: "pair-two",
+      projectId: project.id,
+      title: "Pair two",
+      goal: "Create two/result.txt",
+      scope: {
+        writeGlobs: ["two/result.txt"],
+        impactGlobs: input.conflicting ? ["one/**"] : [],
+        tags: [],
+      },
+      acceptanceCriteria: ["two exists"],
+    },
+  ]);
+  await engine.runUntilIdle();
+  const entries = readFileSync(timeline, "utf8").trim().split(/\r?\n/);
+  db.close();
+  return entries;
+}
+
 test("runs two independent tasks without invalidating the second on HEAD change", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-home-");
@@ -118,6 +180,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
   assert.ok(runs.every((run) => run.review?.verdict === "pass"));
   assert.ok(runs.every((run) => run.review?.reviewerAgentId !== run.agentId));
   assert.ok(runs.every((run) => readFileSync(run.diffPath!, "utf8").length > 0));
+  assert.ok(runs.every((run) => db.getWorkspace(run.workspaceId)?.baseSha === run.baseSha));
   await engine.runTask(tasks[0]!.id);
   assert.equal(db.listRuns().length, 2, "rerunning a succeeded task must not create another Run");
   db.close();
@@ -180,6 +243,76 @@ test("revalidates only the current task after a related target-branch change", a
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(readFileSync(validationCount, "utf8"), "2", "related target changes must trigger local revalidation");
   assert.equal(existsSync(join(repo, "FULL_RAN")), false, "related but non-high-risk changes must not trigger full validation");
+  const finalRun = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getWorkspace(finalRun.workspaceId)?.baseSha, finalRun.baseSha);
+  db.close();
+});
+
+test("enforces global and Project scheduler concurrency limits", async () => {
+  for (const limits of [
+    { globalConcurrency: 1, projectConcurrency: 2 },
+    { globalConcurrency: 2, projectConcurrency: 1 },
+  ]) {
+    const timeline = await runScheduledPair(limits);
+    assert.equal(timeline.length, 4);
+    assert.match(timeline[0]!, /:start$/);
+    assert.match(timeline[1]!, /:end$/);
+    assert.match(timeline[2]!, /:start$/);
+    assert.match(timeline[3]!, /:end$/);
+  }
+});
+
+test("serializes scheduler tasks whose declared Scopes conflict", async () => {
+  const timeline = await runScheduledPair({ globalConcurrency: 2, projectConcurrency: 2, conflicting: true });
+  assert.equal(timeline.length, 4);
+  assert.match(timeline[0]!, /:start$/);
+  assert.match(timeline[1]!, /:end$/);
+  assert.match(timeline[2]!, /:start$/);
+  assert.match(timeline[3]!, /:end$/);
+});
+
+test("renews the Run lease while an external phase remains active", async () => {
+  const db = new AecDatabase(tempDir("aec-lease-heartbeat-"));
+  const project = db.createProject({ name: "lease-heartbeat", repoPath: createGitRepository() });
+  registerFakeAgents(db, "slow");
+  const originalRenew = db.renewRunLease.bind(db);
+  let renewals = 0;
+  db.renewRunLease = (...args) => {
+    renewals += 1;
+    return originalRenew(...args);
+  };
+  const engine = new AecEngine(db, { leaseHeartbeatMs: 20 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-heartbeat",
+    projectId: project.id,
+    title: "Keep lease alive",
+    goal: "Create heartbeat.txt",
+    scope: { writeGlobs: ["heartbeat.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Run remains leased"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.ok(renewals >= 10, `expected periodic lease renewals, received ${renewals}`);
+  db.close();
+});
+
+test("records reprioritize through the same Task audit path", () => {
+  const db = new AecDatabase(tempDir("aec-priority-audit-"));
+  const project = db.createProject({ name: "priority-audit", repoPath: createGitRepository() });
+  const engine = new AecEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-priority",
+    projectId: project.id,
+    title: "Change priority",
+    goal: "Record priority changes",
+    scope: { writeGlobs: ["priority.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Priority is durable"],
+    priority: 1,
+  }]);
+  engine.applyDirective({ action: "reprioritize", taskIds: [task!.id], priority: 9 });
+  assert.equal(db.getTask(task!.id)?.priority, 9);
+  const event = db.listEvents(project.id).find((candidate) => candidate.type === "task.priority_changed");
+  assert.deepEqual(event?.payload, { from: 1, to: 9 });
   db.close();
 });
 

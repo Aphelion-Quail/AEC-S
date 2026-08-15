@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { startSupervisedJob, waitForJob } from "../src/job.js";
+import { processAlive, startSupervisedJob, waitForJob } from "../src/job.js";
 import { execCommand } from "../src/exec.js";
 import { tempDir } from "./helpers.js";
 
@@ -52,4 +52,13 @@ test("kills Agent descendant processes when a supervised command times out", asy
   assert.equal((await waitForJob(job, 1)).status, "timed_out");
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.equal(existsSync(marker), false);
+});
+
+test("treats an unavailable process inspector as not alive without throwing", () => {
+  if (process.platform === "win32") return;
+  assert.equal(processAlive(process.pid, () => ({
+    status: null,
+    stdout: null,
+    error: new Error("spawnSync /bin/ps failed"),
+  })), false);
 });

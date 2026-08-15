@@ -5,6 +5,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { builtCliPath, tempDir } from "./helpers.js";
 import { AecDatabase } from "../src/db.js";
 import { createGitRepository } from "./helpers.js";
+import { aecVersion } from "../src/version.js";
 
 test("exposes the six AEC MCP tools over stdio", async () => {
   const home = tempDir("aec-mcp-");
@@ -26,6 +27,7 @@ test("exposes the six AEC MCP tools over stdio", async () => {
   const client = new Client({ name: "aec-test", version: "1.0.0" });
   await client.connect(transport);
   try {
+    assert.deepEqual(client.getServerVersion(), { name: "aec-core", version: aecVersion() });
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name).sort();
     assert.deepEqual(names, [
@@ -36,6 +38,16 @@ test("exposes the six AEC MCP tools over stdio", async () => {
       "aec_status",
       "aec_submit_task_graph",
     ]);
+    for (const tool of tools.tools) {
+      assert.equal(tool.inputSchema.type, "object", `${tool.name} must expose an object input schema`);
+      assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} must reject unknown input fields`);
+    }
+    const graphTool = tools.tools.find((tool) => tool.name === "aec_submit_task_graph")!;
+    assert.deepEqual(graphTool.inputSchema.required, ["projectId", "tasks"]);
+    const graphProperties = graphTool.inputSchema.properties as Record<string, { minItems?: number }>;
+    assert.equal(graphProperties.tasks!.minItems, 1);
+    const resolveTool = tools.tools.find((tool) => tool.name === "aec_resolve_decision")!;
+    assert.deepEqual(resolveTool.inputSchema.required, ["decisionId", "resolution"]);
     const status = await client.callTool({ name: "aec_status", arguments: {} });
     assert.equal(status.isError, undefined);
     const graph = await client.callTool({
@@ -83,6 +95,13 @@ test("exposes the six AEC MCP tools over stdio", async () => {
       arguments: { projectId: project.id, tasks: [{ title: "invalid" }] },
     });
     assert.equal(invalid.isError, true);
+    const unsafeId = await client.callTool({ name: "aec_status", arguments: { projectId: "../outside" } });
+    assert.equal(unsafeId.isError, true);
+    const unscopedDirective = await client.callTool({
+      name: "aec_apply_directive",
+      arguments: { action: "pause" },
+    });
+    assert.equal(unscopedDirective.isError, true);
   } finally {
     await client.close();
   }

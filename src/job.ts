@@ -70,24 +70,38 @@ export async function runJobFile(inputPath: string): Promise<void> {
 
 const processStateCache = new Map<number, { checkedAt: number; alive: boolean }>();
 
-export function processAlive(pid: number): boolean {
+export type ProcessInspector = (pid: number) => {
+  status: number | null;
+  stdout?: string | Buffer | null;
+  error?: Error;
+};
+
+function inspectProcess(pid: number): ReturnType<ProcessInspector> {
+  return spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], {
+    encoding: "utf8",
+    timeout: 1_000,
+  });
+}
+
+export function processAlive(pid: number, inspector: ProcessInspector = inspectProcess): boolean {
   try {
     process.kill(pid, 0);
   } catch {
     return false;
   }
-  const cached = processStateCache.get(pid);
+  const useCache = inspector === inspectProcess;
+  const cached = useCache ? processStateCache.get(pid) : undefined;
   if (cached && Date.now() - cached.checkedAt < 1_000) return cached.alive;
   let alive = true;
   if (process.platform !== "win32") {
-    const status = spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 1_000,
-    });
-    const state = status.stdout.trim();
-    alive = status.status === 0 && state.length > 0 && !state.startsWith("Z");
+    const status = inspector(pid);
+    const stdout = typeof status.stdout === "string"
+      ? status.stdout
+      : Buffer.isBuffer(status.stdout) ? status.stdout.toString("utf8") : "";
+    const state = stdout.trim();
+    alive = !status.error && status.status === 0 && state.length > 0 && !state.startsWith("Z");
   }
-  processStateCache.set(pid, { checkedAt: Date.now(), alive });
+  if (useCache) processStateCache.set(pid, { checkedAt: Date.now(), alive });
   return alive;
 }
 

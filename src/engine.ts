@@ -61,6 +61,7 @@ import { redactJson, redactText } from "./redaction.js";
 
 type EngineOptions = {
   globalConcurrency?: number;
+  leaseHeartbeatMs?: number;
 };
 
 type JobExecution = {
@@ -72,12 +73,14 @@ type JobExecution = {
 
 export class AecEngine {
   private readonly globalConcurrency: number;
+  private readonly leaseHeartbeatMs: number;
   private readonly inProcess = new Set<string>();
   private readonly leaseOwner = `${process.pid}:${newId("lease")}`;
   private schedulerCycles = 0;
 
   constructor(readonly db: AecDatabase, options: EngineOptions = {}) {
     this.globalConcurrency = options.globalConcurrency ?? 2;
+    this.leaseHeartbeatMs = options.leaseHeartbeatMs ?? 10_000;
   }
 
   submitGraph(projectId: string, inputs: TaskInput[]): Task[] {
@@ -349,37 +352,39 @@ export class AecEngine {
       }
       this.renewLease(run);
       try {
-        switch (run.phase) {
-          case "prepare":
-            await this.phasePrepare(run);
-            break;
-          case "execute":
-            await this.phaseExecute(run);
-            break;
-          case "validate":
-            await this.phaseValidate(run);
-            break;
-          case "review":
-            await this.phaseReview(run);
-            break;
-          case "repair":
-            await this.phaseRepair(run);
-            break;
-          case "publish":
-            await this.phasePublish(run);
-            break;
-          case "remote_checks":
-            await this.phaseRemoteChecks(run);
-            break;
-          case "merge":
-            await this.phaseMerge(run);
-            break;
-          case "cleanup":
-            await this.phaseCleanup(run);
-            break;
-          default:
-            throw new Error(`Unsupported run phase: ${run.phase}`);
-        }
+        await this.withLeaseHeartbeat(run, async () => {
+          switch (run.phase) {
+            case "prepare":
+              await this.phasePrepare(run);
+              break;
+            case "execute":
+              await this.phaseExecute(run);
+              break;
+            case "validate":
+              await this.phaseValidate(run);
+              break;
+            case "review":
+              await this.phaseReview(run);
+              break;
+            case "repair":
+              await this.phaseRepair(run);
+              break;
+            case "publish":
+              await this.phasePublish(run);
+              break;
+            case "remote_checks":
+              await this.phaseRemoteChecks(run);
+              break;
+            case "merge":
+              await this.phaseMerge(run);
+              break;
+            case "cleanup":
+              await this.phaseCleanup(run);
+              break;
+            default:
+              throw new Error(`Unsupported run phase: ${run.phase}`);
+          }
+        });
       } catch (error) {
         await this.handlePhaseError(this.requireRun(runId), error);
         const after = this.requireRun(runId);
@@ -395,7 +400,7 @@ export class AecEngine {
     const baseSha = await createWorktree(project, workspace.path, workspace.branch);
     workspace.baseSha = baseSha;
     workspace.status = "active";
-    this.db.updateWorkspaceStatus(workspace.id, "active");
+    this.db.updateWorkspaceBaseline(workspace.id, baseSha, "active");
     run.baseSha = baseSha;
     this.setPhase(run, "execute", { baseSha });
   }
@@ -571,6 +576,7 @@ export class AecEngine {
     if (await rebaseInProgress(workspace.path)) {
       await continueRebase(workspace.path);
       run.baseSha = await branchHead(project.repoPath, projectBaseRef(project));
+      this.db.updateWorkspaceBaseline(workspace.id, run.baseSha);
       run.effects.commit = {
         operationId: this.operationId(project.id, task.id, run.id, "commit"),
         status: "completed",
@@ -610,6 +616,7 @@ export class AecEngine {
         return;
       }
       run.baseSha = targetHead;
+      this.db.updateWorkspaceBaseline(workspace.id, targetHead);
       run.effects.commit = {
         operationId: this.operationId(project.id, task.id, run.id, "commit"),
         status: "completed",
@@ -1046,7 +1053,7 @@ export class AecEngine {
         if (input.priority === undefined || input.priority < -100 || input.priority > 100) {
           throw new Error("reprioritize requires priority between -100 and 100");
         }
-        this.db.db.prepare("UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?").run(input.priority, nowIso(), task.id);
+        this.db.updateTaskPriority(task.id, input.priority);
       }
     }
     return tasks.map((task) => this.requireTask(task.id));
@@ -1181,9 +1188,28 @@ export class AecEngine {
     run.leaseOwner = this.leaseOwner;
   }
 
+  private async withLeaseHeartbeat<T>(run: Run, operation: () => Promise<T>): Promise<T> {
+    let heartbeatError: unknown;
+    const heartbeat = setInterval(() => {
+      try {
+        this.renewLease(run);
+      } catch (error) {
+        heartbeatError ??= error;
+      }
+    }, this.leaseHeartbeatMs);
+    heartbeat.unref();
+    try {
+      const value = await operation();
+      if (heartbeatError) throw heartbeatError;
+      return value;
+    } finally {
+      clearInterval(heartbeat);
+    }
+  }
+
   private leaseTime(): string {
-    // One lease covers any bounded Git/GitHub subprocess. Supervised jobs and
-    // remote check polling renew continuously, so stalled owners remain fenceable.
+    // Each phase renews periodically, including while Git/GitHub subprocesses
+    // are blocked, so another daemon cannot mistake a long operation for abandonment.
     return new Date(Date.now() + 900_000).toISOString();
   }
 

@@ -82,7 +82,24 @@ export class AecDatabase {
     if (currentVersion > latestVersion) {
       throw new Error(`AEC database schema ${currentVersion} is newer than supported schema ${latestVersion}`);
     }
-    this.db.exec(`
+    this.db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TEXT NOT NULL
+    )`);
+    if (currentVersion === latestVersion) return;
+
+    this.transaction(() => {
+      for (let version = currentVersion + 1; version <= latestVersion; version += 1) {
+        this.applyMigration(version);
+        this.db.prepare("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)").run(version, nowIso());
+        this.db.exec(`PRAGMA user_version = ${version}`);
+      }
+    });
+  }
+
+  private applyMigration(version: number): void {
+    if (version === 1) {
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS projects (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -146,8 +163,6 @@ export class AecDatabase {
         rotation_count INTEGER NOT NULL,
         base_sha TEXT NOT NULL,
         codex_session_id TEXT,
-        worker_result_json TEXT,
-        worker_result_path TEXT,
         validation_json TEXT NOT NULL,
         review_json TEXT,
         effects_json TEXT NOT NULL,
@@ -157,8 +172,7 @@ export class AecDatabase {
         error_json TEXT,
         started_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        lease_until TEXT,
-        lease_owner TEXT
+        lease_until TEXT
       );
 
       CREATE TABLE IF NOT EXISTS workspaces (
@@ -198,38 +212,44 @@ export class AecDatabase {
         resolved_at TEXT
       );
 
-      CREATE TABLE IF NOT EXISTS schema_migrations (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS agent_leases (
-        job_id TEXT PRIMARY KEY,
-        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
-        created_at TEXT NOT NULL
-      );
-
       CREATE INDEX IF NOT EXISTS idx_tasks_project_status ON tasks(project_id, status, priority, created_at);
       CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id, started_at);
       CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, lease_until);
       CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, id);
       CREATE INDEX IF NOT EXISTS idx_decisions_project_status ON decisions(project_id, status);
-    `);
-    const runColumns = this.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>;
-    if (!runColumns.some((column) => column.name === "lease_owner")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN lease_owner TEXT");
+      `);
+      return;
     }
-    if (!runColumns.some((column) => column.name === "worker_result_json")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_json TEXT");
+    if (version === 2) {
+      if (!this.tableHasColumn("runs", "lease_owner")) {
+        this.db.exec("ALTER TABLE runs ADD COLUMN lease_owner TEXT");
+      }
+      return;
     }
-    if (!runColumns.some((column) => column.name === "worker_result_path")) {
-      this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_path TEXT");
+    if (version === 3) {
+      if (!this.tableHasColumn("runs", "worker_result_json")) {
+        this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_json TEXT");
+      }
+      if (!this.tableHasColumn("runs", "worker_result_path")) {
+        this.db.exec("ALTER TABLE runs ADD COLUMN worker_result_path TEXT");
+      }
+      return;
     }
-    const appliedAt = nowIso();
-    const migration = this.db.prepare("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)");
-    for (let version = currentVersion + 1; version <= latestVersion; version += 1) migration.run(version, appliedAt);
-    this.db.exec(`PRAGMA user_version = ${latestVersion}`);
+    if (version === 4) {
+      this.db.exec(`CREATE TABLE IF NOT EXISTS agent_leases (
+        job_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL
+      )`);
+      return;
+    }
+    throw new Error(`Unknown AEC database migration: ${version}`);
+  }
+
+  private tableHasColumn(table: string, column: string): boolean {
+    return (this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .some((candidate) => candidate.name === column);
   }
 
   createProject(input: ProjectInput): Project {
@@ -421,6 +441,18 @@ export class AecDatabase {
       taskId: id,
       type: "task.status_changed",
       payload: { from: task.status, to: status },
+    });
+  }
+
+  updateTaskPriority(id: string, priority: number): void {
+    const task = this.getTask(id);
+    if (!task) throw new Error(`Task not found: ${id}`);
+    this.db.prepare("UPDATE tasks SET priority = ?, updated_at = ? WHERE id = ?").run(priority, nowIso(), id);
+    this.appendEvent({
+      projectId: task.projectId,
+      taskId: id,
+      type: "task.priority_changed",
+      payload: { from: task.priority, to: priority },
     });
   }
 
@@ -767,6 +799,16 @@ export class AecDatabase {
 
   updateWorkspaceStatus(id: string, status: WorkspaceStatus): void {
     this.db.prepare("UPDATE workspaces SET status = ?, updated_at = ? WHERE id = ?").run(status, nowIso(), id);
+  }
+
+  updateWorkspaceBaseline(id: string, baseSha: string, status?: WorkspaceStatus): void {
+    if (status) {
+      this.db.prepare("UPDATE workspaces SET base_sha = ?, status = ?, updated_at = ? WHERE id = ?")
+        .run(baseSha, status, nowIso(), id);
+    } else {
+      this.db.prepare("UPDATE workspaces SET base_sha = ?, updated_at = ? WHERE id = ?")
+        .run(baseSha, nowIso(), id);
+    }
   }
 
   createDecision(input: DecisionInput): Decision {

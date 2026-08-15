@@ -31,6 +31,7 @@ test("persists the seven core entity projections", () => {
   assert.equal(db.getTask(task.id)?.goal, "Create feature.txt");
   assert.equal(db.getDecision(decision.id)?.status, "resolved");
   assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
+  const appliedMigrations = db.db.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all();
   assert.equal(db.updateProject(project.id, { intent: "Updated intent", maxConcurrency: 3 }).intent, "Updated intent");
   assert.equal(db.updateAgent(agent.id, { availability: "degraded", enabled: false }).enabled, false);
   db.updateTaskStatus(task.id, "succeeded", { summary: "done", mergeSha: "abc" });
@@ -39,6 +40,13 @@ test("persists the seven core entity projections", () => {
   assert.equal(db.getTask(task.id)?.mergeSha, undefined);
   assert.ok(db.listEvents(project.id).length >= 3);
   db.close();
+  const reopened = new AecDatabase(home);
+  assert.deepEqual(
+    reopened.db.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all(),
+    appliedMigrations,
+    "opening a current database must not replay or rewrite migrations",
+  );
+  reopened.close();
 });
 
 test("upgrades a pre-lease Run schema through recorded migrations", () => {

@@ -1,4 +1,6 @@
-import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { Project, Task } from "./types.js";
@@ -29,9 +31,7 @@ export async function withProjectGitLock<T>(project: Project, fn: () => Promise<
 }
 
 async function acquireProjectFileLock(project: Project): Promise<{ databasePath: string; token: string }> {
-  const commonDirValue = await execChecked(git(project.repoPath, ["rev-parse", "--git-common-dir"]));
-  const commonDir = isAbsolute(commonDirValue) ? commonDirValue : resolve(project.repoPath, commonDirValue);
-  const databasePath = join(commonDir, "aec-project-git-lock.sqlite");
+  const databasePath = await projectLockDatabasePath(project);
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
   const lockDb = new DatabaseSync(databasePath);
   lockDb.exec("PRAGMA busy_timeout=1000");
@@ -79,6 +79,16 @@ async function acquireProjectFileLock(project: Project): Promise<{ databasePath:
     } catch { /* already closed after successful acquisition */ }
   }
   throw new Error(`Timed out waiting for Project Git lock: ${project.id}`);
+}
+
+export async function projectLockDatabasePath(project: Project): Promise<string> {
+  const commonDirValue = await execChecked(git(project.repoPath, ["rev-parse", "--git-common-dir"]));
+  const commonDir = isAbsolute(commonDirValue) ? commonDirValue : resolve(project.repoPath, commonDirValue);
+  const canonicalCommonDir = realpathSync(commonDir);
+  const lockRoot = join(tmpdir(), "aec-project-git-locks");
+  mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
+  const repositoryKey = createHash("sha256").update(canonicalCommonDir).digest("hex");
+  return join(lockRoot, `${repositoryKey}.sqlite`);
 }
 
 function processIsAlive(pid: number): boolean {

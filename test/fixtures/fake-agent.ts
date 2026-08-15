@@ -66,10 +66,10 @@ const declared = envelope.task.scope.writeGlobs[0];
 if (!declared || declared.includes("*") || declared.includes("?")) throw new Error("Fake agent requires one concrete write path");
 const target = join(workspace, declared);
 if (mode === "slow") await new Promise((resolve) => setTimeout(resolve, 750));
-if (mode === "timeline-slow") {
-  if (!targetArgument) throw new Error("timeline-slow requires a timeline path");
+if (mode === "timeline-slow" || mode === "timeline-fast") {
+  if (!targetArgument) throw new Error(`${mode} requires a timeline path`);
   appendFileSync(targetArgument, `${envelope.task.id}:start\n`);
-  await new Promise((resolve) => setTimeout(resolve, 750));
+  await new Promise((resolve) => setTimeout(resolve, mode === "timeline-slow" ? 750 : 150));
   appendFileSync(targetArgument, `${envelope.task.id}:end\n`);
 }
 mkdirSync(dirname(target), { recursive: true });

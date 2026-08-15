@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
-import { withProjectGitLock } from "../src/git.js";
+import { projectLockDatabasePath, withProjectGitLock } from "../src/git.js";
 import type { Project } from "../src/types.js";
 
 const worker = fixturePath("git-lock-worker.js");
@@ -27,12 +27,15 @@ test("serializes Project Git sections across AEC processes", async () => {
   assert.equal(events[2]![1], "start");
   assert.equal(events[3]![1], "end");
   assert.notEqual(events[0]![0], events[2]![0]);
+  const project = { ...projectFor(repo), id: "lock-location" };
+  const databasePath = await projectLockDatabasePath(project);
+  assert.equal(databasePath.startsWith(repo), false, "coordination locks must not live in the target repository");
+  assert.equal(existsSync(join(repo, ".git", "aec-project-git-lock.sqlite")), false);
 });
 
-test("releases the in-process queue when file-lock acquisition fails", async () => {
-  const repo = createGitRepository();
-  const base: Project = {
-    id: "acquire-failure",
+function projectFor(repo: string): Project {
+  return {
+    id: "project-lock",
     name: "lock",
     repoPath: repo,
     targetBranch: "main",
@@ -46,6 +49,11 @@ test("releases the in-process queue when file-lock acquisition fails", async () 
     maxConcurrency: 2,
     createdAt: new Date().toISOString(),
   };
+}
+
+test("releases the in-process queue when file-lock acquisition fails", async () => {
+  const repo = createGitRepository();
+  const base: Project = { ...projectFor(repo), id: "acquire-failure" };
   await assert.rejects(withProjectGitLock({ ...base, repoPath: join(repo, "missing") }, async () => undefined));
   const result = await Promise.race([
     withProjectGitLock(base, async () => "acquired"),

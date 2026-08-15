@@ -5,7 +5,9 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecDatabase } from "../src/db.js";
 import { AecEngine } from "../src/engine.js";
+import { mergePullRequest, waitForRequiredChecks } from "../src/github.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
+import type { Project } from "../src/types.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
 
@@ -138,5 +140,58 @@ if (args[0] === 'pr' && args[1] === 'list') {
     process.env.PATH = oldPath;
     delete process.env.FAKE_GH_STATE;
     delete process.env.AEC_GITHUB_CHECK_POLL_MS;
+  }
+});
+
+function githubProject(repoPath: string, requiredChecks: string[]): Project {
+  return {
+    id: "github-negative",
+    name: "github negative paths",
+    repoPath,
+    targetBranch: "main",
+    remoteName: "origin",
+    deliveryMode: "github",
+    intent: "",
+    defaultValidation: [],
+    fullValidation: [],
+    requiredChecks,
+    highRiskGlobs: [],
+    maxConcurrency: 2,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+test("rejects missing required checks before querying GitHub", async () => {
+  const repo = createGitRepository();
+  await assert.rejects(waitForRequiredChecks(githubProject(repo, []), repo, 1, 1, undefined, 1), /at least one/);
+});
+
+test("fails closed on GitHub authentication errors and unexpected merged heads", async () => {
+  const repo = createGitRepository();
+  const fakeBin = tempDir("aec-failing-gh-");
+  const ghPath = join(fakeBin, "gh");
+  writeFileSync(ghPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'checks') {
+  process.stderr.write('authentication required');
+  process.exit(1);
+}
+if (args[0] === 'pr' && args[1] === 'view') {
+  process.stdout.write(JSON.stringify({ number: 1, url: 'https://example.test/pr/1', state: 'MERGED', headRefOid: 'wrong-head', mergeCommit: { oid: 'merge-sha' } }));
+  process.exit(0);
+}
+process.exit(2);
+`);
+  chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+  try {
+    await assert.rejects(
+      waitForRequiredChecks(githubProject(repo, ["test"]), repo, 1, 1, undefined, 1),
+      /authentication required/,
+    );
+    await assert.rejects(mergePullRequest(repo, 1, "expected-head"), /unexpected head wrong-head/);
+  } finally {
+    process.env.PATH = oldPath;
   }
 });

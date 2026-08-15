@@ -4,10 +4,23 @@ import { reviewResultSchema, workerResultSchema } from "../src/schemas.js";
 
 test("Codex output schemas require every property and encode optional values as nullable", () => {
   assert.deepEqual(workerResultSchema.required, ["status", "summary", "notes", "blocker"]);
+  assert.equal(workerResultSchema.additionalProperties, false);
+  assert.deepEqual(workerResultSchema.properties.status.enum, ["complete", "blocked"]);
   assert.deepEqual(workerResultSchema.properties.blocker.type, ["object", "null"]);
+  assert.equal(workerResultSchema.properties.blocker.additionalProperties, false);
+  assert.deepEqual(workerResultSchema.properties.blocker.required, ["kind", "question"]);
+  assert.deepEqual(workerResultSchema.properties.blocker.properties.kind.enum, [
+    "technical", "architecture", "product", "tradeoff",
+  ]);
+  assert.equal(reviewResultSchema.additionalProperties, false);
+  assert.deepEqual(reviewResultSchema.required, ["verdict", "summary", "findings"]);
+  assert.deepEqual(reviewResultSchema.properties.verdict.enum, ["pass", "fail"]);
   const finding = reviewResultSchema.properties.findings.items;
+  assert.equal(finding.additionalProperties, false);
   assert.deepEqual(finding.required, ["severity", "summary", "file", "line", "requiredChange"]);
+  assert.deepEqual(finding.properties.severity.enum, ["blocking", "warning"]);
   assert.deepEqual(finding.properties.file.type, ["string", "null"]);
   assert.deepEqual(finding.properties.line.type, ["integer", "null"]);
+  assert.equal(finding.properties.line.minimum, 1);
   assert.deepEqual(finding.properties.requiredChange.type, ["string", "null"]);
 });
