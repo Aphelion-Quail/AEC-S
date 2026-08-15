@@ -99,7 +99,12 @@ export function processAlive(pid: number, inspector: ProcessInspector = inspectP
       ? status.stdout
       : Buffer.isBuffer(status.stdout) ? status.stdout.toString("utf8") : "";
     const state = stdout.trim();
-    alive = !status.error && status.status === 0 && state.length > 0 && !state.startsWith("Z");
+    // process.kill(pid, 0) already proved the PID exists. The secondary ps
+    // inspection only refines that answer for zombies; if ps is unavailable or
+    // times out under load, conservatively keep the process alive.
+    alive = status.error || status.status !== 0 || state.length === 0
+      ? true
+      : !state.startsWith("Z");
   }
   if (useCache) processStateCache.set(pid, { checkedAt: Date.now(), alive });
   return alive;

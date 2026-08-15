@@ -229,7 +229,7 @@ test("revalidates only the current task after a related target-branch change", a
     }],
   }]);
   const running = engine.runTask(task!.id);
-  for (let index = 0; index < 80 && !db.getLatestRunForTask(task!.id)?.job; index += 1) {
+  for (let index = 0; index < 1_200 && !db.getLatestRunForTask(task!.id)?.job; index += 1) {
     await new Promise((resolvePromise) => setTimeout(resolvePromise, 25));
   }
   assert.ok(db.getLatestRunForTask(task!.id)?.job, "the Agent job must be running before target HEAD changes");
@@ -358,7 +358,7 @@ test("a paused active run does not occupy a scheduler slot", async () => {
     },
   ]);
   const running = engine.runTask(pausedTask!.id);
-  for (let index = 0; index < 80 && !db.getLatestRunForTask(pausedTask!.id)?.job; index += 1) {
+  for (let index = 0; index < 1_200 && !db.getLatestRunForTask(pausedTask!.id)?.job; index += 1) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   assert.ok(db.getLatestRunForTask(pausedTask!.id)?.job);

@@ -54,11 +54,12 @@ test("kills Agent descendant processes when a supervised command times out", asy
   assert.equal(existsSync(marker), false);
 });
 
-test("treats an unavailable process inspector as not alive without throwing", () => {
+test("falls back to PID existence when the process inspector is unavailable", () => {
   if (process.platform === "win32") return;
   assert.equal(processAlive(process.pid, () => ({
     status: null,
     stdout: null,
     error: new Error("spawnSync /bin/ps failed"),
-  })), false);
+  })), true);
+  assert.equal(processAlive(process.pid, () => ({ status: 0, stdout: "Z\n" })), false);
 });
