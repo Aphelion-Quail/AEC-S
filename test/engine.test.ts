@@ -120,7 +120,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
     maxConcurrency: 2,
     config: {
       binary: process.execPath,
-      execute: { program: process.execPath, args: [fakeAgent, "timeline-slow", "{workspace}", "{output}", executionTimeline] },
+      execute: { program: process.execPath, args: [fakeAgent, "timeline-barrier", "{workspace}", "{output}", executionTimeline] },
       repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
     },
   });
@@ -485,9 +485,9 @@ test("records timed-out authoritative validation and repairs it", async () => {
     scope: { writeGlobs: ["repaired.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Validation passes after repair"],
     validationCommands: [{
-      program: process.execPath,
-      args: ["-e", "if (!require('node:fs').readFileSync('repaired.txt','utf8').includes('repaired')) setInterval(()=>{},1000)"],
-      timeoutSeconds: 0.05,
+      program: "/bin/sh",
+      args: ["-c", "grep -q repaired repaired.txt || while :; do sleep 1; done"],
+      timeoutSeconds: 1,
     }],
   }]);
   await new AecEngine(db).runTask(task!.id);
