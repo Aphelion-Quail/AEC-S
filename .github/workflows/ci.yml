@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: macos-latest
+    runs-on: [self-hosted, macOS, X64]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
