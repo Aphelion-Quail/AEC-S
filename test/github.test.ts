@@ -1,13 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecDatabase } from "../src/db.js";
 import { AecEngine } from "../src/engine.js";
 import { mergePullRequest, waitForRequiredChecks } from "../src/github.js";
+import { branchHead, commitTask, createWorktree } from "../src/git.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
-import type { Project } from "../src/types.js";
+import type { Project, Run, Workspace } from "../src/types.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
 
@@ -140,6 +141,147 @@ if (args[0] === 'pr' && args[1] === 'list') {
     process.env.PATH = oldPath;
     delete process.env.FAKE_GH_STATE;
     delete process.env.AEC_GITHUB_CHECK_POLL_MS;
+  }
+});
+
+test("reconciles an externally completed PR before retrying publish", async () => {
+  const repo = createGitRepository();
+  const remote = tempDir("aec-reconcile-remote-");
+  execFileSync("git", ["init", "--bare"], { cwd: remote, stdio: "ignore" });
+  execFileSync("git", ["remote", "add", "origin", remote], { cwd: repo });
+  execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repo, stdio: "ignore" });
+
+  const fakeBin = tempDir("aec-reconcile-fakebin-");
+  const ghPath = join(fakeBin, "gh");
+  writeFileSync(ghPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'view') {
+  process.stdout.write(JSON.stringify({
+    number: 7,
+    url: 'https://example.test/pr/7',
+    state: 'MERGED',
+    headRefOid: process.env.FAKE_GH_HEAD,
+    mergeCommit: { oid: process.env.FAKE_GH_MERGE }
+  }));
+  process.exit(0);
+}
+process.stderr.write('unexpected GitHub mutation: ' + args.join(' '));
+process.exit(2);
+`);
+  chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+
+  const home = tempDir("aec-reconcile-home-");
+  const db = new AecDatabase(home);
+  try {
+    const project = db.createProject({
+      id: "github-reconcile",
+      name: "GitHub reconciliation",
+      repoPath: repo,
+      deliveryMode: "github",
+      requiredChecks: ["verify"],
+    });
+    const agent = db.createAgent({
+      id: "executor",
+      name: "must-not-run",
+      adapter: "command",
+      roles: ["executor"],
+      maxConcurrency: 1,
+      config: { binary: process.execPath },
+    });
+    const engine = new AecEngine(db, { operationalRetryBaseMs: 1 });
+    const [task] = engine.submitGraph(project.id, [{
+      id: "task-reconcile",
+      projectId: project.id,
+      title: "Reconcile merged PR",
+      goal: "Record an already completed GitHub merge",
+      scope: { writeGlobs: ["remote.txt"], impactGlobs: [], tags: [] },
+      acceptanceCriteria: ["The completed PR is reconciled without another publish"],
+    }]);
+    engine.promoteTasks();
+    const baseSha = await branchHead(repo, "main");
+    const runId = "run-reconcile";
+    const workspaceId = "workspace-reconcile";
+    const workspacePath = join(home, "workspaces", project.id, task!.id, runId);
+    const logDir = join(home, "runs", runId);
+    mkdirSync(logDir, { recursive: true });
+    const timestamp = new Date().toISOString();
+    const run: Run = {
+      id: runId,
+      taskId: task!.id,
+      agentId: agent.id,
+      workspaceId,
+      phase: "prepare",
+      status: "active",
+      attempt: 1,
+      repairCount: 1,
+      rotationCount: 0,
+      baseSha,
+      validation: [],
+      effects: {},
+      logDir,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+    };
+    const workspace: Workspace = {
+      id: workspaceId,
+      projectId: project.id,
+      taskId: task!.id,
+      runId,
+      path: workspacePath,
+      branch: `aec/${task!.id}`,
+      baseSha,
+      status: "creating",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    db.createRun(run);
+    db.createWorkspace(workspace);
+    db.updateTaskStatus(task!.id, "running");
+    await createWorktree(project, workspace.path, workspace.branch);
+    writeFileSync(join(workspace.path, "remote.txt"), "merged remotely\n");
+    const pullRequestHead = await commitTask(workspace.path, task!);
+    execFileSync("git", ["push", "origin", `${pullRequestHead}:refs/heads/${workspace.branch}`], {
+      cwd: workspace.path,
+      stdio: "ignore",
+    });
+    execFileSync("git", ["push", "origin", `${pullRequestHead}:refs/heads/main`], {
+      cwd: workspace.path,
+      stdio: "ignore",
+    });
+    process.env.FAKE_GH_HEAD = pullRequestHead;
+    process.env.FAKE_GH_MERGE = pullRequestHead;
+    run.phase = "publish";
+    run.status = "interrupted";
+    run.effects = {
+      commit: { operationId: `${project.id}:${task!.id}:${run.id}:commit`, status: "completed", externalRef: pullRequestHead },
+      push: { operationId: `${project.id}:${task!.id}:${run.id}:push`, status: "uncertain" },
+      pullRequest: { operationId: `${project.id}:${task!.id}:${run.id}:pullRequest`, status: "completed", externalRef: "https://example.test/pr/7#7" },
+      merge: { operationId: `${project.id}:${task!.id}:${run.id}:merge`, status: "pending" },
+    };
+    run.error = {
+      phase: "publish",
+      message: "stale branch",
+      operationalRetry: { count: 1, nextAttemptAt: new Date(0).toISOString(), message: "stale branch" },
+    };
+    db.saveRun(run);
+    db.updateWorkspaceStatus(workspace.id, "preserved");
+    db.updateTaskStatus(task!.id, "operational_blocked", { summary: "Retry scheduled" });
+
+    await engine.runOnce();
+
+    assert.equal(db.getTask(task!.id)?.status, "succeeded");
+    assert.equal(db.getTask(task!.id)?.mergeSha, pullRequestHead);
+    assert.equal(db.getLatestRunForTask(task!.id)?.effects.merge?.status, "completed");
+    assert.equal(db.getLatestRunForTask(task!.id)?.status, "completed");
+    assert.equal(db.getWorkspace(workspace.id)?.status, "cleaned");
+    assert.throws(() => execFileSync("git", ["--git-dir", remote, "show-ref", "--verify", `refs/heads/${workspace.branch}`], { stdio: "ignore" }));
+  } finally {
+    db.close();
+    process.env.PATH = oldPath;
+    delete process.env.FAKE_GH_HEAD;
+    delete process.env.FAKE_GH_MERGE;
   }
 });
 

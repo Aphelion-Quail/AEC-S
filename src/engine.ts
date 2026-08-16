@@ -54,6 +54,7 @@ import {
   deleteRemoteTaskBranch,
   mergePullRequest,
   pushTaskBranch,
+  reconcileMergedPullRequest,
   remoteTaskBranchHead,
   waitForRequiredChecks,
 } from "./github.js";
@@ -413,6 +414,7 @@ export class AecEngine {
       this.renewLease(run);
       try {
         await this.withLeaseHeartbeat(run, async () => {
+          if (await this.reconcileCompletedGitHubMerge(run)) return;
           switch (run.phase) {
             case "prepare":
               await this.phasePrepare(run);
@@ -781,6 +783,31 @@ export class AecEngine {
       });
       throw error;
     }
+  }
+
+  private async reconcileCompletedGitHubMerge(run: Run): Promise<boolean> {
+    const { task, project, workspace } = this.contextFor(run);
+    if (project.deliveryMode !== "github") return false;
+    if (!["started", "pending", "uncertain"].includes(run.effects.merge?.status ?? "")) return false;
+    const prRef = run.effects.pullRequest?.status === "completed"
+      ? run.effects.pullRequest.externalRef
+      : undefined;
+    if (!prRef) return false;
+    const prNumber = Number(prRef.split("#").at(-1));
+    if (!Number.isFinite(prNumber)) throw new Error(`Invalid PR reference: ${prRef}`);
+    const expectedHeadSha = run.effects.push?.status === "completed"
+      ? run.effects.push.externalRef
+      : undefined;
+    const merged = await reconcileMergedPullRequest(workspace.path, prNumber, expectedHeadSha);
+    if (!merged) return false;
+    const operationId = this.operationId(project.id, task.id, run.id, "merge");
+    this.setEffect(run, "merge", { operationId, status: "completed", externalRef: merged.mergeSha });
+    this.db.updateTaskStatus(task.id, "succeeded", {
+      summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
+      mergeSha: merged.mergeSha,
+    });
+    this.setPhase(run, "cleanup", { error: undefined });
+    return true;
   }
 
   private async phaseCleanup(run: Run): Promise<void> {

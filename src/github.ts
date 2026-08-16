@@ -154,30 +154,44 @@ export async function mergePullRequest(
   prNumber: number,
   expectedHeadSha: string,
 ): Promise<{ url: string; mergeSha: string }> {
-  const before = await viewPullRequest(workspacePath, prNumber);
-  if (before.state === "MERGED" && before.headRefOid !== expectedHeadSha) {
-    throw new Error(`GitHub PR #${prNumber} was merged from unexpected head ${before.headRefOid ?? "unknown"}`);
+  const existing = await reconcileMergedPullRequest(workspacePath, prNumber, expectedHeadSha);
+  if (existing) return existing;
+  await execChecked(
+    gh(workspacePath, [
+      "pr",
+      "merge",
+      String(prNumber),
+      "--squash",
+      "--delete-branch",
+      "--match-head-commit",
+      expectedHeadSha,
+    ]),
+  );
+  const merged = await reconcileMergedPullRequest(workspacePath, prNumber, expectedHeadSha);
+  if (!merged) throw new Error(`GitHub PR #${prNumber} is not merged`);
+  return merged;
+}
+
+/**
+ * Reconcile the durable GitHub fact before attempting any new side effect.
+ *
+ * `expectedHeadSha` is optional for recovery of older Runs whose Push effect
+ * was overwritten as uncertain after GitHub had already deleted the branch.
+ * The PR number itself still comes from AEC's completed pullRequest effect.
+ */
+export async function reconcileMergedPullRequest(
+  workspacePath: string,
+  prNumber: number,
+  expectedHeadSha?: string,
+): Promise<{ url: string; mergeSha: string } | undefined> {
+  const pullRequest = await viewPullRequest(workspacePath, prNumber);
+  if (pullRequest.state !== "MERGED") return undefined;
+  if (expectedHeadSha && pullRequest.headRefOid !== expectedHeadSha) {
+    throw new Error(`GitHub PR #${prNumber} was merged from unexpected head ${pullRequest.headRefOid ?? "unknown"}`);
   }
-  if (before.state !== "MERGED") {
-    await execChecked(
-      gh(workspacePath, [
-        "pr",
-        "merge",
-        String(prNumber),
-        "--squash",
-        "--delete-branch",
-        "--match-head-commit",
-        expectedHeadSha,
-      ]),
-    );
-  }
-  const after = await viewPullRequest(workspacePath, prNumber);
-  if (after.headRefOid !== expectedHeadSha) {
-    throw new Error(`GitHub PR #${prNumber} head changed from expected ${expectedHeadSha}`);
-  }
-  const mergeSha = after.mergeCommit?.oid;
-  if (after.state !== "MERGED" || !mergeSha) throw new Error(`GitHub PR #${prNumber} is not merged`);
-  return { url: after.url, mergeSha };
+  const mergeSha = pullRequest.mergeCommit?.oid;
+  if (!mergeSha) throw new Error(`GitHub PR #${prNumber} is merged without a merge commit`);
+  return { url: pullRequest.url, mergeSha };
 }
 
 async function viewPullRequest(workspacePath: string, prNumber: number): Promise<PullRequest> {
