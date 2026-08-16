@@ -89,6 +89,10 @@ node dist/src/cli.js service restart
 
 Agent 与 Validation 命令由独立 job supervisor 执行，输出、最终结果和 PID 都落盘；超时会终止整个子进程组。Daemon 重启后会继续等待存活 job，读取已完成 job，或从最近安全阶段恢复。Run 写入由 lease owner 围栏保护，Agent 并发由数据库原子 slot 控制。Commit、Push、PR 和 Merge 均保存确定性 operation ID；`uncertain` 状态先对账，不盲目重试。
 
+LaunchAgent 会保存一个稳定的后台 `PATH`，默认覆盖 Homebrew、系统工具、用户常用 bin 和 ChatGPT 内置 Codex；可在安装前通过 `AEC_SERVICE_PATH` 显式覆盖。Daemon 周期性检查已启用 Agent 的健康状态：探测失败标记为 `degraded`，恢复后重新标记为 `available`，显式 `offline` 不会被自动覆盖。
+
+普通 Git、GitHub、验证器启动和其他运行期基础设施错误使用持久化指数退避自动恢复，默认最多重试五次；重试耗尽后才创建 `failure_exhausted` Human Decision。验证命令正常启动后的非零退出仍属于代码 Gate 失败，会进入 Repair；命令本身无法启动属于运维失败，不要求 Agent 修改代码。
+
 ## CLI 控制面
 
 ```text
@@ -143,6 +147,26 @@ node /absolute/path/to/AEC/dist/src/cli.js mcp
   }
 }
 ```
+
+WorkBuddy 桌面版可通过其内置 CLI 添加同一个 stdio server（确保这里的 `AEC_HOME` 与 LaunchAgent 完全一致）：
+
+```bash
+/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy \
+  mcp add-json --scope user aec \
+  '{"type":"stdio","command":"/opt/homebrew/bin/node","args":["/absolute/path/to/AEC/dist/src/cli.js","mcp"],"env":{"AEC_HOME":"/Users/you/Library/Application Support/AEC"}}'
+
+/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy mcp get aec
+```
+
+如果 WorkBuddy GUI 的连接器只接受 HTTP 或 npx，请使用随 daemon 启动的本机 Streamable HTTP MCP：
+
+```text
+http://127.0.0.1:7337/mcp
+```
+
+该端点只监听回环地址，不对局域网或公网开放。可通过 `AEC_MCP_HTTP_PORT` 修改端口；修改后需重新执行 `aec service install`，使 LaunchAgent 持久化新环境配置。健康检查地址为 `http://127.0.0.1:7337/healthz`。AEC 尚未发布 npm 包，因此当前不要在 GUI 中选择 npx。
+
+WorkBuddy 负责把自然语言转换为结构化 Task DAG、Directive 或 Resolution。最小 Escalation 集成可定期调用 `aec_list_decisions(status="pending")`，按 Decision ID 去重通知 Human，再通过 `aec_resolve_decision` 返回决定；AEC 不需要聊天记录作为工程记忆。
 
 ## GitHub delivery
 

@@ -189,5 +189,7 @@ test("retry_with_agent honors an eligible Human-selected alternate", async () =>
   assert.equal(db.getLatestRunForTask(task!.id)?.agentId, "agent-working");
   await engine.runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.ok(db.listEvents(project.id).some((event) =>
+    event.type === "task.status_changed" && event.payload.from === "ready" && event.payload.to === "running"));
   db.close();
 });

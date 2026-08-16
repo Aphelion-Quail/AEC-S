@@ -1,10 +1,58 @@
 import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { execCommand } from "./exec.js";
 import type { AecPaths } from "./paths.js";
 
 const LABEL = "dev.aec.core";
+
+export function servicePath(): string {
+  const configured = process.env.AEC_SERVICE_PATH?.trim();
+  if (configured) return configured;
+  const candidates = [
+    dirname(realpathSync(process.execPath)),
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+    join(homedir(), ".local", "bin"),
+    join(homedir(), ".cargo", "bin"),
+    "/Applications/ChatGPT.app/Contents/Resources",
+  ];
+  return [...new Set(candidates.filter((candidate) => existsSync(candidate)))].join(":");
+}
+
+export function launchAgentPlist(
+  entry: string,
+  paths: AecPaths,
+  runtimePath = servicePath(),
+  mcpHttpPort = process.env.AEC_MCP_HTTP_PORT?.trim(),
+): string {
+  const mcpPortEnvironment = mcpHttpPort
+    ? `\n    <key>AEC_MCP_HTTP_PORT</key><string>${xml(mcpHttpPort)}</string>`
+    : "";
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${LABEL}</string>
+  <key>ProgramArguments</key><array>
+    <string>${xml(realpathSync(process.execPath))}</string>
+    <string>${xml(realpathSync(entry))}</string>
+    <string>daemon</string>
+  </array>
+  <key>EnvironmentVariables</key><dict>
+    <key>AEC_HOME</key><string>${xml(paths.home)}</string>
+    <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${xml(join(paths.logs, "daemon.stdout.log"))}</string>
+  <key>StandardErrorPath</key><string>${xml(join(paths.logs, "daemon.stderr.log"))}</string>
+</dict></plist>
+`;
+}
 
 function plistPath(): string {
   return join(homedir(), "Library", "LaunchAgents", `${LABEL}.plist`);
@@ -21,22 +69,7 @@ export async function serviceAction(action: "install" | "start" | "stop" | "rest
     const entry = process.env.AEC_CLI_ENTRY ?? process.argv[1];
     if (!entry) throw new Error("Unable to locate AEC CLI entry");
     mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
-    const content = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>${LABEL}</string>
-  <key>ProgramArguments</key><array>
-    <string>${xml(realpathSync(process.execPath))}</string>
-    <string>${xml(realpathSync(entry))}</string>
-    <string>daemon</string>
-  </array>
-  <key>EnvironmentVariables</key><dict><key>AEC_HOME</key><string>${xml(paths.home)}</string></dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>${xml(join(paths.logs, "daemon.stdout.log"))}</string>
-  <key>StandardErrorPath</key><string>${xml(join(paths.logs, "daemon.stderr.log"))}</string>
-</dict></plist>
-`;
+    const content = launchAgentPlist(entry, paths);
     writeFileSync(plist, content, { mode: 0o600 });
     await execCommand({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
     const loaded = await execCommand({ program: "launchctl", args: ["bootstrap", domain, plist], timeoutSeconds: 30 });
