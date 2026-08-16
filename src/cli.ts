@@ -5,7 +5,7 @@ import { AecDatabase } from "./db.js";
 import { AecEngine } from "./engine.js";
 import { assertGitRepository } from "./git.js";
 import { runJobFile } from "./job.js";
-import { serveMcp } from "./mcp.js";
+import { serveMcp, serveMcpHttp } from "./mcp.js";
 import { doctor } from "./doctor.js";
 import { serviceAction } from "./service.js";
 import {
@@ -41,6 +41,7 @@ function usage(): never {
   aec service <install|start|stop|restart|status|uninstall>
   aec doctor
   aec mcp
+  aec mcp-http
 `);
   process.exit(2);
 }
@@ -90,7 +91,10 @@ async function main(): Promise<void> {
       const controller = new AbortController();
       process.on("SIGTERM", () => controller.abort());
       process.on("SIGINT", () => controller.abort());
-      await engine.daemon(controller.signal);
+      await Promise.all([
+        engine.daemon(controller.signal),
+        serveMcpHttp(db, { signal: controller.signal }),
+      ]);
     } else if (command === "status") {
       output(db.statusSnapshot(subcommand));
     } else if (command === "task" && ["pause", "resume", "cancel"].includes(subcommand ?? "")) {
@@ -114,11 +118,16 @@ async function main(): Promise<void> {
       output(await doctor(db));
     } else if (command === "mcp") {
       await serveMcp(db);
+    } else if (command === "mcp-http") {
+      const controller = new AbortController();
+      process.on("SIGTERM", () => controller.abort());
+      process.on("SIGINT", () => controller.abort());
+      await serveMcpHttp(db, { signal: controller.signal });
     } else {
       usage();
     }
   } finally {
-    if (command !== "mcp" && command !== "daemon") db.close();
+    if (command !== "mcp" && command !== "mcp-http" && command !== "daemon") db.close();
   }
 }
 

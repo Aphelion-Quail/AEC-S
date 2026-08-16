@@ -24,7 +24,15 @@ export function servicePath(): string {
   return [...new Set(candidates.filter((candidate) => existsSync(candidate)))].join(":");
 }
 
-export function launchAgentPlist(entry: string, paths: AecPaths, runtimePath = servicePath()): string {
+export function launchAgentPlist(
+  entry: string,
+  paths: AecPaths,
+  runtimePath = servicePath(),
+  mcpHttpPort = process.env.AEC_MCP_HTTP_PORT?.trim(),
+): string {
+  const mcpPortEnvironment = mcpHttpPort
+    ? `\n    <key>AEC_MCP_HTTP_PORT</key><string>${xml(mcpHttpPort)}</string>`
+    : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -36,7 +44,7 @@ export function launchAgentPlist(entry: string, paths: AecPaths, runtimePath = s
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>AEC_HOME</key><string>${xml(paths.home)}</string>
-    <key>PATH</key><string>${xml(runtimePath)}</string>
+    <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

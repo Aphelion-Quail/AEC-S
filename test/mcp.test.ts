@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { builtCliPath, tempDir } from "./helpers.js";
 import { AecDatabase } from "../src/db.js";
 import { createGitRepository } from "./helpers.js";
 import { aecVersion } from "../src/version.js";
+import { mcpHttpPort, serveMcpHttp } from "../src/mcp.js";
 
 test("exposes the six AEC MCP tools over stdio", async () => {
   const home = tempDir("aec-mcp-");
@@ -105,4 +107,45 @@ test("exposes the six AEC MCP tools over stdio", async () => {
   } finally {
     await client.close();
   }
+});
+
+test("exposes AEC MCP over loopback Streamable HTTP", async () => {
+  const home = tempDir("aec-mcp-http-");
+  const db = new AecDatabase(home);
+  db.createProject({ id: "mcp-http-project", name: "MCP HTTP", repoPath: createGitRepository() });
+  const controller = new AbortController();
+  let resolveUrl!: (url: string) => void;
+  const listening = new Promise<string>((resolve) => { resolveUrl = resolve; });
+  const serving = serveMcpHttp(db, {
+    port: 0,
+    signal: controller.signal,
+    onListening: resolveUrl,
+  });
+  const url = await listening;
+  const client = new Client({ name: "aec-http-test", version: "1.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+  try {
+    assert.deepEqual(client.getServerVersion(), { name: "aec-core", version: aecVersion() });
+    const tools = await client.listTools();
+    assert.equal(tools.tools.length, 6);
+    const status = await client.callTool({ name: "aec_status", arguments: { projectId: "mcp-http-project" } });
+    assert.equal(status.isError, undefined);
+    const health = await fetch(url.replace("/mcp", "/healthz"));
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), { status: "ok", service: "aec-mcp", version: aecVersion() });
+    const unsupported = await fetch(url);
+    assert.equal(unsupported.status, 405);
+  } finally {
+    await client.close();
+    controller.abort();
+    await serving;
+    db.close();
+  }
+});
+
+test("validates the configured MCP HTTP port", () => {
+  assert.equal(mcpHttpPort(undefined), 7337);
+  assert.equal(mcpHttpPort("7447"), 7447);
+  assert.throws(() => mcpHttpPort("0"), /between 1 and 65535/);
+  assert.throws(() => mcpHttpPort("not-a-port"), /between 1 and 65535/);
 });

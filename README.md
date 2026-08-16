@@ -158,6 +158,14 @@ WorkBuddy 桌面版可通过其内置 CLI 添加同一个 stdio server（确保�
 /Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy mcp get aec
 ```
 
+如果 WorkBuddy GUI 的连接器只接受 HTTP 或 npx，请使用随 daemon 启动的本机 Streamable HTTP MCP：
+
+```text
+http://127.0.0.1:7337/mcp
+```
+
+该端点只监听回环地址，不对局域网或公网开放。可通过 `AEC_MCP_HTTP_PORT` 修改端口；修改后需重新执行 `aec service install`，使 LaunchAgent 持久化新环境配置。健康检查地址为 `http://127.0.0.1:7337/healthz`。AEC 尚未发布 npm 包，因此当前不要在 GUI 中选择 npx。
+
 WorkBuddy 负责把自然语言转换为结构化 Task DAG、Directive 或 Resolution。最小 Escalation 集成可定期调用 `aec_list_decisions(status="pending")`，按 Decision ID 去重通知 Human，再通过 `aec_resolve_decision` 返回决定；AEC 不需要聊天记录作为工程记忆。
 
 ## GitHub delivery

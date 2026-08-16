@@ -13,9 +13,10 @@ test("LaunchAgent persists a stable executable PATH for background tools", () =>
     runs: join(home, "runs"),
     workspaces: join(home, "workspaces"),
     logs: join(home, "logs"),
-  }, runtimePath);
+  }, runtimePath, "7447");
   assert.match(plist, /<key>PATH<\/key>/);
   assert.match(plist, new RegExp(runtimePath.replaceAll("/", "\\/")));
   assert.match(plist, /<key>AEC_HOME<\/key>/);
+  assert.match(plist, /<key>AEC_MCP_HTTP_PORT<\/key><string>7447<\/string>/);
   assert.ok(servicePath().includes("/usr/bin"));
 });
