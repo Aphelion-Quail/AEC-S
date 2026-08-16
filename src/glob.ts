@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 
 function escapeRegex(value: string): string {
@@ -39,14 +40,41 @@ export function globsMayOverlap(left: string[], right: string[]): boolean {
   if (left.length === 0 || right.length === 0) return true;
   for (const a of left) {
     for (const b of right) {
-      const staticA = a.split(/[?*]/, 1)[0]!.replace(/\/$/, "");
-      const staticB = b.split(/[?*]/, 1)[0]!.replace(/\/$/, "");
-      if (!staticA || !staticB) return true;
-      if (staticA === staticB || staticA.startsWith(`${staticB}/`) || staticB.startsWith(`${staticA}/`)) return true;
-      if (globToRegExp(a).test(b) || globToRegExp(b).test(a)) return true;
+      if (globPairMayOverlap(a, b)) return true;
     }
   }
   return false;
+}
+
+function globPairMayOverlap(left: string, right: string): boolean {
+  const leftWildcard = /[?*]/.test(left);
+  const rightWildcard = /[?*]/.test(right);
+  if (!leftWildcard && !rightWildcard) return normalizeGlob(left) === normalizeGlob(right);
+  if (!leftWildcard && globToRegExp(right).test(normalizeGlob(left))) return true;
+  if (!rightWildcard && globToRegExp(left).test(normalizeGlob(right))) return true;
+  const leftRoot = literalDirectoryRoot(left);
+  const rightRoot = literalDirectoryRoot(right);
+  if (!leftRoot || !rightRoot) return true;
+  return (
+    leftRoot === rightRoot ||
+    leftRoot.startsWith(`${rightRoot}/`) ||
+    rightRoot.startsWith(`${leftRoot}/`)
+  );
+}
+
+function normalizeGlob(glob: string): string {
+  return glob.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function literalDirectoryRoot(glob: string): string {
+  const segments = normalizeGlob(glob).split("/");
+  const literal: string[] = [];
+  for (const segment of segments) {
+    if (/[?*]/.test(segment)) break;
+    literal.push(segment);
+  }
+  if (!/[?*]/.test(glob)) literal.pop();
+  return literal.join("/");
 }
 
 export function tasksConflict(
@@ -61,7 +89,9 @@ export function tasksConflict(
 }
 
 export function relativeInside(root: string, candidate: string): string {
-  const value = relative(root, candidate);
+  const realRoot = realpathSync(root);
+  const realCandidate = realpathSync(candidate);
+  const value = relative(realRoot, realCandidate);
   if (value === "" || (!value.startsWith(`..${sep}`) && value !== ".." && !value.startsWith(sep))) return value;
   throw new Error(`Path escapes workspace: ${candidate}`);
 }

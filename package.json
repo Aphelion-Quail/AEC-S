@@ -10,8 +10,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "test": "npm run build && node --test dist/test/*.test.js",
-    "test:all": "npm run check && npm test && npm run build"
+    "lint": "oxlint src test --deny-warnings",
+    "test:unit": "node --test --test-concurrency=1 dist/test/*.test.js",
+    "test": "npm run build && npm run test:unit",
+    "test:coverage:built": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='dist/src/**/*.js' --test-coverage-include-all --test-coverage-lines=80 --test-coverage-branches=65 --test-coverage-functions=80 dist/test/*.test.js",
+    "test:coverage": "npm run build && npm run test:coverage:built",
+    "test:all": "npm run lint && npm run check && npm run build && npm run test:coverage:built",
+    "audit": "npm audit"
   },
   "engines": {
     "node": ">=26"
@@ -22,6 +27,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
+    "oxlint": "^1.76.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }

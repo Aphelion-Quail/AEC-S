@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { matchesAny, tasksConflict } from "../src/glob.js";
+import { globsMayOverlap, matchesAny, tasksConflict } from "../src/glob.js";
 
 test("matches repository path globs", () => {
   assert.equal(matchesAny("src/core/a.ts", ["src/core/**"]), true);
@@ -30,4 +30,16 @@ test("allows only scope-independent tasks to run concurrently", () => {
     ),
     true,
   );
+});
+
+test("treats wildcard intersections as conflicts unless disjointness is proven", () => {
+  assert.equal(globsMayOverlap(["src/aaa*"], ["src/aa*a"]), true);
+  assert.equal(
+    tasksConflict(
+      { writeGlobs: ["src/aaa*"], impactGlobs: [] },
+      { writeGlobs: ["src/aa*a"], impactGlobs: [] },
+    ),
+    true,
+  );
+  assert.equal(globsMayOverlap(["src/a/**"], ["src/b/**"]), false);
 });

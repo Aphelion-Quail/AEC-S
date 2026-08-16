@@ -1,7 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
 import type { Project, Task } from "../src/types.js";
-import { authoritativeCommands, shouldRunFullValidation } from "../src/validation.js";
+import { authoritativeCommands, resolveValidationCommand, shouldRunFullValidation } from "../src/validation.js";
+import { outOfScopePaths } from "../src/git.js";
+import { tempDir } from "./helpers.js";
 
 const project = {
   id: "project",
@@ -46,4 +50,21 @@ test("does not run full validation for ordinary task changes", () => {
 test("runs full validation only for explicit or high-risk changes", () => {
   assert.equal(shouldRunFullValidation(project, task, ["src/shared/types.ts"]), true);
   assert.equal(authoritativeCommands(project, task, ["src/shared/types.ts"]).length, 3);
+});
+
+test("allows empty write scope while forcing full validation", () => {
+  const unscopedTask: Task = { ...task, scope: { writeGlobs: [], impactGlobs: [], tags: [] } };
+  assert.equal(shouldRunFullValidation(project, unscopedTask, ["src/anything.ts"]), true);
+  assert.deepEqual(outOfScopePaths(unscopedTask, ["src/anything.ts"]), []);
+});
+
+test("rejects validation cwd that escapes through a workspace symlink", () => {
+  const workspace = tempDir("aec-validation-workspace-");
+  const outside = tempDir("aec-validation-outside-");
+  mkdirSync(join(outside, "target"));
+  symlinkSync(join(outside, "target"), join(workspace, "linked"));
+  assert.throws(
+    () => resolveValidationCommand({ program: "true", args: [], cwd: "linked" }, workspace),
+    /Path escapes workspace/,
+  );
 });

@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import { startSupervisedJob, waitForJob } from "../src/job.js";
+import { processAlive, startSupervisedJob, waitForJob } from "../src/job.js";
+import { execCommand } from "../src/exec.js";
 import { tempDir } from "./helpers.js";
 
 test("does not report a timeout until the supervised process has exited", async () => {
@@ -24,4 +25,41 @@ test("does not report a timeout until the supervised process has exited", async 
   assert.equal(result.status, "timed_out");
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.equal(existsSync(marker), false, "a timed-out process must not keep mutating the workspace");
+});
+
+test("bounds captured command output in memory", async () => {
+  const result = await execCommand({
+    program: process.execPath,
+    args: ["-e", "for(let i=0;i<9216;i++) process.stdout.write('x'.repeat(1024))"],
+    timeoutSeconds: 10,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.match(result.stdout, /\[output truncated\]/);
+  assert.ok(result.stdout.length <= 8 * 1024 * 1024);
+});
+
+test("kills Agent descendant processes when a supervised command times out", async () => {
+  const directory = tempDir("aec-process-tree-");
+  const marker = join(directory, "descendant-write.txt");
+  const grandchild = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'leaked'), 500)`;
+  const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", parent], timeoutSeconds: 0.05 },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  }, join(directory, "input.json"));
+  assert.equal((await waitForJob(job, 1)).status, "timed_out");
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(existsSync(marker), false);
+});
+
+test("falls back to PID existence when the process inspector is unavailable", () => {
+  if (process.platform === "win32") return;
+  assert.equal(processAlive(process.pid, () => ({
+    status: null,
+    stdout: null,
+    error: new Error("spawnSync /bin/ps failed"),
+  })), true);
+  assert.equal(processAlive(process.pid, () => ({ status: 0, stdout: "Z\n" })), false);
 });

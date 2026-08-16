@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecDatabase } from "../src/db.js";
 import { AecEngine } from "../src/engine.js";
-import { createGitRepository, tempDir } from "./helpers.js";
+import { mergePullRequest, waitForRequiredChecks } from "../src/github.js";
+import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
+import type { Project } from "../src/types.js";
 
-const fakeAgent = resolve("dist/test/fixtures/fake-agent.js");
+const fakeAgent = fixturePath("fake-agent.js");
 
 test("publishes one idempotent PR and records the remote merge", async () => {
   const repo = createGitRepository();
@@ -23,23 +25,46 @@ test("publishes one idempotent PR and records the remote merge", async () => {
     ghPath,
     `#!/usr/bin/env node
 const fs = require('node:fs');
+const cp = require('node:child_process');
 const args = process.argv.slice(2);
 const statePath = process.env.FAKE_GH_STATE;
 const read = () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : null;
 const write = value => fs.writeFileSync(statePath, JSON.stringify(value));
+const remoteHead = () => cp.execFileSync('git', ['ls-remote', '--heads', 'origin', 'refs/heads/aec/task-github'], { encoding: 'utf8' }).trim().split(/\\s+/)[0];
 if (args[0] === 'pr' && args[1] === 'list') {
   const state = read();
-  process.stdout.write(JSON.stringify(state ? [{ number: 1, url: 'https://example.test/pr/1', state: state.state, headRefOid: state.head }] : []));
+  const head = state ? remoteHead() : undefined;
+  if (state && head) write({ ...state, head });
+  process.stdout.write(JSON.stringify(state ? [{ number: 1, url: 'https://example.test/pr/1', state: state.state, headRefOid: head }] : []));
 } else if (args[0] === 'pr' && args[1] === 'create') {
-  write({ state: 'OPEN', head: 'head' });
+  write({ state: 'OPEN', head: remoteHead(), checks: 0 });
   process.stdout.write('https://example.test/pr/1\\n');
 } else if (args[0] === 'pr' && args[1] === 'checks') {
-  process.stdout.write(JSON.stringify([{ name: 'test', state: 'SUCCESS', bucket: 'pass' }]));
+  const state = read();
+  if (state.checks === 0) {
+    write({ ...state, checks: 1 });
+    process.stderr.write('no checks reported on the branch');
+    process.exit(1);
+  } else if (state.checks === 1) {
+    write({ ...state, checks: 2 });
+    process.stdout.write(JSON.stringify([{ name: 'test', state: 'FAILURE', bucket: 'fail' }]));
+  } else {
+    process.stdout.write(JSON.stringify([{ name: 'test', state: 'SUCCESS', bucket: 'pass' }]));
+  }
 } else if (args[0] === 'pr' && args[1] === 'merge') {
-  write({ state: 'MERGED', head: 'head' });
+  const state = read();
+  const matchIndex = args.indexOf('--match-head-commit');
+  const expected = matchIndex >= 0 ? args[matchIndex + 1] : undefined;
+  const actual = remoteHead();
+  if (!expected || expected !== actual) {
+    process.stderr.write('head commit mismatch');
+    process.exit(1);
+  }
+  cp.execFileSync('git', ['push', '--force', 'origin', actual + ':refs/heads/main'], { stdio: 'ignore' });
+  write({ ...state, state: 'MERGED', head: actual, mergeSha: '1111111111111111111111111111111111111111' });
 } else if (args[0] === 'pr' && args[1] === 'view') {
   const state = read();
-  process.stdout.write(JSON.stringify({ number: 1, url: 'https://example.test/pr/1', state: state.state, headRefOid: state.head, mergeCommit: state.state === 'MERGED' ? { oid: '1111111111111111111111111111111111111111' } : null }));
+  process.stdout.write(JSON.stringify({ number: 1, url: 'https://example.test/pr/1', state: state.state, headRefOid: state.head, mergeCommit: state.mergeSha ? { oid: state.mergeSha } : null }));
 } else {
   process.stderr.write('unsupported fake gh command: ' + args.join(' '));
   process.exit(1);
@@ -50,6 +75,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
   const oldPath = process.env.PATH;
   process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
   process.env.FAKE_GH_STATE = ghState;
+  process.env.AEC_GITHUB_CHECK_POLL_MS = "10";
   try {
     const db = new AecDatabase(tempDir("aec-github-"));
     const project = db.createProject({
@@ -67,6 +93,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
       config: {
         binary: process.execPath,
         execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+        repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
       },
     });
     db.createAgent({
@@ -97,11 +124,74 @@ if (args[0] === 'pr' && args[1] === 'list') {
     assert.equal(run.effects.pullRequest?.status, "completed");
     assert.equal(run.effects.merge?.status, "completed");
     assert.equal(run.review?.reviewerAgentId, "reviewer");
+    assert.equal(
+      execFileSync("git", ["--git-dir", remote, "show", "refs/heads/main:remote.txt"], { encoding: "utf8" }),
+      "repaired\n",
+    );
+    assert.equal(
+      Number(execFileSync("git", ["--git-dir", remote, "rev-list", "--count", "refs/heads/main"], { encoding: "utf8" }).trim()),
+      3,
+    );
+    assert.throws(() => execFileSync("git", ["--git-dir", remote, "show-ref", "--verify", "refs/heads/aec/task-github"], { stdio: "ignore" }));
     await engine.runTask(task!.id);
     assert.equal(db.listRuns(task!.id).length, 1);
     db.close();
   } finally {
     process.env.PATH = oldPath;
     delete process.env.FAKE_GH_STATE;
+    delete process.env.AEC_GITHUB_CHECK_POLL_MS;
+  }
+});
+
+function githubProject(repoPath: string, requiredChecks: string[]): Project {
+  return {
+    id: "github-negative",
+    name: "github negative paths",
+    repoPath,
+    targetBranch: "main",
+    remoteName: "origin",
+    deliveryMode: "github",
+    intent: "",
+    defaultValidation: [],
+    fullValidation: [],
+    requiredChecks,
+    highRiskGlobs: [],
+    maxConcurrency: 2,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+test("rejects missing required checks before querying GitHub", async () => {
+  const repo = createGitRepository();
+  await assert.rejects(waitForRequiredChecks(githubProject(repo, []), repo, 1, 1, undefined, 1), /at least one/);
+});
+
+test("fails closed on GitHub authentication errors and unexpected merged heads", async () => {
+  const repo = createGitRepository();
+  const fakeBin = tempDir("aec-failing-gh-");
+  const ghPath = join(fakeBin, "gh");
+  writeFileSync(ghPath, `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === 'pr' && args[1] === 'checks') {
+  process.stderr.write('authentication required');
+  process.exit(1);
+}
+if (args[0] === 'pr' && args[1] === 'view') {
+  process.stdout.write(JSON.stringify({ number: 1, url: 'https://example.test/pr/1', state: 'MERGED', headRefOid: 'wrong-head', mergeCommit: { oid: 'merge-sha' } }));
+  process.exit(0);
+}
+process.exit(2);
+`);
+  chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+  try {
+    await assert.rejects(
+      waitForRequiredChecks(githubProject(repo, ["test"]), repo, 1, 1, undefined, 1),
+      /authentication required/,
+    );
+    await assert.rejects(mergePullRequest(repo, 1, "expected-head"), /unexpected head wrong-head/);
+  } finally {
+    process.env.PATH = oldPath;
   }
 });

@@ -8,10 +8,19 @@ import { runJobFile } from "./job.js";
 import { serveMcp } from "./mcp.js";
 import { doctor } from "./doctor.js";
 import { serviceAction } from "./service.js";
-import type { AgentInput, DecisionInput, ProjectInput, TaskInput } from "./types.js";
+import {
+  agentInputSchema,
+  agentUpdateSchema,
+  decisionInputSchema,
+  directiveSchema,
+  projectInputSchema,
+  projectUpdateSchema,
+  resolutionSchema,
+  taskGraphSchema,
+} from "./input.js";
 
-function readInput<T>(path: string): T {
-  return JSON.parse(readFileSync(resolve(path), "utf8")) as T;
+function readInput(path: string): unknown {
+  return JSON.parse(readFileSync(resolve(path), "utf8")) as unknown;
 }
 
 function output(value: unknown): void {
@@ -20,8 +29,8 @@ function output(value: unknown): void {
 
 function usage(): never {
   process.stderr.write(`AEC commands:
-  aec project add <project.json>
-  aec agent add <agent.json>
+  aec project <add|list|show|update> [...]
+  aec agent <add|list|show|update> [...]
   aec graph submit <graph.json>
   aec run [task-id]
   aec daemon
@@ -48,14 +57,30 @@ async function main(): Promise<void> {
   try {
     if (command === "project" && subcommand === "add") {
       const path = args[0] ?? usage();
-      const input = readInput<ProjectInput>(path);
+      const input = projectInputSchema.parse(readInput(path));
       input.repoPath = resolve(input.repoPath);
       await assertGitRepository(input.repoPath);
       output(db.createProject(input));
+    } else if (command === "project" && subcommand === "list") {
+      output({ projects: db.listProjects() });
+    } else if (command === "project" && subcommand === "show") {
+      const project = db.getProject(args[0] ?? usage());
+      if (!project) throw new Error(`Unknown project: ${args[0]}`);
+      output(project);
+    } else if (command === "project" && subcommand === "update") {
+      output(db.updateProject(args[0] ?? usage(), projectUpdateSchema.parse(readInput(args[1] ?? usage()))));
     } else if (command === "agent" && subcommand === "add") {
-      output(db.createAgent(readInput<AgentInput>(args[0] ?? usage())));
+      output(db.createAgent(agentInputSchema.parse(readInput(args[0] ?? usage()))));
+    } else if (command === "agent" && subcommand === "list") {
+      output({ agents: db.listAgents() });
+    } else if (command === "agent" && subcommand === "show") {
+      const agent = db.getAgent(args[0] ?? usage());
+      if (!agent) throw new Error(`Unknown agent: ${args[0]}`);
+      output(agent);
+    } else if (command === "agent" && subcommand === "update") {
+      output(db.updateAgent(args[0] ?? usage(), agentUpdateSchema.parse(readInput(args[1] ?? usage()))));
     } else if (command === "graph" && subcommand === "submit") {
-      const value = readInput<{ projectId: string; tasks: TaskInput[] }>(args[0] ?? usage());
+      const value = taskGraphSchema.parse(readInput(args[0] ?? usage()));
       output({ tasks: engine.submitGraph(value.projectId, value.tasks) });
     } else if (command === "run") {
       if (subcommand) await engine.runTask(subcommand);
@@ -72,7 +97,7 @@ async function main(): Promise<void> {
       const taskId = args[0] ?? usage();
       output({ tasks: engine.applyDirective({ action: subcommand as "pause" | "resume" | "cancel", taskIds: [taskId] }) });
     } else if (command === "directive" && subcommand === "apply") {
-      output({ tasks: engine.applyDirective(readInput<Parameters<AecEngine["applyDirective"]>[0]>(args[0] ?? usage())) });
+      output({ tasks: engine.applyDirective(directiveSchema.parse(readInput(args[0] ?? usage()))) });
     } else if (command === "decision" && subcommand === "list") {
       output({ decisions: db.listDecisions(args[0]) });
     } else if (command === "decision" && subcommand === "show") {
@@ -80,9 +105,9 @@ async function main(): Promise<void> {
       if (!decision) throw new Error(`Unknown decision: ${args[0]}`);
       output(decision);
     } else if (command === "decision" && subcommand === "resolve") {
-      output(engine.resolveDecision(args[0] ?? usage(), readInput<Record<string, unknown>>(args[1] ?? usage())));
+      output(engine.resolveDecision(args[0] ?? usage(), resolutionSchema.parse(readInput(args[1] ?? usage()))));
     } else if (command === "decision" && subcommand === "record") {
-      output(db.createDecision({ ...readInput<DecisionInput>(args[0] ?? usage()), status: "resolved" }));
+      output(db.createDecision({ ...decisionInputSchema.parse(readInput(args[0] ?? usage())), status: "resolved" }));
     } else if (command === "service" && ["install", "start", "stop", "restart", "status", "uninstall"].includes(subcommand ?? "")) {
       output({ message: await serviceAction(subcommand as "install" | "start" | "stop" | "restart" | "status" | "uninstall", db.paths) });
     } else if (command === "doctor") {

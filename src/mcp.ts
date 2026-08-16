@@ -3,7 +3,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import type { AecDatabase } from "./db.js";
 import { AecEngine } from "./engine.js";
-import type { DecisionInput, TaskInput } from "./types.js";
+import { decisionInputSchema, directiveSchema, idSchema, resolutionSchema, taskInputSchema } from "./input.js";
+import { aecVersion } from "./version.js";
 
 function result(value: unknown) {
   const object = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : { value };
@@ -15,13 +16,13 @@ function result(value: unknown) {
 
 export async function serveMcp(db: AecDatabase): Promise<void> {
   const engine = new AecEngine(db);
-  const server = new McpServer({ name: "aec-core", version: "0.1.0" });
+  const server = new McpServer({ name: "aec-core", version: aecVersion() });
 
   server.registerTool(
     "aec_status",
     {
       description: "Read AEC project, task, run, agent, workspace, decision, and recent event state.",
-      inputSchema: z.object({ projectId: z.string().optional() }),
+      inputSchema: z.object({ projectId: idSchema.optional() }).strict(),
     },
     async ({ projectId }) => result(db.statusSnapshot(projectId)),
   );
@@ -30,22 +31,16 @@ export async function serveMcp(db: AecDatabase): Promise<void> {
     "aec_submit_task_graph",
     {
       description: "Submit an immutable structured Task DAG to AEC.",
-      inputSchema: z.object({ projectId: z.string(), tasks: z.array(z.record(z.string(), z.unknown())).min(1) }),
+      inputSchema: z.object({ projectId: idSchema, tasks: z.array(taskInputSchema).min(1) }).strict(),
     },
-    async ({ projectId, tasks }) => result({ tasks: engine.submitGraph(projectId, tasks as unknown as TaskInput[]) }),
+    async ({ projectId, tasks }) => result({ tasks: engine.submitGraph(projectId, tasks) }),
   );
 
   server.registerTool(
     "aec_apply_directive",
     {
       description: "Apply a structured pause, resume, reprioritize, or cancel directive.",
-      inputSchema: z.object({
-        action: z.enum(["pause", "resume", "reprioritize", "cancel"]),
-        projectId: z.string().optional(),
-        taskIds: z.array(z.string()).optional(),
-        tags: z.array(z.string()).optional(),
-        priority: z.number().int().min(-100).max(100).optional(),
-      }),
+      inputSchema: directiveSchema,
     },
     async (input) => result({ tasks: engine.applyDirective(input) }),
   );
@@ -54,7 +49,7 @@ export async function serveMcp(db: AecDatabase): Promise<void> {
     "aec_list_decisions",
     {
       description: "List pending or resolved AEC decisions and Human escalations.",
-      inputSchema: z.object({ projectId: z.string().optional(), status: z.enum(["pending", "resolved"]).optional() }),
+      inputSchema: z.object({ projectId: idSchema.optional(), status: z.enum(["pending", "resolved"]).optional() }).strict(),
     },
     async ({ projectId, status }) => result({ decisions: db.listDecisions(projectId, status) }),
   );
@@ -63,7 +58,7 @@ export async function serveMcp(db: AecDatabase): Promise<void> {
     "aec_resolve_decision",
     {
       description: "Persist a Human resolution and apply its requested task action.",
-      inputSchema: z.object({ decisionId: z.string(), resolution: z.record(z.string(), z.unknown()) }),
+      inputSchema: z.object({ decisionId: idSchema, resolution: resolutionSchema }).strict(),
     },
     async ({ decisionId, resolution }) => result({ decision: engine.resolveDecision(decisionId, resolution) }),
   );
@@ -72,15 +67,9 @@ export async function serveMcp(db: AecDatabase): Promise<void> {
     "aec_record_decision",
     {
       description: "Record a durable project or task decision through AEC Core.",
-      inputSchema: z.object({
-        projectId: z.string(),
-        taskId: z.string().optional(),
-        kind: z.enum(["architecture", "product", "tradeoff", "record"]),
-        title: z.string().min(1),
-        body: z.string().min(1),
-      }),
+      inputSchema: decisionInputSchema.omit({ status: true }),
     },
-    async (input) => result({ decision: db.createDecision({ ...input, status: "resolved" } as DecisionInput) }),
+    async (input) => result({ decision: db.createDecision({ ...input, status: "resolved" }) }),
   );
 
   const transport = new StdioServerTransport();
