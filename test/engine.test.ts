@@ -498,6 +498,30 @@ test("records timed-out authoritative validation and repairs it", async () => {
   db.close();
 });
 
+test("treats a validation spawn error as operational instead of asking the Agent to repair code", async () => {
+  const repo = createGitRepository();
+  const db = new AecDatabase(tempDir("aec-validation-spawn-error-"));
+  const project = db.createProject({ name: "validation-spawn-error", repoPath: repo });
+  registerFakeAgents(db);
+  const [task] = new AecEngine(db).submitGraph(project.id, [{
+    id: "task-validation-spawn-error",
+    projectId: project.id,
+    title: "Classify validator startup failure",
+    goal: "Create spawn-error.txt",
+    scope: { writeGlobs: ["spawn-error.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Infrastructure failure does not trigger code repair"],
+    validationCommands: [{ program: "/definitely/missing/aec-validator", args: [] }],
+  }]);
+  await new AecEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.equal(run.status, "interrupted");
+  assert.equal(run.repairCount, 0);
+  assert.match(JSON.stringify(run.error), /operationalRetry/);
+  assert.match(JSON.stringify(run.error), /validation could not start/);
+  db.close();
+});
+
 test("repairs a blocking independent Review finding and reviews the new diff", async () => {
   const repo = createGitRepository();
   const db = new AecDatabase(tempDir("aec-review-repair-"));
@@ -772,5 +796,108 @@ test("isolates one Run startup failure without terminating sibling work", async 
   assert.equal(await engine.runOnce(), 2);
   assert.equal(db.getTask(healthy!.id)?.status, "succeeded");
   assert.equal(db.getTask("task-broken-start")?.status, "operational_blocked");
+  assert.match(JSON.stringify(db.getLatestRunForTask("task-broken-start")?.error), /operationalRetry/);
+  db.close();
+});
+
+test("automatically retries an operationally blocked Run after the dependency recovers", async () => {
+  const repo = createGitRepository();
+  const db = new AecDatabase(tempDir("aec-operational-retry-"));
+  const project = db.createProject({ name: "operational-retry", repoPath: repo });
+  db.createAgent({
+    id: "retry-executor",
+    name: "retry executor",
+    adapter: "command",
+    roles: ["executor"],
+    config: {
+      binary: process.execPath,
+      execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+    },
+  });
+  const engine = new AecEngine(db, { operationalRetryBaseMs: 1 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-operational-retry",
+    projectId: project.id,
+    title: "Recover missing reviewer",
+    goal: "Create retry.txt",
+    scope: { writeGlobs: ["retry.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Task resumes without a Human directive"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.equal(db.getLatestRunForTask(task!.id)?.status, "interrupted");
+  db.createAgent({
+    id: "retry-reviewer",
+    name: "retry reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    config: {
+      binary: process.execPath,
+      review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
+    },
+  });
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+  await engine.runUntilIdle();
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.equal(db.listRuns(task!.id).length, 1);
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "run.retry_ready"));
+  db.close();
+});
+
+test("escalates only after persisted operational retries are exhausted", async () => {
+  const repo = createGitRepository();
+  const db = new AecDatabase(tempDir("aec-operational-exhaustion-"));
+  const project = db.createProject({ name: "operational-exhaustion", repoPath: repo });
+  db.createAgent({
+    id: "exhaustion-executor",
+    name: "exhaustion executor",
+    adapter: "command",
+    roles: ["executor"],
+    config: {
+      binary: process.execPath,
+      execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+    },
+  });
+  const engine = new AecEngine(db, { operationalRetryBaseMs: 1, maxOperationalRetries: 1 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-operational-exhaustion",
+    projectId: project.id,
+    title: "Exhaust missing reviewer retries",
+    goal: "Create exhausted.txt",
+    scope: { writeGlobs: ["exhausted.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Escalation is bounded"],
+  }]);
+  await engine.runTask(task!.id);
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 5));
+  await engine.runUntilIdle();
+  assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
+  assert.equal(db.listDecisions(project.id, "pending").at(-1)?.kind, "failure_exhausted");
+  db.close();
+});
+
+test("reconciles enabled Agent health while preserving explicit offline state", async () => {
+  const db = new AecDatabase(tempDir("aec-agent-health-"));
+  db.createAgent({
+    id: "health-agent",
+    name: "health agent",
+    adapter: "command",
+    roles: ["executor"],
+    config: { binary: "/definitely/missing/aec-agent" },
+  });
+  db.createAgent({
+    id: "manual-offline-agent",
+    name: "manual offline agent",
+    adapter: "command",
+    roles: ["executor"],
+    availability: "offline",
+    config: { binary: process.execPath },
+  });
+  const engine = new AecEngine(db);
+  await engine.refreshAgentAvailability();
+  assert.equal(db.getAgent("health-agent")?.availability, "degraded");
+  assert.equal(db.getAgent("manual-offline-agent")?.availability, "offline");
+  db.updateAgent("health-agent", { config: { binary: process.execPath } });
+  await engine.refreshAgentAvailability();
+  assert.equal(db.getAgent("health-agent")?.availability, "available");
   db.close();
 });

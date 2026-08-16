@@ -62,6 +62,9 @@ import { redactJson, redactText } from "./redaction.js";
 type EngineOptions = {
   globalConcurrency?: number;
   leaseHeartbeatMs?: number;
+  operationalRetryBaseMs?: number;
+  maxOperationalRetries?: number;
+  agentHealthcheckIntervalMs?: number;
 };
 
 type JobExecution = {
@@ -74,13 +77,20 @@ type JobExecution = {
 export class AecEngine {
   private readonly globalConcurrency: number;
   private readonly leaseHeartbeatMs: number;
+  private readonly operationalRetryBaseMs: number;
+  private readonly maxOperationalRetries: number;
+  private readonly agentHealthcheckIntervalMs: number;
   private readonly inProcess = new Set<string>();
   private readonly leaseOwner = `${process.pid}:${newId("lease")}`;
   private schedulerCycles = 0;
+  private lastAgentHealthcheckAt = 0;
 
   constructor(readonly db: AecDatabase, options: EngineOptions = {}) {
     this.globalConcurrency = options.globalConcurrency ?? 2;
     this.leaseHeartbeatMs = options.leaseHeartbeatMs ?? 10_000;
+    this.operationalRetryBaseMs = options.operationalRetryBaseMs ?? 5_000;
+    this.maxOperationalRetries = options.maxOperationalRetries ?? 5;
+    this.agentHealthcheckIntervalMs = options.agentHealthcheckIntervalMs ?? 60_000;
   }
 
   submitGraph(projectId: string, inputs: TaskInput[]): Task[] {
@@ -173,6 +183,7 @@ export class AecEngine {
   async runOnce(): Promise<number> {
     this.schedulerCycles += 1;
     if (this.schedulerCycles % 100 === 0) this.db.pruneEvents();
+    this.promoteOperationalRetries();
     this.promoteTasks();
     this.recalculateAgentLoad();
     const allActiveRuns = this.db.listActiveRuns();
@@ -242,8 +253,48 @@ export class AecEngine {
 
   async daemon(signal?: AbortSignal): Promise<void> {
     while (!signal?.aborted) {
+      await this.refreshAgentAvailabilityIfDue();
       const count = await this.runOnce();
       if (count === 0) await new Promise((resolve) => setTimeout(resolve, 1_000));
+    }
+  }
+
+  async refreshAgentAvailability(): Promise<void> {
+    for (const agent of this.db.listAgents()) {
+      if (!agent.enabled || agent.availability === "offline") continue;
+      let healthy = false;
+      try {
+        healthy = (await adapterFor(agent).healthcheck()).ok;
+      } catch {
+        healthy = false;
+      }
+      const availability = healthy ? "available" : "degraded";
+      if (agent.availability !== availability) this.db.updateAgent(agent.id, { availability });
+    }
+    this.lastAgentHealthcheckAt = Date.now();
+  }
+
+  private async refreshAgentAvailabilityIfDue(): Promise<void> {
+    if (Date.now() - this.lastAgentHealthcheckAt < this.agentHealthcheckIntervalMs) return;
+    await this.refreshAgentAvailability();
+  }
+
+  private promoteOperationalRetries(): void {
+    for (const task of this.db.listTasks()) {
+      if (task.status !== "operational_blocked") continue;
+      const run = this.db.getLatestRunForTask(task.id);
+      const retry = run?.error?.operationalRetry;
+      if (!run || run.status !== "interrupted" || !retry || typeof retry !== "object" || Array.isArray(retry)) continue;
+      const nextAttemptAt = String((retry as JsonObject).nextAttemptAt ?? "");
+      if (!nextAttemptAt || Date.parse(nextAttemptAt) > Date.now()) continue;
+      this.db.updateTaskStatus(task.id, "ready", { summary: "Automatic operational retry is ready" });
+      this.db.appendEvent({
+        projectId: task.projectId,
+        taskId: task.id,
+        runId: run.id,
+        type: "run.retry_ready",
+        payload: { nextAttemptAt },
+      });
     }
   }
 
@@ -265,6 +316,8 @@ export class AecEngine {
         run = await this.createRun(task, preferredAgentId);
       }
       if (!run || !this.claimRun(run)) return;
+      task = this.requireTask(taskId);
+      if (task.status === "ready") this.db.updateTaskStatus(task.id, "running");
       await this.executeRun(run.id);
       task = this.requireTask(taskId);
       if (task.status === "running" && this.db.getRun(run.id)?.status !== "active") {
@@ -278,11 +331,18 @@ export class AecEngine {
 
   private async createRun(task: Task, preferredAgentId?: string): Promise<Run | undefined> {
     const project = this.requireProject(task.projectId);
-    if (project.deliveryMode === "github") await fetchRemote(project);
     const preferred = preferredAgentId ? this.db.getAgent(preferredAgentId) : undefined;
     const agent = preferred ?? this.selectAgent("executor", task.requiredCapabilities);
     if (!agent) throw new Error(`No available executor for task ${task.id}`);
-    const baseSha = await branchHead(project.repoPath, projectBaseRef(project));
+    // Phase prepare resolves and persists the authoritative base. Keeping Run
+    // creation independent of Git I/O ensures even an initial fetch/repository
+    // failure has durable retry state instead of becoming a stranded Task.
+    let baseSha = "";
+    try {
+      baseSha = await branchHead(project.repoPath, projectBaseRef(project));
+    } catch {
+      // The prepare phase will retry the same fact under the normal Run policy.
+    }
     const runId = newId("run");
     const workspaceId = newId("workspace");
     const logDir = join(this.db.paths.runs, runId);
@@ -464,6 +524,9 @@ export class AecEngine {
         fixedPaths: pathsForCommand,
         allowFailure: true,
       });
+      if (execution.result.status === "spawn_error") {
+        throw new Error(`Authoritative validation could not start: ${name}`);
+      }
       const validation: ValidationResult = {
         name,
         command: original,
@@ -878,7 +941,12 @@ export class AecEngine {
 
   private async handlePhaseError(run: Run, error: unknown): Promise<void> {
     const message = redactText(error instanceof Error ? error.message : String(error));
-    run.error = this.failureEvidence(run, { phase: run.phase, message });
+    const operationalRetry = run.error?.operationalRetry;
+    run.error = this.failureEvidence(run, {
+      phase: run.phase,
+      message,
+      ...(operationalRetry !== undefined ? { operationalRetry } : {}),
+    });
     run.job = undefined;
     if (["execute", "repair"].includes(run.phase)) {
       if (run.attempt < 3) {
@@ -899,14 +967,15 @@ export class AecEngine {
       this.setPhase(run, "repair", { error: this.failureEvidence(run, { phase: run.phase, message }) });
       return;
     }
-    run.status = "interrupted";
-    run.updatedAt = nowIso();
-    run.leaseUntil = undefined;
-    run.leaseOwner = undefined;
-    this.saveRun(run);
     const task = this.requireTask(run.taskId);
-    if (!(run.phase === "cleanup" && task.status === "succeeded")) {
-      this.db.updateTaskStatus(run.taskId, "operational_blocked", { summary: message });
+    if (run.phase === "cleanup" && task.status === "succeeded") {
+      run.status = "interrupted";
+      run.updatedAt = nowIso();
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+    } else {
+      this.scheduleOperationalRetry(run, message);
     }
     const workspace = this.db.getWorkspace(run.workspaceId);
     if (workspace) this.db.updateWorkspaceStatus(workspace.id, "preserved");
@@ -915,6 +984,63 @@ export class AecEngine {
       runId: run.id,
       type: "run.operational_blocked",
       payload: { phase: run.phase, message },
+    });
+  }
+
+  private scheduleOperationalRetry(run: Run, message: string): void {
+    const task = this.requireTask(run.taskId);
+    const previous = run.error?.operationalRetry;
+    const previousCount = previous && typeof previous === "object" && !Array.isArray(previous)
+      ? Number((previous as JsonObject).count ?? 0)
+      : 0;
+    const count = previousCount + 1;
+    if (count > this.maxOperationalRetries) {
+      this.escalateOperationalFailure(run, message, previousCount);
+      return;
+    }
+    const delayMs = Math.min(this.operationalRetryBaseMs * 2 ** Math.max(0, count - 1), 5 * 60_000);
+    const nextAttemptAt = new Date(Date.now() + delayMs).toISOString();
+    run.error = this.failureEvidence(run, {
+      ...run.error,
+      operationalRetry: { count, nextAttemptAt, message },
+    });
+    run.status = "interrupted";
+    run.updatedAt = nowIso();
+    run.leaseUntil = undefined;
+    run.leaseOwner = undefined;
+    this.saveRun(run);
+    this.db.updateTaskStatus(task.id, "operational_blocked", {
+      summary: `Automatic retry ${count}/${this.maxOperationalRetries} scheduled for ${nextAttemptAt}: ${message}`,
+    });
+    this.db.appendEvent({
+      projectId: task.projectId,
+      taskId: task.id,
+      runId: run.id,
+      type: "run.retry_scheduled",
+      payload: { count, nextAttemptAt, message },
+    });
+  }
+
+  private escalateOperationalFailure(run: Run, message: string, retries: number): void {
+    const task = this.requireTask(run.taskId);
+    this.db.transaction(() => {
+      const existing = this.db.listDecisions(task.projectId, "pending")
+        .find((decision) => decision.taskId === task.id && decision.kind === "failure_exhausted");
+      const decision = existing ?? this.db.createDecision({
+        projectId: task.projectId,
+        taskId: task.id,
+        kind: "failure_exhausted",
+        title: `Operational retries exhausted: ${task.title}`,
+        body: JSON.stringify({ message, retries, runId: run.id, phase: run.phase }, null, 2),
+        options: ["resume_task", "replace_task", "cancel_task"],
+      });
+      run.status = "failed";
+      run.updatedAt = nowIso();
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatus(task.id, "awaiting_human", { summary: `Decision required: ${decision.id}` });
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
     });
   }
 
