@@ -2,6 +2,7 @@
   "name": "aec-s-core",
   "version": "0.1.0",
   "private": true,
+  "license": "SEE LICENSE IN LICENSE",
   "type": "module",
   "description": "Agent Equilibrium Control System core infrastructure MVP",
   "bin": {
@@ -10,12 +11,13 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
-    "lint": "oxlint src test --deny-warnings",
+    "check:licenses": "node scripts/check-licenses.mjs",
+    "lint": "oxlint src test scripts --deny-warnings",
     "test:unit": "node --test --test-concurrency=1 dist/test/*.test.js",
     "test": "npm run build && npm run test:unit",
     "test:coverage:built": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='dist/src/**/*.js' --test-coverage-include-all --test-coverage-lines=80 --test-coverage-branches=65 --test-coverage-functions=80 dist/test/*.test.js",
     "test:coverage": "npm run build && npm run test:coverage:built",
-    "test:all": "npm run lint && npm run check && npm run build && npm run test:coverage:built",
+    "test:all": "npm run lint && npm run check && npm run check:licenses && npm run build && npm run test:coverage:built",
     "audit": "npm audit"
   },
   "engines": {
