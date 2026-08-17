@@ -2,7 +2,7 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { mkdirSync } from "node:fs";
 
-export type AecPaths = {
+export type AecSPaths = {
   home: string;
   database: string;
   runs: string;
@@ -10,20 +10,20 @@ export type AecPaths = {
   logs: string;
 };
 
-export function getAecPaths(explicitHome?: string): AecPaths {
+export function getAecSPaths(explicitHome?: string): AecSPaths {
   const home = resolve(
-    explicitHome ?? process.env.AEC_HOME ?? join(homedir(), "Library", "Application Support", "AEC"),
+    explicitHome ?? process.env.AEC_S_HOME ?? join(homedir(), "Library", "Application Support", "AEC-S"),
   );
   return {
     home,
-    database: join(home, "aec.db"),
+    database: join(home, "aec-s.db"),
     runs: join(home, "runs"),
     workspaces: join(home, "workspaces"),
     logs: join(home, "logs"),
   };
 }
 
-export function ensureAecPaths(paths: AecPaths): void {
+export function ensureAecSPaths(paths: AecSPaths): void {
   for (const path of [paths.home, paths.runs, paths.workspaces, paths.logs]) {
     mkdirSync(path, { recursive: true, mode: 0o700 });
   }

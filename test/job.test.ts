@@ -7,7 +7,7 @@ import { execCommand } from "../src/exec.js";
 import { tempDir } from "./helpers.js";
 
 test("does not report a timeout until the supervised process has exited", async () => {
-  const directory = tempDir("aec-timeout-");
+  const directory = tempDir("aec-s-timeout-");
   const marker = join(directory, "late-write.txt");
   const inputPath = join(directory, "job.input.json");
   const resultPath = join(directory, "job.result.json");
@@ -39,7 +39,7 @@ test("bounds captured command output in memory", async () => {
 });
 
 test("kills Agent descendant processes when a supervised command times out", async () => {
-  const directory = tempDir("aec-process-tree-");
+  const directory = tempDir("aec-s-process-tree-");
   const marker = join(directory, "descendant-write.txt");
   const grandchild = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'leaked'), 500)`;
   const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});setInterval(()=>{},1000)`;

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 
 type PackageMetadata = { version?: unknown };
 
-export function aecVersion(): string {
+export function aecSVersion(): string {
   const candidates = [
     new URL("../package.json", import.meta.url),
     new URL("../../package.json", import.meta.url),
@@ -14,5 +14,5 @@ export function aecVersion(): string {
     const metadata = JSON.parse(readFileSync(path, "utf8")) as PackageMetadata;
     if (typeof metadata.version === "string" && metadata.version.length > 0) return metadata.version;
   }
-  throw new Error("Unable to locate AEC package version");
+  throw new Error("Unable to locate AEC-S package version");
 }

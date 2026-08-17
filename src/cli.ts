@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { AecDatabase } from "./db.js";
-import { AecEngine } from "./engine.js";
+import { AecSDatabase } from "./db.js";
+import { AecSEngine } from "./engine.js";
 import { assertGitRepository } from "./git.js";
 import { runJobFile } from "./job.js";
 import { serveMcp, serveMcpHttp } from "./mcp.js";
@@ -28,20 +28,20 @@ function output(value: unknown): void {
 }
 
 function usage(): never {
-  process.stderr.write(`AEC commands:
-  aec project <add|list|show|update> [...]
-  aec agent <add|list|show|update> [...]
-  aec graph submit <graph.json>
-  aec run [task-id]
-  aec daemon
-  aec status [project-id]
-  aec task <pause|resume|cancel> <task-id>
-  aec directive apply <directive.json>
-  aec decision <list|show|resolve|record> [...]
-  aec service <install|start|stop|restart|status|uninstall>
-  aec doctor
-  aec mcp
-  aec mcp-http
+  process.stderr.write(`AEC-S commands:
+  aec-s project <add|list|show|update> [...]
+  aec-s agent <add|list|show|update> [...]
+  aec-s graph submit <graph.json>
+  aec-s run [task-id]
+  aec-s daemon
+  aec-s status [project-id]
+  aec-s task <pause|resume|cancel> <task-id>
+  aec-s directive apply <directive.json>
+  aec-s decision <list|show|resolve|record> [...]
+  aec-s service <install|start|stop|restart|status|uninstall>
+  aec-s doctor
+  aec-s mcp
+  aec-s mcp-http
 `);
   process.exit(2);
 }
@@ -53,8 +53,8 @@ async function main(): Promise<void> {
     await runJobFile(subcommand);
     return;
   }
-  const db = new AecDatabase();
-  const engine = new AecEngine(db);
+  const db = new AecSDatabase();
+  const engine = new AecSEngine(db);
   try {
     if (command === "project" && subcommand === "add") {
       const path = args[0] ?? usage();

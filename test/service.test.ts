@@ -9,14 +9,15 @@ test("LaunchAgent persists a stable executable PATH for background tools", () =>
   const runtimePath = "/opt/homebrew/bin:/usr/bin:/Applications/ChatGPT.app/Contents/Resources";
   const plist = launchAgentPlist(builtCliPath(), {
     home,
-    database: join(home, "aec.db"),
+    database: join(home, "aec-s.db"),
     runs: join(home, "runs"),
     workspaces: join(home, "workspaces"),
     logs: join(home, "logs"),
   }, runtimePath, "7447");
   assert.match(plist, /<key>PATH<\/key>/);
+  assert.match(plist, /<key>Label<\/key><string>dev\.aec-s\.core<\/string>/);
   assert.match(plist, new RegExp(runtimePath.replaceAll("/", "\\/")));
-  assert.match(plist, /<key>AEC_HOME<\/key>/);
-  assert.match(plist, /<key>AEC_MCP_HTTP_PORT<\/key><string>7447<\/string>/);
+  assert.match(plist, /<key>AEC_S_HOME<\/key>/);
+  assert.match(plist, /<key>AEC_S_MCP_HTTP_PORT<\/key><string>7447<\/string>/);
   assert.ok(servicePath().includes("/usr/bin"));
 });

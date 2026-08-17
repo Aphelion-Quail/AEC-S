@@ -12,7 +12,7 @@ test("parses tracked, untracked, renamed, and special Git paths without corrupti
   const original = " leading\n名字.txt";
   writeFileSync(join(repo, original), "original\n");
   execFileSync("git", ["add", "--", original], { cwd: repo });
-  execFileSync("git", ["-c", "user.name=AEC Test", "-c", "user.email=aec-test@local", "commit", "-m", "special"], {
+  execFileSync("git", ["-c", "user.name=AEC-S Test", "-c", "user.email=aec-s-test@local", "commit", "-m", "special"], {
     cwd: repo,
     stdio: "ignore",
   });
@@ -43,15 +43,15 @@ test("reuses an existing worktree with its actual historical base", async () => 
     maxConcurrency: 2,
     createdAt: new Date().toISOString(),
   };
-  const workspace = join(tempDir("aec-existing-worktree-"), "workspace");
-  const initial = await createWorktree(project, workspace, "aec/worktree-base");
+  const workspace = join(tempDir("aec-s-existing-worktree-"), "workspace");
+  const initial = await createWorktree(project, workspace, "aec-s/worktree-base");
   writeFileSync(join(repo, "later.txt"), "later\n");
   execFileSync("git", ["add", "later.txt"], { cwd: repo });
-  execFileSync("git", ["-c", "user.name=AEC Test", "-c", "user.email=aec-test@local", "commit", "-m", "later"], {
+  execFileSync("git", ["-c", "user.name=AEC-S Test", "-c", "user.email=aec-s-test@local", "commit", "-m", "later"], {
     cwd: repo,
     stdio: "ignore",
   });
   assert.notEqual(await branchHead(repo, "main"), initial);
-  assert.equal(await createWorktree(project, workspace, "aec/worktree-base"), initial);
-  await cleanupWorktree(project, workspace, "aec/worktree-base");
+  assert.equal(await createWorktree(project, workspace, "aec-s/worktree-base"), initial);
+  await cleanupWorktree(project, workspace, "aec-s/worktree-base");
 });

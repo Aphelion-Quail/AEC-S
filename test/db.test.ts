@@ -2,13 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
-import { AecDatabase } from "../src/db.js";
+import { AecSDatabase } from "../src/db.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 import type { Run } from "../src/types.js";
 
 test("persists the seven core entity projections", () => {
-  const home = tempDir("aec-home-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-home-");
+  const db = new AecSDatabase(home);
   const project = db.createProject({ name: "fixture", repoPath: createGitRepository() });
   const agent = db.createAgent({ name: "fake", adapter: "command", roles: ["executor"], config: { binary: process.execPath } });
   const task = db.createTask({
@@ -40,7 +40,7 @@ test("persists the seven core entity projections", () => {
   assert.equal(db.getTask(task.id)?.mergeSha, undefined);
   assert.ok(db.listEvents(project.id).length >= 3);
   db.close();
-  const reopened = new AecDatabase(home);
+  const reopened = new AecSDatabase(home);
   assert.deepEqual(
     reopened.db.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all(),
     appliedMigrations,
@@ -50,8 +50,8 @@ test("persists the seven core entity projections", () => {
 });
 
 test("upgrades a pre-lease Run schema through recorded migrations", () => {
-  const home = tempDir("aec-old-schema-");
-  const legacy = new DatabaseSync(join(home, "aec.db"));
+  const home = tempDir("aec-s-old-schema-");
+  const legacy = new DatabaseSync(join(home, "aec-s.db"));
   legacy.exec(`CREATE TABLE runs (
     id TEXT PRIMARY KEY,
     task_id TEXT NOT NULL,
@@ -77,7 +77,7 @@ test("upgrades a pre-lease Run schema through recorded migrations", () => {
   )`);
   legacy.close();
 
-  const db = new AecDatabase(home);
+  const db = new AecSDatabase(home);
   const columns = (db.db.prepare("PRAGMA table_info(runs)").all() as Array<{ name: string }>).map((column) => column.name);
   assert.ok(columns.includes("lease_owner"));
   assert.ok(columns.includes("worker_result_json"));
@@ -91,8 +91,8 @@ test("upgrades a pre-lease Run schema through recorded migrations", () => {
 });
 
 test("fences stale Run writes and atomically resumes an interrupted Run", () => {
-  const home = tempDir("aec-run-fence-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-run-fence-");
+  const db = new AecSDatabase(home);
   const project = db.createProject({ name: "fence", repoPath: createGitRepository() });
   const agent = db.createAgent({ name: "executor", adapter: "command", roles: ["executor"] });
   const task = db.createTask({
@@ -131,7 +131,7 @@ test("fences stale Run writes and atomically resumes an interrupted Run", () => 
   assert.equal(db.getRun(run.id)?.leaseOwner, "owner-b");
 
   db.db.prepare("UPDATE runs SET status='interrupted', lease_owner=NULL, lease_until=NULL WHERE id=?").run(run.id);
-  const competitor = new AecDatabase(home);
+  const competitor = new AecSDatabase(home);
   assert.equal(db.resumeInterruptedRun(run.id, "winner", new Date(Date.now() + 60_000).toISOString()), true);
   assert.equal(competitor.resumeInterruptedRun(run.id, "loser", new Date(Date.now() + 60_000).toISOString()), false);
   assert.equal(competitor.getRun(run.id)?.leaseOwner, "winner");
@@ -152,10 +152,10 @@ test("fences stale Run writes and atomically resumes an interrupted Run", () => 
   db.close();
 });
 
-test("rejects a database created by a newer AEC schema", () => {
-  const home = tempDir("aec-new-schema-");
-  const future = new DatabaseSync(join(home, "aec.db"));
+test("rejects a database created by a newer AEC-S schema", () => {
+  const home = tempDir("aec-s-new-schema-");
+  const future = new DatabaseSync(join(home, "aec-s.db"));
   future.exec("PRAGMA user_version=999");
   future.close();
-  assert.throws(() => new AecDatabase(home), /newer than supported/);
+  assert.throws(() => new AecSDatabase(home), /newer than supported/);
 });

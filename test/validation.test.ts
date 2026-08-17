@@ -59,8 +59,8 @@ test("allows empty write scope while forcing full validation", () => {
 });
 
 test("rejects validation cwd that escapes through a workspace symlink", () => {
-  const workspace = tempDir("aec-validation-workspace-");
-  const outside = tempDir("aec-validation-outside-");
+  const workspace = tempDir("aec-s-validation-workspace-");
+  const outside = tempDir("aec-s-validation-outside-");
   mkdirSync(join(outside, "target"));
   symlinkSync(join(outside, "target"), join(workspace, "linked"));
   assert.throws(

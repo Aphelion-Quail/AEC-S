@@ -1,6 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import type { AecDatabase } from "./db.js";
+import type { AecSDatabase } from "./db.js";
 import type {
   Agent,
   AgentRole,
@@ -75,7 +75,7 @@ type JobExecution = {
   structuredOutputPath?: string;
 };
 
-export class AecEngine {
+export class AecSEngine {
   private readonly globalConcurrency: number;
   private readonly leaseHeartbeatMs: number;
   private readonly operationalRetryBaseMs: number;
@@ -86,7 +86,7 @@ export class AecEngine {
   private schedulerCycles = 0;
   private lastAgentHealthcheckAt = 0;
 
-  constructor(readonly db: AecDatabase, options: EngineOptions = {}) {
+  constructor(readonly db: AecSDatabase, options: EngineOptions = {}) {
     this.globalConcurrency = options.globalConcurrency ?? 2;
     this.leaseHeartbeatMs = options.leaseHeartbeatMs ?? 10_000;
     this.operationalRetryBaseMs = options.operationalRetryBaseMs ?? 5_000;
@@ -230,7 +230,7 @@ export class AecEngine {
       const count = await this.runOnce();
       if (count === 0) return;
     }
-    throw new Error(`AEC did not become idle after ${maxCycles} scheduler cycles`);
+    throw new Error(`AEC-S did not become idle after ${maxCycles} scheduler cycles`);
   }
 
   private async runTaskSafely(taskId: string, preferredAgentId?: string): Promise<void> {
@@ -376,7 +376,7 @@ export class AecEngine {
       taskId: task.id,
       runId,
       path: workspacePath,
-      branch: `aec/${task.id}`,
+      branch: `aec-s/${task.id}`,
       baseSha,
       status: "creating",
       createdAt: timestamp,

@@ -26,13 +26,13 @@ export function fixturePath(name: string): string {
 }
 
 export function createGitRepository(): string {
-  const repo = tempDir("aec-repo-");
+  const repo = tempDir("aec-s-repo-");
   execFileSync("git", ["init", "-b", "main"], { cwd: repo, stdio: "ignore" });
   writeFileSync(join(repo, "README.md"), "fixture\n");
   execFileSync("git", ["add", "README.md"], { cwd: repo });
   execFileSync(
     "git",
-    ["-c", "user.name=AEC Test", "-c", "user.email=aec-test@local", "commit", "-m", "initial"],
+    ["-c", "user.name=AEC-S Test", "-c", "user.email=aec-s-test@local", "commit", "-m", "initial"],
     { cwd: repo, stdio: "ignore" },
   );
   return repo;

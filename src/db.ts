@@ -19,7 +19,7 @@ import type {
 } from "./types.js";
 import { agentInputSchema, decisionInputSchema, projectInputSchema, taskInputSchema } from "./input.js";
 import { newId, nowIso } from "./ids.js";
-import { ensureAecPaths, getAecPaths, type AecPaths } from "./paths.js";
+import { ensureAecSPaths, getAecSPaths, type AecSPaths } from "./paths.js";
 
 type Row = Record<string, unknown>;
 type SqlValue = string | number | bigint | Uint8Array | null;
@@ -33,13 +33,13 @@ function bool(value: unknown): boolean {
   return Number(value) === 1;
 }
 
-export class AecDatabase {
-  readonly paths: AecPaths;
+export class AecSDatabase {
+  readonly paths: AecSPaths;
   readonly db: DatabaseSync;
 
   constructor(home?: string) {
-    this.paths = getAecPaths(home);
-    ensureAecPaths(this.paths);
+    this.paths = getAecSPaths(home);
+    ensureAecSPaths(this.paths);
     this.db = new DatabaseSync(this.paths.database);
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA journal_mode = WAL");
@@ -55,7 +55,7 @@ export class AecDatabase {
 
   transaction<T>(fn: () => T): T {
     const outermost = this.transactionDepth === 0;
-    const savepoint = `aec_nested_${this.transactionDepth}`;
+    const savepoint = `aec_s_nested_${this.transactionDepth}`;
     if (outermost) this.db.exec("BEGIN IMMEDIATE");
     else this.db.exec(`SAVEPOINT ${savepoint}`);
     this.transactionDepth += 1;
@@ -80,7 +80,7 @@ export class AecDatabase {
     const currentVersion = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version ?? 0);
     const latestVersion = 4;
     if (currentVersion > latestVersion) {
-      throw new Error(`AEC database schema ${currentVersion} is newer than supported schema ${latestVersion}`);
+      throw new Error(`AEC-S database schema ${currentVersion} is newer than supported schema ${latestVersion}`);
     }
     this.db.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
       version INTEGER PRIMARY KEY,
@@ -244,7 +244,7 @@ export class AecDatabase {
       )`);
       return;
     }
-    throw new Error(`Unknown AEC database migration: ${version}`);
+    throw new Error(`Unknown AEC-S database migration: ${version}`);
   }
 
   private tableHasColumn(table: string, column: string): boolean {

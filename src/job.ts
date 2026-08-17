@@ -125,8 +125,8 @@ function killProcessTree(pid: number | undefined, signal: NodeJS.Signals, fallba
 export function startSupervisedJob(input: JobInput, inputPath: string, jobId = newId("job")): JobState {
   writeJsonAtomic(inputPath, input);
   const compiledEntry = fileURLToPath(new URL("./cli.js", import.meta.url));
-  const entry = process.env.AEC_CLI_ENTRY ?? (existsSync(compiledEntry) ? compiledEntry : process.argv[1]);
-  if (!entry) throw new Error("Unable to locate AEC CLI entry for job supervisor");
+  const entry = process.env.AEC_S_CLI_ENTRY ?? (existsSync(compiledEntry) ? compiledEntry : process.argv[1]);
+  if (!entry) throw new Error("Unable to locate AEC-S CLI entry for job supervisor");
   const child = spawn(process.execPath, [entry, "internal-job", inputPath], {
     detached: true,
     stdio: "ignore",

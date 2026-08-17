@@ -2,12 +2,12 @@ import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { execCommand } from "./exec.js";
-import type { AecPaths } from "./paths.js";
+import type { AecSPaths } from "./paths.js";
 
-const LABEL = "dev.aec.core";
+const LABEL = "dev.aec-s.core";
 
 export function servicePath(): string {
-  const configured = process.env.AEC_SERVICE_PATH?.trim();
+  const configured = process.env.AEC_S_SERVICE_PATH?.trim();
   if (configured) return configured;
   const candidates = [
     dirname(realpathSync(process.execPath)),
@@ -26,12 +26,12 @@ export function servicePath(): string {
 
 export function launchAgentPlist(
   entry: string,
-  paths: AecPaths,
+  paths: AecSPaths,
   runtimePath = servicePath(),
-  mcpHttpPort = process.env.AEC_MCP_HTTP_PORT?.trim(),
+  mcpHttpPort = process.env.AEC_S_MCP_HTTP_PORT?.trim(),
 ): string {
   const mcpPortEnvironment = mcpHttpPort
-    ? `\n    <key>AEC_MCP_HTTP_PORT</key><string>${xml(mcpHttpPort)}</string>`
+    ? `\n    <key>AEC_S_MCP_HTTP_PORT</key><string>${xml(mcpHttpPort)}</string>`
     : "";
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -43,7 +43,7 @@ export function launchAgentPlist(
     <string>daemon</string>
   </array>
   <key>EnvironmentVariables</key><dict>
-    <key>AEC_HOME</key><string>${xml(paths.home)}</string>
+    <key>AEC_S_HOME</key><string>${xml(paths.home)}</string>
     <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}
   </dict>
   <key>RunAtLoad</key><true/>
@@ -62,12 +62,12 @@ function xml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
-export async function serviceAction(action: "install" | "start" | "stop" | "restart" | "status" | "uninstall", paths: AecPaths): Promise<string> {
+export async function serviceAction(action: "install" | "start" | "stop" | "restart" | "status" | "uninstall", paths: AecSPaths): Promise<string> {
   const plist = plistPath();
   const domain = `gui/${process.getuid?.() ?? 0}`;
   if (action === "install") {
-    const entry = process.env.AEC_CLI_ENTRY ?? process.argv[1];
-    if (!entry) throw new Error("Unable to locate AEC CLI entry");
+    const entry = process.env.AEC_S_CLI_ENTRY ?? process.argv[1];
+    if (!entry) throw new Error("Unable to locate AEC-S CLI entry");
     mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
     const content = launchAgentPlist(entry, paths);
     writeFileSync(plist, content, { mode: 0o600 });
