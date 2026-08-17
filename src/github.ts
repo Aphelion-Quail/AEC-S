@@ -70,11 +70,11 @@ export async function createOrGetPullRequest(
   const existing = await findPullRequest(workspacePath, branch);
   if (existing && existing.state !== "CLOSED") return existing;
   const body = [
-    `AEC task: ${task.id}`,
+    `AEC-S task: ${task.id}`,
     "",
     task.goal,
     "",
-    `<!-- aec-task:${task.id} -->`,
+    `<!-- aec-s-task:${task.id} -->`,
   ].join("\n");
   await execChecked(
     gh(workspacePath, [
@@ -101,7 +101,7 @@ export async function waitForRequiredChecks(
   prNumber: number,
   timeoutSeconds = 1800,
   heartbeat?: () => void,
-  pollIntervalMs = Number(process.env.AEC_GITHUB_CHECK_POLL_MS ?? 5_000),
+  pollIntervalMs = Number(process.env.AEC_S_GITHUB_CHECK_POLL_MS ?? 5_000),
 ): Promise<void> {
   if (project.requiredChecks.length === 0) {
     throw new Error("GitHub delivery requires at least one explicitly configured required check");
@@ -177,7 +177,7 @@ export async function mergePullRequest(
  *
  * `expectedHeadSha` is optional for recovery of older Runs whose Push effect
  * was overwritten as uncertain after GitHub had already deleted the branch.
- * The PR number itself still comes from AEC's completed pullRequest effect.
+ * The PR number itself still comes from AEC-S's completed pullRequest effect.
  */
 export async function reconcileMergedPullRequest(
   workspacePath: string,

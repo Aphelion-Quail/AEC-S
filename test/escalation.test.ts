@@ -1,13 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { AecDatabase } from "../src/db.js";
-import { AecEngine } from "../src/engine.js";
+import { AecSDatabase } from "../src/db.js";
+import { AecSEngine } from "../src/engine.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
 
 test("creates a Human decision only after Agent repair options are exhausted", async () => {
-  const db = new AecDatabase(tempDir("aec-escalation-"));
+  const db = new AecSDatabase(tempDir("aec-s-escalation-"));
   const project = db.createProject({ name: "escalation", repoPath: createGitRepository() });
   db.createAgent({
     name: "blocked-worker",
@@ -19,7 +19,7 @@ test("creates a Human decision only after Agent repair options are exhausted", a
       repair: { program: process.execPath, args: [fakeAgent, "blocked", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [
     {
       id: "task-blocked",
@@ -46,7 +46,7 @@ test("creates a Human decision only after Agent repair options are exhausted", a
 });
 
 test("creates an immediate typed Decision for a non-technical Worker blocker", async () => {
-  const db = new AecDatabase(tempDir("aec-architecture-escalation-"));
+  const db = new AecSDatabase(tempDir("aec-s-architecture-escalation-"));
   const project = db.createProject({ name: "architecture", repoPath: createGitRepository() });
   db.createAgent({
     name: "architecture-worker",
@@ -57,7 +57,7 @@ test("creates an immediate typed Decision for a non-technical Worker blocker", a
       execute: { program: process.execPath, args: [fakeAgent, "architecture-blocked", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [{
     id: "task-architecture",
     projectId: project.id,
@@ -77,9 +77,9 @@ test("creates an immediate typed Decision for a non-technical Worker blocker", a
 });
 
 test("resolves replace_task by creating an immutable replacement in the same Project", () => {
-  const db = new AecDatabase(tempDir("aec-replacement-"));
+  const db = new AecSDatabase(tempDir("aec-s-replacement-"));
   const project = db.createProject({ name: "replacement", repoPath: createGitRepository() });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [oldTask] = engine.submitGraph(project.id, [{
     id: "task-old",
     projectId: project.id,
@@ -142,7 +142,7 @@ test("resolves replace_task by creating an immutable replacement in the same Pro
 });
 
 test("retry_with_agent honors an eligible Human-selected alternate", async () => {
-  const db = new AecDatabase(tempDir("aec-retry-agent-"));
+  const db = new AecSDatabase(tempDir("aec-s-retry-agent-"));
   const project = db.createProject({ name: "retry-agent", repoPath: createGitRepository() });
   db.createAgent({
     id: "agent-blocked",
@@ -155,7 +155,7 @@ test("retry_with_agent honors an eligible Human-selected alternate", async () =>
       repair: { program: process.execPath, args: [fakeAgent, "blocked", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [{
     id: "task-retry-agent",
     projectId: project.id,

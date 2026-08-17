@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AecDatabase } from "../src/db.js";
-import { AecEngine } from "../src/engine.js";
+import { AecSDatabase } from "../src/db.js";
+import { AecSEngine } from "../src/engine.js";
 import { branchHead, commitTask, createWorktree, localMerge } from "../src/git.js";
 import type { Run, Workspace } from "../src/types.js";
 import { builtCliPath, createGitRepository, fixturePath, tempDir } from "./helpers.js";
@@ -14,11 +14,11 @@ const fakeAgent = fixturePath("fake-agent.js");
 
 async function prepareExternallyMergedRun(status: Run["status"], phase: Run["phase"], markTaskSucceeded = true) {
   const repo = createGitRepository();
-  const home = tempDir("aec-merge-recovery-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-merge-recovery-");
+  const db = new AecSDatabase(home);
   const project = db.createProject({ name: `merge-${phase}`, repoPath: repo });
   const agent = db.createAgent({ name: "executor", adapter: "command", roles: ["executor"], config: { binary: process.execPath } });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [{
     id: `task-${phase}`,
     projectId: project.id,
@@ -58,7 +58,7 @@ async function prepareExternallyMergedRun(status: Run["status"], phase: Run["pha
     taskId: task!.id,
     runId,
     path: workspacePath,
-    branch: `aec/${task!.id}`,
+    branch: `aec-s/${task!.id}`,
     baseSha,
     status: "creating",
     createdAt: timestamp,
@@ -78,7 +78,7 @@ async function prepareExternallyMergedRun(status: Run["status"], phase: Run["pha
   };
   if (phase === "cleanup" && markTaskSucceeded) db.updateTaskStatus(task!.id, "succeeded", { mergeSha: commitSha });
   db.saveRun(run);
-  return { db, engine: new AecEngine(db), project, task: task!, run, workspace, repo, commitSha };
+  return { db, engine: new AecSEngine(db), project, task: task!, run, workspace, repo, commitSha };
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -92,8 +92,8 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<v
 
 test("resumes a supervised Agent job after the controlling process is killed", async () => {
   const repo = createGitRepository();
-  const home = tempDir("aec-recovery-");
-  let db = new AecDatabase(home);
+  const home = tempDir("aec-s-recovery-");
+  let db = new AecSDatabase(home);
   const project = db.createProject({ name: "recovery", repoPath: repo });
   db.createAgent({
     name: "slow-worker",
@@ -114,7 +114,7 @@ test("resumes a supervised Agent job after the controlling process is killed", a
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [
     {
       id: "task-recovery",
@@ -128,11 +128,11 @@ test("resumes a supervised Agent job after the controlling process is killed", a
   db.close();
 
   const controller = spawn(process.execPath, [cli, "run", task!.id], {
-    env: { ...process.env, AEC_HOME: home },
+    env: { ...process.env, AEC_S_HOME: home },
     stdio: "ignore",
   });
   await waitUntil(() => {
-    const inspect = new AecDatabase(home);
+    const inspect = new AecSDatabase(home);
     const active = inspect.getLatestRunForTask(task!.id);
     inspect.close();
     return Boolean(active?.job);
@@ -140,18 +140,18 @@ test("resumes a supervised Agent job after the controlling process is killed", a
   controller.kill("SIGKILL");
   await new Promise((resolvePromise) => controller.once("close", resolvePromise));
 
-  db = new AecDatabase(home);
-  await new AecEngine(db).runTask(task!.id);
+  db = new AecSDatabase(home);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(existsSync(join(repo, "recovered.txt")), true);
   assert.equal(db.listRuns(task!.id).length, 1);
   db.close();
 });
 
-test("two AEC processes cannot execute the same Run concurrently", async () => {
+test("two AEC-S processes cannot execute the same Run concurrently", async () => {
   const repo = createGitRepository();
-  const home = tempDir("aec-lease-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-lease-");
+  const db = new AecSDatabase(home);
   const project = db.createProject({ name: "lease", repoPath: repo });
   db.createAgent({
     name: "slow-worker",
@@ -171,7 +171,7 @@ test("two AEC processes cannot execute the same Run concurrently", async () => {
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-single-owner",
     projectId: project.id,
     title: "One owner",
@@ -182,14 +182,14 @@ test("two AEC processes cannot execute the same Run concurrently", async () => {
   assert.ok(task);
   db.close();
 
-  const first = spawn(process.execPath, [cli, "run", task.id], { env: { ...process.env, AEC_HOME: home }, stdio: "ignore" });
-  const second = spawn(process.execPath, [cli, "run", task.id], { env: { ...process.env, AEC_HOME: home }, stdio: "ignore" });
+  const first = spawn(process.execPath, [cli, "run", task.id], { env: { ...process.env, AEC_S_HOME: home }, stdio: "ignore" });
+  const second = spawn(process.execPath, [cli, "run", task.id], { env: { ...process.env, AEC_S_HOME: home }, stdio: "ignore" });
   await Promise.all([
     new Promise<void>((resolvePromise, reject) => first.once("close", (code) => code === 0 ? resolvePromise() : reject(new Error(`first exited ${code}`)))),
     new Promise<void>((resolvePromise, reject) => second.once("close", (code) => code === 0 ? resolvePromise() : reject(new Error(`second exited ${code}`)))),
   ]);
 
-  const inspect = new AecDatabase(home);
+  const inspect = new AecSDatabase(home);
   assert.equal(inspect.listRuns(task.id).length, 1);
   assert.equal(inspect.getTask(task.id)?.status, "succeeded");
   inspect.close();

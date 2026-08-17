@@ -1,8 +1,8 @@
-import type { AecDatabase } from "./db.js";
+import type { AecSDatabase } from "./db.js";
 import { execCommand } from "./exec.js";
 import { adapterFor } from "./adapters/agent.js";
 
-export async function doctor(db: AecDatabase): Promise<Record<string, unknown>> {
+export async function doctor(db: AecSDatabase): Promise<Record<string, unknown>> {
   const projects = db.listProjects();
   const commands = [
     ["git", ["--version"]],

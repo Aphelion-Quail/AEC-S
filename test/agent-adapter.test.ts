@@ -18,8 +18,8 @@ const agent: Agent = {
 };
 
 test("applies the same explicit Codex workspace boundary to fresh and resumed writes", () => {
-  const workspace = tempDir("aec-codex-workspace-");
-  const runDir = tempDir("aec-codex-run-");
+  const workspace = tempDir("aec-s-codex-workspace-");
+  const runDir = tempDir("aec-s-codex-run-");
   const adapter = adapterFor(agent);
   const fresh = adapter.invocation({
     kind: "execute",
@@ -45,8 +45,8 @@ test("applies the same explicit Codex workspace boundary to fresh and resumed wr
 });
 
 test("forces independent Codex review into a read-only workspace", () => {
-  const workspace = tempDir("aec-codex-review-");
-  const runDir = tempDir("aec-codex-review-run-");
+  const workspace = tempDir("aec-s-codex-review-");
+  const runDir = tempDir("aec-s-codex-review-run-");
   const invocation = adapterFor(agent).invocation({
     kind: "review",
     prompt: "review",

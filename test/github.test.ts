@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { AecDatabase } from "../src/db.js";
-import { AecEngine } from "../src/engine.js";
+import { AecSDatabase } from "../src/db.js";
+import { AecSEngine } from "../src/engine.js";
 import { mergePullRequest, waitForRequiredChecks } from "../src/github.js";
 import { branchHead, commitTask, createWorktree } from "../src/git.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
@@ -14,12 +14,12 @@ const fakeAgent = fixturePath("fake-agent.js");
 
 test("publishes one idempotent PR and records the remote merge", async () => {
   const repo = createGitRepository();
-  const remote = tempDir("aec-remote-");
+  const remote = tempDir("aec-s-remote-");
   execFileSync("git", ["init", "--bare"], { cwd: remote, stdio: "ignore" });
   execFileSync("git", ["remote", "add", "origin", remote], { cwd: repo });
   execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repo, stdio: "ignore" });
 
-  const fakeBin = tempDir("aec-fakebin-");
+  const fakeBin = tempDir("aec-s-fakebin-");
   const ghState = join(fakeBin, "gh-state.json");
   const ghPath = join(fakeBin, "gh");
   writeFileSync(
@@ -31,7 +31,7 @@ const args = process.argv.slice(2);
 const statePath = process.env.FAKE_GH_STATE;
 const read = () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : null;
 const write = value => fs.writeFileSync(statePath, JSON.stringify(value));
-const remoteHead = () => cp.execFileSync('git', ['ls-remote', '--heads', 'origin', 'refs/heads/aec/task-github'], { encoding: 'utf8' }).trim().split(/\\s+/)[0];
+const remoteHead = () => cp.execFileSync('git', ['ls-remote', '--heads', 'origin', 'refs/heads/aec-s/task-github'], { encoding: 'utf8' }).trim().split(/\\s+/)[0];
 if (args[0] === 'pr' && args[1] === 'list') {
   const state = read();
   const head = state ? remoteHead() : undefined;
@@ -76,9 +76,9 @@ if (args[0] === 'pr' && args[1] === 'list') {
   const oldPath = process.env.PATH;
   process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
   process.env.FAKE_GH_STATE = ghState;
-  process.env.AEC_GITHUB_CHECK_POLL_MS = "10";
+  process.env.AEC_S_GITHUB_CHECK_POLL_MS = "10";
   try {
-    const db = new AecDatabase(tempDir("aec-github-"));
+    const db = new AecSDatabase(tempDir("aec-s-github-"));
     const project = db.createProject({
       name: "github",
       repoPath: repo,
@@ -107,7 +107,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
         review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
       },
     });
-    const engine = new AecEngine(db);
+    const engine = new AecSEngine(db);
     const [task] = engine.submitGraph(project.id, [
       {
         id: "task-github",
@@ -133,25 +133,25 @@ if (args[0] === 'pr' && args[1] === 'list') {
       Number(execFileSync("git", ["--git-dir", remote, "rev-list", "--count", "refs/heads/main"], { encoding: "utf8" }).trim()),
       3,
     );
-    assert.throws(() => execFileSync("git", ["--git-dir", remote, "show-ref", "--verify", "refs/heads/aec/task-github"], { stdio: "ignore" }));
+    assert.throws(() => execFileSync("git", ["--git-dir", remote, "show-ref", "--verify", "refs/heads/aec-s/task-github"], { stdio: "ignore" }));
     await engine.runTask(task!.id);
     assert.equal(db.listRuns(task!.id).length, 1);
     db.close();
   } finally {
     process.env.PATH = oldPath;
     delete process.env.FAKE_GH_STATE;
-    delete process.env.AEC_GITHUB_CHECK_POLL_MS;
+    delete process.env.AEC_S_GITHUB_CHECK_POLL_MS;
   }
 });
 
 test("reconciles an externally completed PR before retrying publish", async () => {
   const repo = createGitRepository();
-  const remote = tempDir("aec-reconcile-remote-");
+  const remote = tempDir("aec-s-reconcile-remote-");
   execFileSync("git", ["init", "--bare"], { cwd: remote, stdio: "ignore" });
   execFileSync("git", ["remote", "add", "origin", remote], { cwd: repo });
   execFileSync("git", ["push", "-u", "origin", "main"], { cwd: repo, stdio: "ignore" });
 
-  const fakeBin = tempDir("aec-reconcile-fakebin-");
+  const fakeBin = tempDir("aec-s-reconcile-fakebin-");
   const ghPath = join(fakeBin, "gh");
   writeFileSync(ghPath, `#!/usr/bin/env node
 const args = process.argv.slice(2);
@@ -172,8 +172,8 @@ process.exit(2);
   const oldPath = process.env.PATH;
   process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
 
-  const home = tempDir("aec-reconcile-home-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-reconcile-home-");
+  const db = new AecSDatabase(home);
   try {
     const project = db.createProject({
       id: "github-reconcile",
@@ -190,7 +190,7 @@ process.exit(2);
       maxConcurrency: 1,
       config: { binary: process.execPath },
     });
-    const engine = new AecEngine(db, { operationalRetryBaseMs: 1 });
+    const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
     const [task] = engine.submitGraph(project.id, [{
       id: "task-reconcile",
       projectId: project.id,
@@ -230,7 +230,7 @@ process.exit(2);
       taskId: task!.id,
       runId,
       path: workspacePath,
-      branch: `aec/${task!.id}`,
+      branch: `aec-s/${task!.id}`,
       baseSha,
       status: "creating",
       createdAt: timestamp,
@@ -310,7 +310,7 @@ test("rejects missing required checks before querying GitHub", async () => {
 
 test("fails closed on GitHub authentication errors and unexpected merged heads", async () => {
   const repo = createGitRepository();
-  const fakeBin = tempDir("aec-failing-gh-");
+  const fakeBin = tempDir("aec-s-failing-gh-");
   const ghPath = join(fakeBin, "gh");
   writeFileSync(ghPath, `#!/usr/bin/env node
 const args = process.argv.slice(2);

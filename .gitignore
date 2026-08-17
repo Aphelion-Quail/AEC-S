@@ -1,6 +1,6 @@
 node_modules/
 dist/
-.aec/
+.aec-s/
 coverage/
 *.log
 .DS_Store

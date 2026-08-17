@@ -1,11 +1,11 @@
 {
-  "name": "aec-core",
+  "name": "aec-s-core",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Agent Engineering Control core infrastructure MVP",
+  "description": "Agent Equilibrium Control System core infrastructure MVP",
   "bin": {
-    "aec": "dist/src/cli.js"
+    "aec-s": "dist/src/cli.js"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

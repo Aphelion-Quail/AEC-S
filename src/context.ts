@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import type { AecDatabase } from "./db.js";
+import type { AecSDatabase } from "./db.js";
 import type { Project, Run, Task, Workspace } from "./types.js";
 import { writeJsonAtomic } from "./files.js";
 import { redactJson } from "./redaction.js";
@@ -15,7 +15,7 @@ export type ContextEnvelope = {
 };
 
 export function buildContextEnvelope(
-  db: AecDatabase,
+  db: AecSDatabase,
   project: Project,
   task: Task,
   run: Run,
@@ -43,7 +43,7 @@ export function buildContextEnvelope(
     dependencies,
     workspace: { path: workspace.path, branch: workspace.branch, baseSha: workspace.baseSha },
     validation: redactJson(options.reviewer
-      ? run.validation.map((validation) => ({ ...validation, stdoutPath: "[AEC-managed]", stderrPath: "[AEC-managed]" }))
+      ? run.validation.map((validation) => ({ ...validation, stdoutPath: "[AEC-S-managed]", stderrPath: "[AEC-S-managed]" }))
       : run.validation),
     current: {
       runId: run.id,
@@ -60,11 +60,11 @@ export function buildContextEnvelope(
 
 export function executionPrompt(contextPath: string): string {
   return [
-    "You are an AEC worker executing one immutable engineering task.",
+    "You are an AEC-S worker executing one immutable engineering task.",
     `Read the task context envelope at ${contextPath}.`,
     "Implement the task in the current workspace.",
     "You may run exploratory tests and debugging commands.",
-    "Do not commit, push, merge, switch branches, or modify AEC state.",
+    "Do not commit, push, merge, switch branches, or modify AEC-S state.",
     "Do not intentionally modify files outside task.scope.writeGlobs.",
     "Return only the structured result required by the output schema.",
   ].join("\n");
@@ -72,16 +72,16 @@ export function executionPrompt(contextPath: string): string {
 
 export function repairPrompt(contextPath: string): string {
   return [
-    "Continue the same AEC task and repair the reported authoritative validation or review failures.",
+    "Continue the same AEC-S task and repair the reported authoritative validation or review failures.",
     `Read the updated context envelope at ${contextPath}.`,
-    "Do not commit, push, merge, switch branches, or modify AEC state.",
+    "Do not commit, push, merge, switch branches, or modify AEC-S state.",
     "Return only the structured result required by the output schema.",
   ].join("\n");
 }
 
 export function reviewPrompt(contextPath: string, diffPath: string): string {
   return [
-    "You are an independent AEC reviewer.",
+    "You are an independent AEC-S reviewer.",
     `Read the task context envelope at ${contextPath}.`,
     `Review only the task diff at ${diffPath} against the goal, constraints, decisions, and validation evidence.`,
     "Do not modify files. Do not infer approval from the executor's claims.",

@@ -3,13 +3,13 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { AecDatabase } from "../src/db.js";
-import { AecEngine } from "../src/engine.js";
+import { AecSDatabase } from "../src/db.js";
+import { AecSEngine } from "../src/engine.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
 
-function registerFakeAgents(db: AecDatabase, executeMode = "execute", reviewMode = "review"): void {
+function registerFakeAgents(db: AecSDatabase, executeMode = "execute", reviewMode = "review"): void {
   db.createAgent({
     id: "executor",
     name: "executor",
@@ -43,7 +43,7 @@ async function runScheduledPair(input: {
   const repo = createGitRepository();
   const home = tempDir("aec-scheduler-pair-");
   const timeline = join(home, "timeline.txt");
-  const db = new AecDatabase(home);
+  const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "scheduler-pair",
     repoPath: repo,
@@ -68,7 +68,7 @@ async function runScheduledPair(input: {
     maxConcurrency: 2,
     config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
   });
-  const engine = new AecEngine(db, { globalConcurrency: input.globalConcurrency });
+  const engine = new AecSEngine(db, { globalConcurrency: input.globalConcurrency });
   engine.submitGraph(project.id, [
     {
       id: "pair-one",
@@ -99,8 +99,8 @@ async function runScheduledPair(input: {
 
 test("runs two independent tasks without invalidating the second on HEAD change", async () => {
   const repo = createGitRepository();
-  const home = tempDir("aec-home-");
-  const db = new AecDatabase(home);
+  const home = tempDir("aec-s-home-");
+  const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "parallel-fixture",
     repoPath: repo,
@@ -135,7 +135,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db, { globalConcurrency: 2 });
+  const engine = new AecSEngine(db, { globalConcurrency: 2 });
   const tasks = engine.submitGraph(project.id, [
     {
       id: "task-ui",
@@ -172,8 +172,8 @@ test("runs two independent tasks without invalidating the second on HEAD change"
   const timeline = readFileSync(executionTimeline, "utf8").trim().split(/\r?\n/);
   assert.ok(timeline[0]?.endsWith(":start") && timeline[1]?.endsWith(":start"), "independent executor jobs must overlap");
   const log = execFileSync("git", ["log", "--format=%B"], { cwd: repo, encoding: "utf8" });
-  assert.match(log, /AEC-Task: task-ui/);
-  assert.match(log, /AEC-Task: task-core/);
+  assert.match(log, /AEC-S-Task: task-ui/);
+  assert.match(log, /AEC-S-Task: task-core/);
   const runs = db.listRuns();
   assert.equal(runs.length, 2);
   assert.ok(runs.every((run) => run.validation.every((validation) => validation.status === "passed")));
@@ -188,9 +188,9 @@ test("runs two independent tasks without invalidating the second on HEAD change"
 
 test("revalidates only the current task after a related target-branch change", async () => {
   const repo = createGitRepository();
-  const home = tempDir("aec-related-head-");
+  const home = tempDir("aec-s-related-head-");
   const validationCount = join(home, "validation-count.txt");
-  const db = new AecDatabase(home);
+  const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "related-head",
     repoPath: repo,
@@ -215,7 +215,7 @@ test("revalidates only the current task after a related target-branch change", a
     roles: ["reviewer"],
     config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [{
     id: "task-related-head",
     projectId: project.id,
@@ -235,7 +235,7 @@ test("revalidates only the current task after a related target-branch change", a
   assert.ok(db.getLatestRunForTask(task!.id)?.job, "the Agent job must be running before target HEAD changes");
   writeFileSync(join(repo, "shared.txt"), "related target change\n");
   execFileSync("git", ["add", "shared.txt"], { cwd: repo });
-  execFileSync("git", ["-c", "user.name=AEC Test", "-c", "user.email=aec-test@local", "commit", "-m", "related change"], {
+  execFileSync("git", ["-c", "user.name=AEC-S Test", "-c", "user.email=aec-s-test@local", "commit", "-m", "related change"], {
     cwd: repo,
     stdio: "ignore",
   });
@@ -272,7 +272,7 @@ test("serializes scheduler tasks whose declared Scopes conflict", async () => {
 });
 
 test("renews the Run lease while an external phase remains active", async () => {
-  const db = new AecDatabase(tempDir("aec-lease-heartbeat-"));
+  const db = new AecSDatabase(tempDir("aec-s-lease-heartbeat-"));
   const project = db.createProject({ name: "lease-heartbeat", repoPath: createGitRepository() });
   registerFakeAgents(db, "slow");
   const originalRenew = db.renewRunLease.bind(db);
@@ -281,7 +281,7 @@ test("renews the Run lease while an external phase remains active", async () => 
     renewals += 1;
     return originalRenew(...args);
   };
-  const engine = new AecEngine(db, { leaseHeartbeatMs: 20 });
+  const engine = new AecSEngine(db, { leaseHeartbeatMs: 20 });
   const [task] = engine.submitGraph(project.id, [{
     id: "task-heartbeat",
     projectId: project.id,
@@ -297,9 +297,9 @@ test("renews the Run lease while an external phase remains active", async () => 
 });
 
 test("records reprioritize through the same Task audit path", () => {
-  const db = new AecDatabase(tempDir("aec-priority-audit-"));
+  const db = new AecSDatabase(tempDir("aec-s-priority-audit-"));
   const project = db.createProject({ name: "priority-audit", repoPath: createGitRepository() });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [task] = engine.submitGraph(project.id, [{
     id: "task-priority",
     projectId: project.id,
@@ -318,7 +318,7 @@ test("records reprioritize through the same Task audit path", () => {
 
 test("a paused active run does not occupy a scheduler slot", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-home-"));
+  const db = new AecSDatabase(tempDir("aec-s-home-"));
   const project = db.createProject({ name: "pause-fixture", repoPath: repo });
   db.createAgent({
     name: "fake-worker",
@@ -338,7 +338,7 @@ test("a paused active run does not occupy a scheduler slot", async () => {
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   const [pausedTask, nextTask] = engine.submitGraph(project.id, [
     {
       id: "task-paused-active",
@@ -373,7 +373,7 @@ test("a paused active run does not occupy a scheduler slot", async () => {
 
 test("modifies an existing tracked file without inventing an out-of-scope path", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-tracked-"));
+  const db = new AecSDatabase(tempDir("aec-s-tracked-"));
   const project = db.createProject({ name: "tracked", repoPath: repo });
   db.createAgent({
     id: "executor",
@@ -395,7 +395,7 @@ test("modifies an existing tracked file without inventing an out-of-scope path",
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-tracked",
     projectId: project.id,
     title: "Update tracked file",
@@ -403,7 +403,7 @@ test("modifies an existing tracked file without inventing an out-of-scope path",
     scope: { writeGlobs: ["README.md"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["README changes"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.match(readFileSync(join(repo, "README.md"), "utf8"), /task-tracked/);
   db.close();
@@ -411,7 +411,7 @@ test("modifies an existing tracked file without inventing an out-of-scope path",
 
 test("records failed authoritative validation and repairs it", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-validation-repair-"));
+  const db = new AecSDatabase(tempDir("aec-s-validation-repair-"));
   const project = db.createProject({ name: "validation-repair", repoPath: repo });
   db.createAgent({
     id: "executor",
@@ -434,7 +434,7 @@ test("records failed authoritative validation and repairs it", async () => {
       review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
     },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-validation-repair",
     projectId: project.id,
     title: "Repair validation",
@@ -446,7 +446,7 @@ test("records failed authoritative validation and repairs it", async () => {
       args: ["-e", "if (!require('node:fs').readFileSync('repaired.txt','utf8').includes('repaired')) process.exit(3)"],
     }],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   const run = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(run.repairCount, 1);
@@ -457,7 +457,7 @@ test("records failed authoritative validation and repairs it", async () => {
 
 test("records timed-out authoritative validation and repairs it", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-validation-timeout-"));
+  const db = new AecSDatabase(tempDir("aec-s-validation-timeout-"));
   const project = db.createProject({ name: "validation-timeout", repoPath: repo });
   db.createAgent({
     id: "executor",
@@ -477,7 +477,7 @@ test("records timed-out authoritative validation and repairs it", async () => {
     roles: ["reviewer"],
     config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-validation-timeout",
     projectId: project.id,
     title: "Repair timed-out validation",
@@ -490,7 +490,7 @@ test("records timed-out authoritative validation and repairs it", async () => {
       timeoutSeconds: 1,
     }],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   const run = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(run.repairCount, 1);
@@ -500,19 +500,19 @@ test("records timed-out authoritative validation and repairs it", async () => {
 
 test("treats a validation spawn error as operational instead of asking the Agent to repair code", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-validation-spawn-error-"));
+  const db = new AecSDatabase(tempDir("aec-s-validation-spawn-error-"));
   const project = db.createProject({ name: "validation-spawn-error", repoPath: repo });
   registerFakeAgents(db);
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-validation-spawn-error",
     projectId: project.id,
     title: "Classify validator startup failure",
     goal: "Create spawn-error.txt",
     scope: { writeGlobs: ["spawn-error.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Infrastructure failure does not trigger code repair"],
-    validationCommands: [{ program: "/definitely/missing/aec-validator", args: [] }],
+    validationCommands: [{ program: "/definitely/missing/aec-s-validator", args: [] }],
   }]);
-  await new AecEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
+  await new AecSEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
   const run = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
   assert.equal(run.status, "interrupted");
@@ -524,7 +524,7 @@ test("treats a validation spawn error as operational instead of asking the Agent
 
 test("repairs a blocking independent Review finding and reviews the new diff", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-review-repair-"));
+  const db = new AecSDatabase(tempDir("aec-s-review-repair-"));
   const project = db.createProject({ name: "review-repair", repoPath: repo });
   db.createAgent({
     id: "executor",
@@ -547,7 +547,7 @@ test("repairs a blocking independent Review finding and reviews the new diff", a
       review: { program: process.execPath, args: [fakeAgent, "review-file", "{workspace}", "{output}", "reviewed.txt"] },
     },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-review-repair",
     projectId: project.id,
     title: "Repair review finding",
@@ -555,7 +555,7 @@ test("repairs a blocking independent Review finding and reviews the new diff", a
     scope: { writeGlobs: ["reviewed.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Review passes after repair"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   const run = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(run.repairCount, 1);
@@ -566,7 +566,7 @@ test("repairs a blocking independent Review finding and reviews the new diff", a
 
 test("rotates to a second eligible executor after repair attempts are exhausted", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-agent-rotation-"));
+  const db = new AecSDatabase(tempDir("aec-s-agent-rotation-"));
   const project = db.createProject({ name: "agent-rotation", repoPath: repo });
   db.createAgent({
     id: "a-blocked",
@@ -597,7 +597,7 @@ test("rotates to a second eligible executor after repair attempts are exhausted"
     roles: ["reviewer"],
     config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-agent-rotation",
     projectId: project.id,
     title: "Rotate executor",
@@ -605,7 +605,7 @@ test("rotates to a second eligible executor after repair attempts are exhausted"
     scope: { writeGlobs: ["rotated.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Alternate executor succeeds"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   const run = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(run.rotationCount, 1);
@@ -615,7 +615,7 @@ test("rotates to a second eligible executor after repair attempts are exhausted"
 
 test("does not bypass the independent Review Gate when no reviewer is available", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-review-gate-"));
+  const db = new AecSDatabase(tempDir("aec-s-review-gate-"));
   const project = db.createProject({ name: "review-gate", repoPath: repo });
   db.createAgent({
     name: "executor-only",
@@ -626,7 +626,7 @@ test("does not bypass the independent Review Gate when no reviewer is available"
       execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
     },
   });
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-review-required",
     projectId: project.id,
     title: "Require review",
@@ -634,7 +634,7 @@ test("does not bypass the independent Review Gate when no reviewer is available"
     scope: { writeGlobs: ["review-required.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Independent review is required"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
   assert.match(String(db.getLatestRunForTask(task!.id)?.error?.message), /No independent reviewer/);
   assert.equal(existsSync(join(repo, "review-required.txt")), false);
@@ -643,9 +643,9 @@ test("does not bypass the independent Review Gate when no reviewer is available"
 
 test("runs configured full validation for a high-risk Task path", async () => {
   const repo = createGitRepository();
-  const home = tempDir("aec-high-risk-");
+  const home = tempDir("aec-s-high-risk-");
   const fullMarker = join(home, "full-validation-ran.txt");
-  const db = new AecDatabase(home);
+  const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "high-risk",
     repoPath: repo,
@@ -656,7 +656,7 @@ test("runs configured full validation for a high-risk Task path", async () => {
     }],
   });
   registerFakeAgents(db);
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-high-risk",
     projectId: project.id,
     title: "Change critical path",
@@ -664,7 +664,7 @@ test("runs configured full validation for a high-risk Task path", async () => {
     scope: { writeGlobs: ["critical/state.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Critical change is fully validated"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(readFileSync(fullMarker, "utf8"), "yes");
   db.close();
@@ -672,10 +672,10 @@ test("runs configured full validation for a high-risk Task path", async () => {
 
 test("promotes DAG dependants only after their dependencies merge", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-dag-") );
+  const db = new AecSDatabase(tempDir("aec-s-dag-") );
   const project = db.createProject({ name: "dag", repoPath: repo });
   registerFakeAgents(db);
-  const [first, second] = new AecEngine(db).submitGraph(project.id, [
+  const [first, second] = new AecSEngine(db).submitGraph(project.id, [
     {
       id: "task-dag-first",
       projectId: project.id,
@@ -695,7 +695,7 @@ test("promotes DAG dependants only after their dependencies merge", async () => 
       validationCommands: [{ program: process.execPath, args: ["-e", "require('node:fs').accessSync('first.txt')"] }],
     },
   ]);
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   await engine.runUntilIdle();
   assert.equal(db.getTask(first!.id)?.status, "succeeded");
   assert.equal(db.getTask(second!.id)?.status, "succeeded");
@@ -705,14 +705,14 @@ test("promotes DAG dependants only after their dependencies merge", async () => 
 
 test("provides authoritative validation evidence to the independent reviewer", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-review-evidence-"));
+  const db = new AecSDatabase(tempDir("aec-s-review-evidence-"));
   const project = db.createProject({
     name: "review-evidence",
     repoPath: repo,
     defaultValidation: [{ program: process.execPath, args: ["-e", "process.exit(0)"] }],
   });
   registerFakeAgents(db, "execute", "review-validation");
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-review-evidence",
     projectId: project.id,
     title: "Review evidence",
@@ -720,7 +720,7 @@ test("provides authoritative validation evidence to the independent reviewer", a
     scope: { writeGlobs: ["evidence.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Reviewer receives evidence"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(db.getLatestRunForTask(task!.id)?.review?.summary, "Validation evidence received");
   db.close();
@@ -728,10 +728,10 @@ test("provides authoritative validation evidence to the independent reviewer", a
 
 test("blocks a Reviewer adapter that mutates the task workspace", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-mutating-reviewer-"));
+  const db = new AecSDatabase(tempDir("aec-s-mutating-reviewer-"));
   const project = db.createProject({ name: "mutating-reviewer", repoPath: repo });
   registerFakeAgents(db, "execute", "review-mutate");
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-mutating-reviewer",
     projectId: project.id,
     title: "Reject mutating reviewer",
@@ -739,7 +739,7 @@ test("blocks a Reviewer adapter that mutates the task workspace", async () => {
     scope: { writeGlobs: ["safe.txt"], impactGlobs: [], tags: [] },
     acceptanceCriteria: ["Reviewer remains read-only"],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
   assert.match(db.getTask(task!.id)?.terminalSummary ?? "", /modified the task workspace/);
   assert.equal(existsSync(join(repo, "reviewer-leak.txt")), false);
@@ -748,10 +748,10 @@ test("blocks a Reviewer adapter that mutates the task workspace", async () => {
 
 test("refuses to commit out-of-scope files created by authoritative validation", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-post-validation-scope-"));
+  const db = new AecSDatabase(tempDir("aec-s-post-validation-scope-"));
   const project = db.createProject({ name: "post-validation-scope", repoPath: repo });
   registerFakeAgents(db);
-  const [task] = new AecEngine(db).submitGraph(project.id, [{
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
     id: "task-post-validation-scope",
     projectId: project.id,
     title: "Guard validation outputs",
@@ -763,7 +763,7 @@ test("refuses to commit out-of-scope files created by authoritative validation",
       args: ["-e", "require('node:fs').writeFileSync('outside.txt','generated')"],
     }],
   }]);
-  await new AecEngine(db).runTask(task!.id);
+  await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
   assert.equal(existsSync(join(repo, "outside.txt")), false);
   assert.match(JSON.stringify(db.getLatestRunForTask(task!.id)?.error), /scope_violation/);
@@ -771,11 +771,11 @@ test("refuses to commit out-of-scope files created by authoritative validation",
 });
 
 test("isolates one Run startup failure without terminating sibling work", async () => {
-  const db = new AecDatabase(tempDir("aec-run-isolation-"));
-  const brokenProject = db.createProject({ name: "broken", repoPath: join(tempDir("aec-missing-repo-"), "missing") });
+  const db = new AecSDatabase(tempDir("aec-s-run-isolation-"));
+  const brokenProject = db.createProject({ name: "broken", repoPath: join(tempDir("aec-s-missing-repo-"), "missing") });
   const healthyProject = db.createProject({ name: "healthy", repoPath: createGitRepository() });
   registerFakeAgents(db);
-  const engine = new AecEngine(db, { globalConcurrency: 2 });
+  const engine = new AecSEngine(db, { globalConcurrency: 2 });
   engine.submitGraph(brokenProject.id, [{
     id: "task-broken-start",
     projectId: brokenProject.id,
@@ -802,7 +802,7 @@ test("isolates one Run startup failure without terminating sibling work", async 
 
 test("automatically retries an operationally blocked Run after the dependency recovers", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-operational-retry-"));
+  const db = new AecSDatabase(tempDir("aec-s-operational-retry-"));
   const project = db.createProject({ name: "operational-retry", repoPath: repo });
   db.createAgent({
     id: "retry-executor",
@@ -814,7 +814,7 @@ test("automatically retries an operationally blocked Run after the dependency re
       execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db, { operationalRetryBaseMs: 1 });
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
   const [task] = engine.submitGraph(project.id, [{
     id: "task-operational-retry",
     projectId: project.id,
@@ -846,7 +846,7 @@ test("automatically retries an operationally blocked Run after the dependency re
 
 test("escalates only after persisted operational retries are exhausted", async () => {
   const repo = createGitRepository();
-  const db = new AecDatabase(tempDir("aec-operational-exhaustion-"));
+  const db = new AecSDatabase(tempDir("aec-s-operational-exhaustion-"));
   const project = db.createProject({ name: "operational-exhaustion", repoPath: repo });
   db.createAgent({
     id: "exhaustion-executor",
@@ -858,7 +858,7 @@ test("escalates only after persisted operational retries are exhausted", async (
       execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
     },
   });
-  const engine = new AecEngine(db, { operationalRetryBaseMs: 1, maxOperationalRetries: 1 });
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1, maxOperationalRetries: 1 });
   const [task] = engine.submitGraph(project.id, [{
     id: "task-operational-exhaustion",
     projectId: project.id,
@@ -876,13 +876,13 @@ test("escalates only after persisted operational retries are exhausted", async (
 });
 
 test("reconciles enabled Agent health while preserving explicit offline state", async () => {
-  const db = new AecDatabase(tempDir("aec-agent-health-"));
+  const db = new AecSDatabase(tempDir("aec-s-agent-health-"));
   db.createAgent({
     id: "health-agent",
     name: "health agent",
     adapter: "command",
     roles: ["executor"],
-    config: { binary: "/definitely/missing/aec-agent" },
+    config: { binary: "/definitely/missing/aec-s-agent" },
   });
   db.createAgent({
     id: "manual-offline-agent",
@@ -892,7 +892,7 @@ test("reconciles enabled Agent health while preserving explicit offline state", 
     availability: "offline",
     config: { binary: process.execPath },
   });
-  const engine = new AecEngine(db);
+  const engine = new AecSEngine(db);
   await engine.refreshAgentAvailability();
   assert.equal(db.getAgent("health-agent")?.availability, "degraded");
   assert.equal(db.getAgent("manual-offline-agent")?.availability, "offline");

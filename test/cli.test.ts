@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { builtCliPath, createGitRepository, tempDir } from "./helpers.js";
@@ -9,14 +9,22 @@ const cli = builtCliPath();
 
 function invoke(home: string, args: string[]): Record<string, unknown> {
   return JSON.parse(execFileSync(process.execPath, [cli, ...args], {
-    env: { ...process.env, AEC_HOME: home },
+    env: { ...process.env, AEC_S_HOME: home },
     encoding: "utf8",
   })) as Record<string, unknown>;
 }
 
+test("advertises the AEC-S command name", () => {
+  const result = spawnSync(process.execPath, [cli], { encoding: "utf8" });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /^AEC-S commands:/);
+  assert.match(result.stderr, /aec-s doctor/);
+  assert.doesNotMatch(result.stderr, /^  aec doctor$/m);
+});
+
 test("manages Project and Agent configuration through the CLI and reports doctor state", () => {
-  const home = tempDir("aec-cli-home-");
-  const inputs = tempDir("aec-cli-input-");
+  const home = tempDir("aec-s-cli-home-");
+  const inputs = tempDir("aec-s-cli-input-");
   const projectPath = join(inputs, "project.json");
   const projectPatchPath = join(inputs, "project-patch.json");
   const agentPath = join(inputs, "agent.json");

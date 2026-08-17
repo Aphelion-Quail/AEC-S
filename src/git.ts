@@ -85,7 +85,7 @@ export async function projectLockDatabasePath(project: Project): Promise<string>
   const commonDirValue = await execChecked(git(project.repoPath, ["rev-parse", "--git-common-dir"]));
   const commonDir = isAbsolute(commonDirValue) ? commonDirValue : resolve(project.repoPath, commonDirValue);
   const canonicalCommonDir = realpathSync(commonDir);
-  const lockRoot = join(tmpdir(), "aec-project-git-locks");
+  const lockRoot = join(tmpdir(), "aec-s-project-git-locks");
   mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
   const repositoryKey = createHash("sha256").update(canonicalCommonDir).digest("hex");
   return join(lockRoot, `${repositoryKey}.sqlite`);
@@ -221,7 +221,7 @@ export async function commitTask(workspacePath: string, task: Task): Promise<str
   const staged = await execCommand(git(workspacePath, ["diff", "--cached", "--quiet"]));
   if (staged.exitCode === 0) {
     const existing = await execCommand(git(workspacePath, ["log", "-1", "--format=%B"]));
-    if (existing.exitCode === 0 && existing.stdout.includes(`AEC-Task: ${task.id}`)) {
+    if (existing.exitCode === 0 && existing.stdout.includes(`AEC-S-Task: ${task.id}`)) {
       return await branchHead(workspacePath, "HEAD");
     }
     throw new Error("Task produced no changes to commit");
@@ -229,14 +229,14 @@ export async function commitTask(workspacePath: string, task: Task): Promise<str
   await execChecked({
     ...git(workspacePath, [
       "-c",
-      "user.name=AEC",
+      "user.name=AEC-S",
       "-c",
-      "user.email=aec@local",
+      "user.email=aec-s@local",
       "commit",
       "-m",
       task.title,
       "-m",
-      `AEC-Task: ${task.id}`,
+      `AEC-S-Task: ${task.id}`,
     ]),
     timeoutSeconds: 300,
   });

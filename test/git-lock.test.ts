@@ -16,9 +16,9 @@ function runWorker(repo: string, output: string, id: string): Promise<void> {
   });
 }
 
-test("serializes Project Git sections across AEC processes", async () => {
+test("serializes Project Git sections across AEC-S processes", async () => {
   const repo = createGitRepository();
-  const output = join(tempDir("aec-git-lock-"), "timeline.log");
+  const output = join(tempDir("aec-s-git-lock-"), "timeline.log");
   await Promise.all([runWorker(repo, output, "a"), runWorker(repo, output, "b")]);
   const events = readFileSync(output, "utf8").trim().split(/\r?\n/).map((line) => line.split(":"));
   assert.equal(events.length, 4);
@@ -30,7 +30,7 @@ test("serializes Project Git sections across AEC processes", async () => {
   const project = { ...projectFor(repo), id: "lock-location" };
   const databasePath = await projectLockDatabasePath(project);
   assert.equal(databasePath.startsWith(repo), false, "coordination locks must not live in the target repository");
-  assert.equal(existsSync(join(repo, ".git", "aec-project-git-lock.sqlite")), false);
+  assert.equal(existsSync(join(repo, ".git", "aec-s-project-git-lock.sqlite")), false);
 });
 
 function projectFor(repo: string): Project {
