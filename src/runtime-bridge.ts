@@ -3,7 +3,8 @@ import { createSession, type Session, type Turn } from "@moonshot-ai/kimi-agent-
 import { DeepSeekHarness } from "@deepseek-ai/dsh-sdk-client";
 import { writeJsonAtomic } from "./files.js";
 import { dirname, join } from "node:path";
-import { runKimiAcp } from "./kimi-acp.js";
+import { KimiAcpTransportError, runKimiAcp } from "./kimi-acp.js";
+import { childEnvironment } from "./child-env.js";
 
 type BridgeConfig = {
   binary?: string;
@@ -191,12 +192,11 @@ async function runDeepSeek(
       command,
       args: kind === "review" ? config.reviewArgs ?? config.args ?? [] : config.args ?? [],
       cwd: config.cwd ?? workspace,
-      env: {
-        ...process.env,
+      env: childEnvironment("deepseek_harness", {
         DSH_CWD: workspace,
         DSH_SESSION_ROOT: join(stateRoot, "dsh-sessions"),
         ...(config.dshHome ? { DSH_HOME: config.dshHome } : {}),
-      },
+      }),
     },
     cwd: workspace,
     provider: config.provider ?? "deepseek-official",
@@ -263,6 +263,9 @@ async function main(): Promise<void> {
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
+  const diagnostic = error instanceof KimiAcpTransportError
+    ? { code: "kimi_acp_transport_error", turnStarted: error.turnStarted, message }
+    : { code: "runtime_bridge_error", message };
+  process.stderr.write(`${JSON.stringify(diagnostic)}\n`);
   process.exitCode = 1;
 });

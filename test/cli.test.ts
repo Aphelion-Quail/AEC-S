@@ -19,6 +19,10 @@ test("advertises the AEC-S command name", () => {
   assert.equal(result.status, 2);
   assert.match(result.stderr, /^AEC-S commands:/);
   assert.match(result.stderr, /aec-s doctor/);
+  assert.match(result.stderr, /aec-s run \[task-id\]/);
+  assert.match(result.stderr, /aec-s daemon/);
+  assert.match(result.stderr, /aec-s service <install\|start\|stop\|restart\|status\|uninstall>/);
+  assert.match(result.stderr, /aec-s mcp-http/);
   assert.doesNotMatch(result.stderr, /^  aec doctor$/m);
 });
 

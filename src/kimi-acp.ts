@@ -4,6 +4,8 @@ import { basename, dirname, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { redactText } from "./redaction.js";
+import { within } from "./async.js";
+import { childEnvironment } from "./child-env.js";
 
 export const KIMI_ACP_CLIENT_VERSION = "0.23.0";
 const MAX_RUNTIME_RESULT_BYTES = 8 * 1024 * 1024;
@@ -55,21 +57,6 @@ function errorText(error: unknown): string {
   return redactText(error instanceof Error ? error.message : String(error), 2_000);
 }
 
-async function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds} ms`)), milliseconds);
-        timer.unref();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 function boundedStderr(child: ChildProcessWithoutNullStreams): () => string {
   let stderr = "";
   child.stderr.setEncoding("utf8");
@@ -99,10 +86,7 @@ function launch(
 ): { child: ChildProcessWithoutNullStreams; connection: acp.ClientSideConnection; stderr: () => string } {
   const child = spawn(options.binary, ["acp"], {
     cwd: options.workspace,
-    env: {
-      ...process.env,
-      ...(options.shareDir ? { KIMI_SHARE_DIR: options.shareDir } : {}),
-    },
+    env: childEnvironment("kimi", options.shareDir ? { KIMI_SHARE_DIR: options.shareDir } : {}),
     stdio: ["pipe", "pipe", "pipe"],
   });
   const stream = acp.ndJsonStream(Writable.toWeb(child.stdin), Readable.toWeb(child.stdout));

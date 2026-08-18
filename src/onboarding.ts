@@ -8,7 +8,7 @@ import { branchHead, currentBranch } from "./git.js";
 import { getAecSPaths } from "./paths.js";
 import { serviceAction } from "./service.js";
 import type { AgentInput, ProjectInput } from "./types.js";
-import { DSH_COMPATIBILITY, type RuntimeProbeResult } from "./runtime-probe.js";
+import { DSH_COMPATIBILITY } from "./runtime-probe.js";
 
 function legacySchemaVersion(database: string): number | undefined {
   if (!existsSync(database)) return undefined;
@@ -53,10 +53,9 @@ export async function initializeAecS(options: { installService?: boolean } = {})
     const engine = new AecSEngine(db);
     // Two successful probes recover a Runtime; three consecutive failures
     // cross the default debounce threshold and make the failure explicit.
-    let probes = new Map<string, RuntimeProbeResult>();
-    probes = await engine.refreshAgentAvailability();
-    probes = await engine.refreshAgentAvailability();
-    probes = await engine.refreshAgentAvailability();
+    await engine.refreshAgentAvailability();
+    await engine.refreshAgentAvailability();
+    const probes = await engine.refreshAgentAvailability();
     const service = options.installService === false ? "skipped" : await serviceAction("install", paths);
     return {
       home: paths.home,

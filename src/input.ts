@@ -182,6 +182,7 @@ export const resolutionSchema = z.record(z.string(), z.unknown());
 
 export const jobInputSchema = z.object({
   command: commandSpecSchema,
+  environmentProfile: z.enum(["restricted", "codex", "kimi", "deepseek_harness"]).optional(),
   stdin: z.string().optional(),
   stdoutPath: z.string().min(1),
   stderrPath: z.string().min(1),

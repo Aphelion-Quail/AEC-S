@@ -108,6 +108,8 @@ node dist/src/cli.js service restart
 
 Agent and validation commands run under an independent job supervisor. Output, final results, and PIDs are persisted; timeouts terminate the entire child process group. After a daemon restart, AEC-S waits for a live job, consumes a completed job, or resumes from the latest safe phase. Run writes are fenced by lease ownership, and agent concurrency is controlled by atomic database slots. Commit, push, PR, and merge operations use deterministic operation IDs. An `uncertain` operation is reconciled instead of blindly retried.
 
+Child environments are capability-scoped. Git, validation, and ordinary command probes receive only the minimal user, locale, temporary-directory, and executable-path environment; they do not inherit arbitrary daemon secrets. First-class Runtime processes additionally receive only the credential variables required by Codex, Kimi, and DeepSeek Harness. Authenticate GitHub with `gh auth login`; validation commands must not depend on ambient secret variables.
+
 The LaunchAgent stores a stable background `PATH` covering Homebrew, system tools, common user bins, and ChatGPT's bundled Codex by default. Health transitions are debounced: one failure records degradation, while the configured consecutive threshold is required before `unavailable`; recovery is also consecutive. A missing runtime blocks only tasks that require it. Checks, merge, Human input, and stability observation do not occupy runtime capacity.
 
 Ordinary Git, GitHub, validator-launch, and other runtime infrastructure failures use persistent exponential backoff, with five attempts by default. A `failure_exhausted` human decision is created only after retries are exhausted. A nonzero exit after a validation command starts normally remains a code-gate failure and enters repair; failure to launch the command is an operational failure and does not ask an agent to change code.
@@ -126,8 +128,13 @@ aec-s decision list [project-id]
 aec-s decision show <decision-id>
 aec-s decision resolve <decision-id> <resolution.json>
 aec-s decision record <decision.json>
+aec-s run [task-id]
+aec-s daemon
+aec-s service install|start|stop|restart|status|uninstall
 aec-s doctor
 aec-s init [--no-service]
+aec-s mcp
+aec-s mcp-http
 ```
 
 Example human resolution:
@@ -190,7 +197,7 @@ If the WorkBuddy GUI connector accepts only HTTP or npx, use the local Streamabl
 http://127.0.0.1:7337/mcp
 ```
 
-The endpoint listens only on loopback and requires `Authorization: Bearer <token>` on every MCP request. `aec-s init` creates the token at `$AEC_S_HOME/mcp-http.token` with mode `0600`; configure it only in a client's secret/header field and never copy it into a repository, log, or task input. Clients that cannot set an HTTP header must use the stdio configuration above. The server keeps at most 64 standard Streamable HTTP sessions, expires idle sessions after 30 minutes, and supports POST, GET/SSE, and DELETE termination. Set `AEC_S_MCP_HTTP_PORT` to change the port, then rerun `aec-s service install`. The unauthenticated health endpoint is `http://127.0.0.1:7337/healthz` and deliberately exposes no version. AEC-S is not distributed as an npm package, so do not select npx in the GUI.
+The endpoint listens only on loopback and requires `Authorization: Bearer <token>` on every MCP request. This token is a control-plane capability: a holder can submit validation commands that execute with the AEC-S host user's permissions. Treat it like an authenticated local shell session, never share it with an untrusted client, and revoke client access immediately if it may have leaked. `aec-s init` creates the token at `$AEC_S_HOME/mcp-http.token` with mode `0600`; configure it only in a client's secret/header field and never copy it into a repository, log, or task input. Clients that cannot set an HTTP header must use the stdio configuration above. The server keeps at most 64 standard Streamable HTTP sessions, expires idle sessions after 30 minutes, and supports POST, GET/SSE and DELETE termination. Shutdown closes idle keep-alive connections and forcibly bounds remaining connections. Set `AEC_S_MCP_HTTP_PORT` to change the port, then rerun `aec-s service install`. The unauthenticated health endpoint is `http://127.0.0.1:7337/healthz` and deliberately exposes no version. AEC-S is not distributed as an npm package, so do not select npx in the GUI.
 
 Finding transitions do not accept a caller-supplied identity. A dedicated reviewer MCP process must bind an enabled Reviewer with `AEC_S_MCP_ACTOR_AGENT_ID`; the shared daemon endpoint fails closed for this tool when no reviewer identity is bound. Human direction continues through Decision tools rather than impersonating a Reviewer.
 
@@ -225,7 +232,7 @@ npm run test:all
 npm run test:runtimes:live
 ```
 
-`test:all` runs lint, strict type checking, license policy, and thresholded coverage. GitHub Actions uses protocol substitutes and no real credentials. `test:runtimes:live` is maintainer-only, requires `AEC_S_LIVE_RUNTIME_CONFIRM=1`, and writes a sanitized report containing only versions, scenario IDs, PASS/FAIL, time, and schema version.
+`test:all` runs lint, strict type checking, license policy, an enforceable package policy, and thresholded coverage. The package policy independently requires every install-script package to match the reviewed `allowScripts` name/version set and keeps every DSH preview package exactly pinned, so safety does not depend on a package manager honoring `allowScripts`. GitHub Actions uses protocol substitutes and no real credentials. `test:runtimes:live` is maintainer-only, requires `AEC_S_LIVE_RUNTIME_CONFIRM=1`, and writes a sanitized report containing only versions, scenario IDs, PASS/FAIL, time, and schema version.
 
 Tests cover the formal ten-entity projection, Task Revision and Finding evidence, deterministic scheduling and health debounce, scope conflict, validation/review repair, supervisor recovery, post-merge convergence, all eleven MCP tools, and idempotent Git/GitHub effects. The live gate separately proves real Codex/Kimi/DSH execution, review, repair/resume, cancellation isolation, and health thresholds.
 

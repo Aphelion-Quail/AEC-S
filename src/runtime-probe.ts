@@ -11,6 +11,8 @@ import { isLoggedIn, ProtocolClient } from "@moonshot-ai/kimi-agent-sdk";
 import { execCommand } from "./exec.js";
 import { KIMI_ACP_CLIENT_VERSION, probeKimiAcp } from "./kimi-acp.js";
 import { redactText } from "./redaction.js";
+import { within } from "./async.js";
+import { childEnvironment } from "./child-env.js";
 
 export type ProbeCheck = {
   ok: boolean;
@@ -97,21 +99,6 @@ function errorDetail(error: unknown): string {
   return redactText(error instanceof Error ? error.message : String(error), 1_000);
 }
 
-async function within<T>(promise: Promise<T>, milliseconds: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${milliseconds} ms`)), milliseconds);
-        timer.unref();
-      }),
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
 function resultFromChecks(
   version: string,
   checks: NonNullable<RuntimeProbeResult["checks"]>,
@@ -128,7 +115,7 @@ function resultFromChecks(
 export async function probeCodex(binary: string): Promise<RuntimeProbeResult> {
   let versionResult;
   try {
-    versionResult = await execCommand({ program: binary, args: ["--version"], timeoutSeconds: 10 });
+    versionResult = await execCommand({ program: binary, args: ["--version"], timeoutSeconds: 10 }, undefined, "codex");
   } catch (error) {
     const detail = `Codex CLI is not executable: ${errorDetail(error)}`;
     const failed = { ok: false, detail };
@@ -144,13 +131,13 @@ export async function probeCodex(binary: string): Promise<RuntimeProbeResult> {
     ? { ok: true, detail: `Codex CLI/${version} at ${binary}` }
     : { ok: false, detail: `Codex version probe failed: ${errorDetail(versionResult.stderr || versionResult.stdout)}` };
   const login = installation.ok
-    ? await execCommand({ program: binary, args: ["login", "status"], timeoutSeconds: 15 })
+    ? await execCommand({ program: binary, args: ["login", "status"], timeoutSeconds: 15 }, undefined, "codex")
     : undefined;
   const authentication: ProbeCheck = login?.exitCode === 0
     ? { ok: true, detail: redactText(login.stdout.trim() || login.stderr.trim() || "Codex login is available") }
     : { ok: false, detail: login ? `Codex authentication is unavailable: ${errorDetail(login.stderr || login.stdout)}` : "Authentication was not checked" };
   const help = installation.ok
-    ? await execCommand({ program: binary, args: ["exec", "--help"], timeoutSeconds: 15 })
+    ? await execCommand({ program: binary, args: ["exec", "--help"], timeoutSeconds: 15 }, undefined, "codex")
     : undefined;
   const helpText = `${help?.stdout ?? ""}\n${help?.stderr ?? ""}`;
   const requiredFlags = ["--sandbox", "--json", "--output-schema", "--output-last-message"];
@@ -188,7 +175,11 @@ export function discoverKimiShareDirectory(binary: string): string | undefined {
 
 async function kimiAuthentication(binary: string): Promise<ProbeCheck> {
   const sdkEvidence = discoverKimiShareDirectory(binary) !== undefined;
-  const providers = await execCommand({ program: binary, args: ["provider", "list"], timeoutSeconds: 15 });
+  const providers = await execCommand(
+    { program: binary, args: ["provider", "list"], timeoutSeconds: 15 },
+    undefined,
+    "kimi",
+  );
   const providerEvidence = providers.exitCode === 0
     && /\bmodels=[1-9][0-9]*\b/.test(providers.stdout)
     && /\bsource=(?:oauth|api[_-]?key|credential)\b/i.test(providers.stdout);
@@ -277,7 +268,7 @@ export async function probeKimi(
 ): Promise<RuntimeProbeResult> {
   let versionResult;
   try {
-    versionResult = await execCommand({ program: binary, args: ["--version"], timeoutSeconds: 10 });
+    versionResult = await execCommand({ program: binary, args: ["--version"], timeoutSeconds: 10 }, undefined, "kimi");
   } catch (error) {
     const detail = `Kimi Code CLI is not executable: ${errorDetail(error)}`;
     const failed = { ok: false, detail };
@@ -366,12 +357,11 @@ async function dshHandshake(
         command,
         args: [config],
         cwd: workspace,
-        env: {
-          ...process.env,
+        env: childEnvironment("deepseek_harness", {
           DSH_CWD: workspace,
           DSH_SESSION_ROOT: join(stateRoot, String(index)),
           ...(dshHome ? { DSH_HOME: dshHome } : {}),
-        },
+        }),
         requestTimeoutMs: 10_000,
         shutdownTimeoutMs: 1_000,
       });

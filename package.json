@@ -12,13 +12,15 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "check:licenses": "node scripts/check-licenses.mjs",
+    "check:package-policy": "node scripts/check-package-policy.mjs",
     "lint": "oxlint src test scripts --deny-warnings",
-    "test:unit": "node --test --test-concurrency=1 dist/test/*.test.js",
-    "test": "npm run build && npm run test:unit",
+    "test:unit:built": "node --test --test-concurrency=1 dist/test/*.test.js",
+    "test:unit": "npm run build && npm run test:unit:built",
+    "test": "npm run test:unit",
     "test:runtimes:live": "npm run build && node scripts/test-runtimes-live.mjs",
     "test:coverage:built": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='dist/src/**/*.js' --test-coverage-include-all --test-coverage-lines=80 --test-coverage-branches=65 --test-coverage-functions=80 dist/test/*.test.js",
     "test:coverage": "npm run build && npm run test:coverage:built",
-    "test:all": "npm run lint && npm run check && npm run check:licenses && npm run build && npm run test:coverage:built",
+    "test:all": "npm run lint && npm run check && npm run check:licenses && npm run check:package-policy && npm run build && npm run test:coverage:built",
     "audit": "npm audit"
   },
   "engines": {

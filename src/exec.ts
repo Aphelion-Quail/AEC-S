@@ -1,22 +1,12 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
-import type { CommandSpec } from "./types.js";
+import type { ChildEnvironmentProfile, CommandSpec } from "./types.js";
+import { childEnvironment } from "./child-env.js";
+import { killProcessTree } from "./process-control.js";
 
-const MAX_CAPTURED_CHARACTERS = 8 * 1024 * 1024;
-
-function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
-  if (child.pid && process.platform !== "win32") {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Fall through to the direct child when the process group is gone.
-    }
-  }
-  child.kill(signal);
-}
+const MAX_CAPTURED_BYTES = 8 * 1024 * 1024;
 
 export type ExecResult = {
   exitCode: number | null;
@@ -26,16 +16,20 @@ export type ExecResult = {
   timedOut: boolean;
 };
 
-export async function execCommand(command: CommandSpec, stdin?: string): Promise<ExecResult> {
+export async function execCommand(
+  command: CommandSpec,
+  stdin?: string,
+  environmentProfile: ChildEnvironmentProfile = "restricted",
+): Promise<ExecResult> {
   return await new Promise<ExecResult>((resolve, reject) => {
     const child = spawn(command.program, command.args, {
       cwd: command.cwd,
-      env: { ...process.env, ...command.env },
+      env: childEnvironment(environmentProfile, command.env),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
-    let stdout = "";
-    let stderr = "";
+    let stdout: Buffer = Buffer.alloc(0);
+    let stderr: Buffer = Buffer.alloc(0);
     let timedOut = false;
     let forceKill: NodeJS.Timeout | undefined;
     const timeout = setTimeout(() => {
@@ -45,10 +39,8 @@ export async function execCommand(command: CommandSpec, stdin?: string): Promise
       forceKill.unref();
     }, (command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk: string) => (stdout = appendBounded(stdout, chunk)));
-    child.stderr.on("data", (chunk: string) => (stderr = appendBounded(stderr, chunk)));
+    child.stdout.on("data", (chunk: Buffer) => (stdout = appendBounded(stdout, chunk)));
+    child.stderr.on("data", (chunk: Buffer) => (stderr = appendBounded(stderr, chunk)));
     child.on("error", (error) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
@@ -58,7 +50,7 @@ export async function execCommand(command: CommandSpec, stdin?: string): Promise
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       killProcessTree(child, "SIGKILL");
-      resolve({ exitCode, signal, stdout, stderr, timedOut });
+      resolve({ exitCode, signal, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut });
     });
     if (stdin !== undefined) child.stdin.end(stdin);
     else child.stdin.end();
@@ -68,12 +60,12 @@ export async function execCommand(command: CommandSpec, stdin?: string): Promise
 export async function execCommandToFile(command: CommandSpec, outputPath: string): Promise<ExecResult> {
   const child = spawn(command.program, command.args, {
     cwd: command.cwd,
-    env: { ...process.env, ...command.env },
+    env: childEnvironment("restricted", command.env),
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32",
   });
   const output = createWriteStream(outputPath, { mode: 0o600 });
-  let stderr = "";
+  let stderr: Buffer = Buffer.alloc(0);
   let outputBytes = 0;
   let timedOut = false;
   let forceKill: NodeJS.Timeout | undefined;
@@ -84,8 +76,7 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
     forceKill.unref();
   }, (command.timeoutSeconds ?? 300) * 1_000);
   timeout.unref();
-  child.stderr.setEncoding("utf8");
-  child.stderr.on("data", (chunk: string) => (stderr = appendBounded(stderr, chunk)));
+  child.stderr.on("data", (chunk: Buffer) => (stderr = appendBounded(stderr, chunk)));
   const completed = new Promise<ExecResult>((resolve, reject) => {
     child.on("error", (error) => {
       clearTimeout(timeout);
@@ -97,13 +88,13 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       killProcessTree(child, "SIGKILL");
-      resolve({ exitCode, signal, stdout: "", stderr, timedOut });
+      resolve({ exitCode, signal, stdout: "", stderr: stderr.toString("utf8"), timedOut });
     });
   });
   const limiter = new Transform({
     transform(chunk: Buffer, _encoding, callback) {
       outputBytes += chunk.length;
-      if (outputBytes > MAX_CAPTURED_CHARACTERS) callback(new Error("Command file output exceeds 8 MiB"));
+      if (outputBytes > MAX_CAPTURED_BYTES) callback(new Error("Command file output exceeds 8 MiB"));
       else callback(null, chunk);
     },
   });
@@ -117,15 +108,23 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
     },
   );
   const [result, writeError] = await Promise.all([completed, writing]);
-  return writeError ? { ...result, exitCode: null, stderr: appendBounded(stderr, writeError.message) } : result;
+  return writeError
+    ? { ...result, exitCode: null, stderr: appendBounded(Buffer.from(result.stderr), Buffer.from(writeError.message)).toString("utf8") }
+    : result;
 }
 
-function appendBounded(current: string, chunk: string): string {
-  if (current.length >= MAX_CAPTURED_CHARACTERS) return current;
-  const remaining = MAX_CAPTURED_CHARACTERS - current.length;
-  if (chunk.length <= remaining) return current + chunk;
-  const marker = "\n[output truncated]\n";
-  return `${current}${chunk.slice(0, Math.max(0, remaining - marker.length))}${marker}`;
+function appendBounded(current: Buffer, chunk: Buffer): Buffer {
+  const marker = Buffer.from("\n[output truncated]\n");
+  if (current.length >= MAX_CAPTURED_BYTES) {
+    if (current.subarray(-marker.length).equals(marker)) return current;
+    const prefixLength = MAX_CAPTURED_BYTES - marker.length - 4;
+    return Buffer.concat([current.subarray(0, prefixLength), marker], prefixLength + marker.length);
+  }
+  const remaining = MAX_CAPTURED_BYTES - current.length;
+  if (chunk.length <= remaining) return Buffer.concat([current, chunk], current.length + chunk.length);
+  if (remaining <= marker.length) return Buffer.concat([current, marker.subarray(0, remaining)], MAX_CAPTURED_BYTES);
+  const contentLength = Math.max(0, remaining - marker.length - 4);
+  return Buffer.concat([current, chunk.subarray(0, contentLength), marker], current.length + contentLength + marker.length);
 }
 
 export async function execChecked(command: CommandSpec, stdin?: string): Promise<string> {

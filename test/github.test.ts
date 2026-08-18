@@ -28,7 +28,7 @@ test("publishes one idempotent PR and records the remote merge", async () => {
 const fs = require('node:fs');
 const cp = require('node:child_process');
 const args = process.argv.slice(2);
-const statePath = process.env.FAKE_GH_STATE;
+const statePath = ${JSON.stringify(ghState)};
 const read = () => fs.existsSync(statePath) ? JSON.parse(fs.readFileSync(statePath, 'utf8')) : null;
 const write = value => fs.writeFileSync(statePath, JSON.stringify(value));
 const remoteHead = () => cp.execFileSync('git', ['ls-remote', '--heads', 'origin', 'refs/heads/aec-s/task-github'], { encoding: 'utf8' }).trim().split(/\\s+/)[0];
@@ -76,7 +76,6 @@ if (args[0] === 'pr' && args[1] === 'list') {
   chmodSync(ghPath, 0o755);
   const oldPath = process.env.PATH;
   process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
-  process.env.FAKE_GH_STATE = ghState;
   process.env.AEC_S_GITHUB_CHECK_POLL_MS = "10";
   try {
     const db = new AecSDatabase(tempDir("aec-s-github-"));
@@ -147,7 +146,6 @@ if (args[0] === 'pr' && args[1] === 'list') {
     db.close();
   } finally {
     process.env.PATH = oldPath;
-    delete process.env.FAKE_GH_STATE;
     delete process.env.AEC_S_GITHUB_CHECK_POLL_MS;
   }
 });
@@ -161,15 +159,18 @@ test("reconciles an externally completed PR before retrying publish", async () =
 
   const fakeBin = tempDir("aec-s-reconcile-fakebin-");
   const ghPath = join(fakeBin, "gh");
+  const ghState = join(fakeBin, "gh-state.json");
   writeFileSync(ghPath, `#!/usr/bin/env node
+const fs = require('node:fs');
 const args = process.argv.slice(2);
 if (args[0] === 'pr' && args[1] === 'view') {
+  const state = JSON.parse(fs.readFileSync(${JSON.stringify(ghState)}, 'utf8'));
   process.stdout.write(JSON.stringify({
     number: 7,
     url: 'https://example.test/pr/7',
     state: 'MERGED',
-    headRefOid: process.env.FAKE_GH_HEAD,
-    mergeCommit: { oid: process.env.FAKE_GH_MERGE }
+    headRefOid: state.head,
+    mergeCommit: { oid: state.merge }
   }));
   process.exit(0);
 }
@@ -258,8 +259,7 @@ process.exit(2);
       cwd: workspace.path,
       stdio: "ignore",
     });
-    process.env.FAKE_GH_HEAD = pullRequestHead;
-    process.env.FAKE_GH_MERGE = pullRequestHead;
+    writeFileSync(ghState, JSON.stringify({ head: pullRequestHead, merge: pullRequestHead }));
     run.phase = "publish";
     run.status = "interrupted";
     run.effects = {
@@ -288,8 +288,6 @@ process.exit(2);
   } finally {
     db.close();
     process.env.PATH = oldPath;
-    delete process.env.FAKE_GH_HEAD;
-    delete process.env.FAKE_GH_MERGE;
   }
 });
 

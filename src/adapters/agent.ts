@@ -256,7 +256,7 @@ class BridgeAdapter extends BaseAdapter {
       ? this.agent.config.probeArgs.map(String)
       : ["--version"];
     try {
-      const result = await execCommand({ program, args, timeoutSeconds: 15 });
+      const result = await execCommand({ program, args, timeoutSeconds: 15 }, undefined, "kimi");
       const detail = result.stdout.trim() || result.stderr.trim();
       return { ok: result.exitCode === 0, detail, ...(result.exitCode === 0 ? { version: detail } : {}) };
     } catch (error) {

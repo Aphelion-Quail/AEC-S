@@ -7,6 +7,8 @@ import type { JobInput, JobResult, JobState } from "./types.js";
 import { newId, nowIso } from "./ids.js";
 import { readJson, writeJsonAtomic } from "./files.js";
 import { jobInputSchema } from "./input.js";
+import { childEnvironment } from "./child-env.js";
+import { killProcessTreeByPid } from "./process-control.js";
 
 export async function runJobFile(inputPath: string): Promise<void> {
   const input = jobInputSchema.parse(readJson<unknown>(inputPath)) as JobInput;
@@ -55,7 +57,7 @@ export async function runJobFile(inputPath: string): Promise<void> {
   try {
     const child = spawn(input.command.program, input.command.args, {
       cwd: input.command.cwd,
-      env: { ...process.env, ...input.command.env },
+      env: childEnvironment(input.environmentProfile, input.command.env),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -68,11 +70,11 @@ export async function runJobFile(inputPath: string): Promise<void> {
       // A bounded process-group kill remains the deterministic backstop.
       child.kill("SIGTERM");
       if (!terminateTree) {
-        terminateTree = setTimeout(() => killProcessTree(child.pid, "SIGTERM", () => child.kill("SIGTERM")), 250);
+        terminateTree = setTimeout(() => killProcessTreeByPid(child.pid, "SIGTERM", () => child.kill("SIGTERM")), 250);
         terminateTree.unref();
       }
       if (!forceKill) {
-        forceKill = setTimeout(() => killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL")), 2_000);
+        forceKill = setTimeout(() => killProcessTreeByPid(child.pid, "SIGKILL", () => child.kill("SIGKILL")), 2_000);
         forceKill.unref();
       }
     };
@@ -122,7 +124,7 @@ export async function runJobFile(inputPath: string): Promise<void> {
       // completed cancellation result and continue mutating the workspace.
       // A Runtime is not allowed to leave detached helpers behind after its
       // entrypoint has completed, even on the nominal success path.
-      killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      killProcessTreeByPid(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
@@ -196,18 +198,6 @@ export function processAlive(pid: number, inspector: ProcessInspector = inspectP
   return alive;
 }
 
-function killProcessTree(pid: number | undefined, signal: NodeJS.Signals, fallback: () => boolean): void {
-  if (!pid || process.platform === "win32") {
-    fallback();
-    return;
-  }
-  try {
-    process.kill(-pid, signal);
-  } catch {
-    fallback();
-  }
-}
-
 export function startSupervisedJob(
   input: JobInput,
   inputPath: string,
@@ -223,6 +213,7 @@ export function startSupervisedJob(
   const child = spawn(process.execPath, [entry, "internal-job", inputPath], {
     detached: true,
     stdio: "ignore",
+    env: childEnvironment(input.environmentProfile),
   });
   child.unref();
   return {

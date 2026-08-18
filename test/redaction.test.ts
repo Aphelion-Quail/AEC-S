@@ -22,3 +22,13 @@ test("redacts private keys, cloud identifiers, JWTs, and Slack tokens", () => {
   for (const secret of [aws, slack, jwt, "not-real-key-material"]) assert.equal(redacted.includes(secret), false);
   assert.deepEqual(redactJson({ authorization: "opaque-value" }), { authorization: "[REDACTED]" });
 });
+
+test("redacts JSON secrets, Google API keys, and non-HTTP credential URLs", () => {
+  const google = `AIza${"a".repeat(35)}`;
+  const input = `{"api_key": "${google}", "database": "postgresql://user:password@db.test/name"}`;
+  const redacted = redactText(input);
+  assert.equal(redacted.includes(google), false);
+  assert.equal(redacted.includes("password"), false);
+  assert.match(redacted, /"api_key": "\[REDACTED\]"/);
+  assert.doesNotMatch(redactText(`DEEPSEEK_API_KEY: '${"x".repeat(32)}'`), /xxxxxxxx/);
+});

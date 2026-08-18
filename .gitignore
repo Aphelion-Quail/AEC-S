@@ -4,4 +4,12 @@ dist/
 .aec-s-reports/
 coverage/
 *.log
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.*
+*.pem
+*.key
+mcp-http.token
 .DS_Store
