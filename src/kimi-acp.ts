@@ -1,11 +1,12 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { realpathSync } from "node:fs";
-import { relative, resolve } from "node:path";
+import { existsSync, realpathSync } from "node:fs";
+import { basename, dirname, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { redactText } from "./redaction.js";
 
 export const KIMI_ACP_CLIENT_VERSION = "0.23.0";
+const MAX_RUNTIME_RESULT_BYTES = 8 * 1024 * 1024;
 
 export type KimiAcpProbe = {
   protocolVersion: number;
@@ -183,11 +184,19 @@ export async function probeKimiAcp(options: KimiAcpOptions): Promise<KimiAcpProb
 
 function pathInsideWorkspace(path: string, workspace: string): boolean {
   if (/^[a-z][a-z0-9+.-]*:/i.test(path)) return false;
-  const roots = new Set([resolve(workspace), realpathSync.native(resolve(workspace))]);
-  return [...roots].some((root) => {
-    const relation = relative(root, resolve(root, path));
-    return relation === "" || (!relation.startsWith("..") && !relation.startsWith("/") && !relation.startsWith("\\"));
-  });
+  const root = realpathSync.native(resolve(workspace));
+  const unresolved = resolve(root, path);
+  const suffix: string[] = [];
+  let existing = unresolved;
+  while (!existsSync(existing)) {
+    const parent = dirname(existing);
+    if (parent === existing) return false;
+    suffix.unshift(basename(existing));
+    existing = parent;
+  }
+  const candidate = resolve(realpathSync.native(existing), ...suffix);
+  const relation = relative(root, candidate);
+  return relation === "" || (relation !== ".." && !relation.startsWith(`..${sep}`) && !relation.startsWith(sep));
 }
 
 function usage(value: acp.Usage | null | undefined): KimiAcpRunResult["usage"] {
@@ -233,6 +242,7 @@ export async function runKimiAcp(options: KimiAcpOptions & {
 }): Promise<KimiAcpRunResult> {
   const permissionSummary = { requested: 0, allowedOnce: 0, rejected: 0, toolKinds: [] as string[] };
   let text = "";
+  let textBytes = 0;
   let activeSessionId: string | undefined;
   let connection: acp.ClientSideConnection | undefined;
   let turnStarted = false;
@@ -265,7 +275,11 @@ export async function runKimiAcp(options: KimiAcpOptions & {
       // eligible to become the current AEC-S structured result or audit data.
       if (!collecting) return;
       const update = params.update;
-      if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") text += update.content.text;
+      if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text") {
+        textBytes += Buffer.byteLength(update.content.text);
+        if (textBytes > MAX_RUNTIME_RESULT_BYTES) throw new Error("Kimi ACP structured result exceeds 8 MiB");
+        text += update.content.text;
+      }
       if ((update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update")
         && update.kind && !permissionSummary.toolKinds.includes(update.kind)) permissionSummary.toolKinds.push(update.kind);
     },

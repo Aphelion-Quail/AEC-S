@@ -1,7 +1,6 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { chmodSync, existsSync, mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import type { Project, Task } from "./types.js";
 import { execChecked, execCommand, execCommandToFile } from "./exec.js";
@@ -9,7 +8,7 @@ import { matchesAny } from "./glob.js";
 
 const projectLocks = new Map<string, Promise<void>>();
 const LOCK_RETRY_MS = 100;
-const LOCK_TIMEOUT_MS = 2 * 60 * 1_000;
+const LOCK_TIMEOUT_MS = 10 * 60 * 1_000;
 const LOCK_LEASE_MS = 30 * 60 * 1_000;
 
 export async function withProjectGitLock<T>(project: Project, fn: () => Promise<T>): Promise<T> {
@@ -24,9 +23,12 @@ export async function withProjectGitLock<T>(project: Project, fn: () => Promise<
     lock = await acquireProjectFileLock(project);
     return await fn();
   } finally {
-    if (lock) releaseProjectFileLock(lock);
+    // Always release the in-process queue first. A SQLite release failure must
+    // be visible to the caller, but it cannot be allowed to strand every later
+    // Git operation for this Project behind an unresolved Promise.
     release();
     if (projectLocks.get(project.id) === queued) projectLocks.delete(project.id);
+    if (lock) releaseProjectFileLock(lock);
   }
 }
 
@@ -34,6 +36,7 @@ async function acquireProjectFileLock(project: Project): Promise<{ databasePath:
   const databasePath = await projectLockDatabasePath(project);
   const token = `${process.pid}:${Date.now()}:${Math.random().toString(16).slice(2)}`;
   const lockDb = new DatabaseSync(databasePath);
+  chmodSync(databasePath, 0o600);
   lockDb.exec("PRAGMA busy_timeout=1000");
   lockDb.exec(`CREATE TABLE IF NOT EXISTS project_lock (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -85,16 +88,16 @@ export async function projectLockDatabasePath(project: Project): Promise<string>
   const commonDirValue = await execChecked(git(project.repoPath, ["rev-parse", "--git-common-dir"]));
   const commonDir = isAbsolute(commonDirValue) ? commonDirValue : resolve(project.repoPath, commonDirValue);
   const canonicalCommonDir = realpathSync(commonDir);
-  const lockRoot = join(tmpdir(), "aec-s-project-git-locks");
-  mkdirSync(lockRoot, { recursive: true, mode: 0o700 });
-  const repositoryKey = createHash("sha256").update(canonicalCommonDir).digest("hex");
-  return join(lockRoot, `${repositoryKey}.sqlite`);
+  mkdirSync(canonicalCommonDir, { recursive: true, mode: 0o700 });
+  return join(canonicalCommonDir, "aec-s-project-git-lock.sqlite");
 }
 
 function processIsAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
-    return true;
+    const inspected = spawnSync("/bin/ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 });
+    if (inspected.error || inspected.status !== 0 || !inspected.stdout.trim()) return true;
+    return !inspected.stdout.trim().startsWith("Z");
   } catch {
     return false;
   }
@@ -189,11 +192,27 @@ export async function workspaceHasChanges(workspacePath: string): Promise<boolea
   return result.stdout.length > 0;
 }
 
+export async function restoreWorkspaceHead(workspacePath: string): Promise<void> {
+  await execChecked(git(workspacePath, ["reset", "--hard", "HEAD"]));
+  await execChecked(git(workspacePath, ["clean", "-fd"]));
+}
+
 export async function changedPathsBetween(repoPath: string, fromSha: string, toSha: string): Promise<string[]> {
   if (fromSha === toSha) return [];
   const result = await execCommand(git(repoPath, ["diff", "--name-only", "-z", `${fromSha}..${toSha}`, "--"]));
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || "Unable to inspect target changes");
   return result.stdout.split("\0").filter(Boolean).sort();
+}
+
+export async function isAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
+  const result = await execCommand(git(repoPath, ["merge-base", "--is-ancestor", ancestor, descendant]));
+  if (result.exitCode === 0) return true;
+  if (result.exitCode === 1) return false;
+  throw new Error(result.stderr.trim() || `Unable to compare Git ancestry for ${ancestor} and ${descendant}`);
+}
+
+export async function mergeBase(repoPath: string, left: string, right: string): Promise<string> {
+  return await execChecked(git(repoPath, ["merge-base", left, right]));
 }
 
 export async function commitCountBetween(repoPath: string, fromSha: string, toSha: string): Promise<number> {
@@ -254,11 +273,22 @@ export async function revertMergedTask(project: Project, mergeSha: string, taskI
   return await withProjectGitLock(project, async () => {
     if (project.deliveryMode !== "local") throw new Error("Automatic revert is currently limited to local delivery");
     const targetHead = await branchHead(project.repoPath, project.targetBranch);
-    if (targetHead !== mergeSha) throw new Error("Automatic revert requires the failed merge to remain the exact target HEAD");
-    await execChecked(git(project.repoPath, [
-      "-c", "user.name=AEC-S", "-c", "user.email=aec-s@local",
-      "revert", "--no-edit", mergeSha,
-    ], 300));
+    if (targetHead !== mergeSha) {
+      const parent = await execCommand(git(project.repoPath, ["rev-parse", `${targetHead}^`]));
+      const message = await execCommand(git(project.repoPath, ["log", "-1", "--format=%B", targetHead]));
+      if (parent.exitCode === 0 && parent.stdout.trim() === mergeSha &&
+          message.exitCode === 0 && message.stdout.includes(`This reverts commit ${mergeSha}`)) return targetHead;
+      throw new Error("Automatic revert requires the failed merge or its reconciled revert to remain the exact target HEAD");
+    }
+    try {
+      await execChecked(git(project.repoPath, [
+        "-c", "user.name=AEC-S", "-c", "user.email=aec-s@local",
+        "revert", "--no-edit", mergeSha,
+      ], 300));
+    } catch (error) {
+      await execCommand(git(project.repoPath, ["revert", "--abort"]));
+      throw error;
+    }
     const reverted = await branchHead(project.repoPath, project.targetBranch);
     const message = await execChecked(git(project.repoPath, ["log", "-1", "--format=%B"]));
     if (!message.includes(`Revert`) || !message.includes(mergeSha.slice(0, 7))) {
@@ -285,9 +315,11 @@ export async function verifyMergedRevision(project: Project, workspacePath: stri
   if (workspaceTree !== mergedTree) throw new Error(`Workspace tree does not represent local merge SHA ${mergeSha}`);
 }
 
-export async function rebaseOntoTarget(project: Project, workspacePath: string): Promise<void> {
-  await withProjectGitLock(project, async () => {
-    await execChecked({ ...git(workspacePath, ["rebase", projectBaseRef(project)]), timeoutSeconds: 300 });
+export async function rebaseOntoTarget(project: Project, workspacePath: string): Promise<string> {
+  return await withProjectGitLock(project, async () => {
+    const targetHead = await branchHead(project.repoPath, projectBaseRef(project));
+    await execChecked({ ...git(workspacePath, ["rebase", targetHead]), timeoutSeconds: 300 });
+    return targetHead;
   });
 }
 
@@ -305,10 +337,6 @@ export async function rebaseInProgress(workspacePath: string): Promise<boolean> 
   const absoluteMergePath = isAbsolute(mergePath) ? mergePath : resolve(workspacePath, mergePath);
   const absoluteApplyPath = isAbsolute(applyPath) ? applyPath : resolve(workspacePath, applyPath);
   return existsSync(absoluteMergePath) || existsSync(absoluteApplyPath);
-}
-
-export async function abortRebase(workspacePath: string): Promise<void> {
-  await execCommand(git(workspacePath, ["rebase", "--abort"]));
 }
 
 export async function localMerge(project: Project, branch: string, expectedTaskSha: string): Promise<string> {

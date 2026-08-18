@@ -58,7 +58,8 @@ export async function findPullRequest(workspacePath: string, branch: string): Pr
   const output = await execChecked(
     gh(workspacePath, ["pr", "list", "--head", branch, "--state", "all", "--json", "number,url,state,headRefOid"]),
   );
-  return parseJson<PullRequest[]>(output || "[]", "gh pr list")[0];
+  const pullRequests = parseJson<PullRequest[]>(output || "[]", "gh pr list");
+  return pullRequests.find((pullRequest) => pullRequest.state === "OPEN") ?? pullRequests[0];
 }
 
 export async function createOrGetPullRequest(
@@ -68,7 +69,7 @@ export async function createOrGetPullRequest(
   branch: string,
 ): Promise<PullRequest> {
   const existing = await findPullRequest(workspacePath, branch);
-  if (existing && existing.state !== "CLOSED") return existing;
+  if (existing?.state === "OPEN") return existing;
   const body = [
     `AEC-S task: ${task.id}`,
     "",
@@ -126,7 +127,7 @@ export async function inspectRequiredChecks(
   const result = await execCommand(
     gh(workspacePath, ["pr", "checks", String(prNumber), "--json", "name,state,bucket"], 120),
   );
-  const diagnostic = `${result.stderr}\n${result.stdout}`.trim();
+  const diagnostic = result.stderr.trim();
   const noChecksYet = result.exitCode === 8 || (
     result.exitCode === 1 && /no checks reported|no checks found|checks? (?:have|has) not been reported/i.test(diagnostic)
   );
@@ -134,8 +135,15 @@ export async function inspectRequiredChecks(
     result.exitCode !== 0 && /HTTP\s+(?:408|429|5\d\d)|timed?\s*out|connection\s+reset|temporary|unexpected\s+EOF|network|failed\s+to\s+connect|TLS\s+handshake/i.test(diagnostic)
   );
   if (noChecksYet || transientFailure) return "pending";
-  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Unable to inspect GitHub checks for PR #${prNumber}`);
-  const checks = parseJson<Array<{ name: string; state: string; bucket: string }>>(result.stdout || "[]", "gh pr checks");
+  let checks: Array<{ name: string; state: string; bucket: string }> | undefined;
+  if (result.stdout.trim()) {
+    checks = parseJson<Array<{ name: string; state: string; bucket: string }>>(result.stdout, "gh pr checks");
+  }
+  // `gh pr checks` deliberately exits 1 when a check failed and still emits
+  // the authoritative JSON on stdout. Parse that contract before treating a
+  // non-zero exit as an operational inspection failure.
+  if (!checks && result.exitCode !== 0) throw new Error(result.stderr.trim() || `Unable to inspect GitHub checks for PR #${prNumber}`);
+  checks ??= [];
   const selected = checks.filter((check) => project.requiredChecks.includes(check.name));
   if (project.requiredChecks.some((name) => !checks.some((check) => check.name === name))) return "pending";
   if (selected.some((check) => check.bucket === "fail" || check.bucket === "cancel")) {

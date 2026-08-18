@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { AecSDatabase } from "../src/db.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 import type { Run } from "../src/types.js";
@@ -33,6 +33,10 @@ test("persists the formal AEC-S entity projections", () => {
   assert.equal(db.getDecision(decision.id)?.status, "resolved");
   assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
   assert.equal(statSync(db.paths.database).mode & 0o777, 0o600);
+  assert.equal(statSync(db.paths.mcpHttpToken).mode & 0o777, 0o600);
+  for (const sidecar of [`${db.paths.database}-wal`, `${db.paths.database}-shm`]) {
+    if (existsSync(sidecar)) assert.equal(statSync(sidecar).mode & 0o777, 0o600);
+  }
   assert.equal(db.listTaskRevisions(task.id).length, 1);
   const appliedMigrations = db.db.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all();
   assert.equal(db.updateProject(project.id, { intent: "Updated intent", intentVersion: 2, maxConcurrency: 3 }).intent, "Updated intent");

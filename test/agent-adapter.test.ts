@@ -4,7 +4,7 @@ import { adapterFor } from "../src/adapters/agent.js";
 import type { Agent } from "../src/types.js";
 import { tempDir } from "./helpers.js";
 import { executableCandidates } from "../src/runtime-discovery.js";
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { spawn, spawnSync } from "node:child_process";
@@ -157,7 +157,7 @@ test("Codex discovery includes the official macOS application directories", () =
   assert.ok(candidates.includes(join(homedir(), "Applications", "ChatGPT.app", "Contents", "Resources", "codex")));
 });
 
-function fakeKimi(mode: "acp" | "cancel" | "outside" | "missing-location" | "legacy" | "incompatible"): string {
+function fakeKimi(mode: "acp" | "cancel" | "outside" | "symlink" | "missing-location" | "legacy" | "incompatible"): string {
   const root = tempDir("aec-s-fake-kimi-");
   const binary = join(root, "kimi");
   writeFileSync(binary, `#!/usr/bin/env node
@@ -167,7 +167,7 @@ if (args[0] === 'provider' && args[1] === 'list') {
   console.log('managed:kimi-code  type=kimi  models=1  source=oauth'); process.exit(0);
 }
 const mode = ${JSON.stringify(mode)};
-if (args[0] === 'acp' && mode !== 'acp' && mode !== 'cancel' && mode !== 'outside' && mode !== 'missing-location') {
+if (args[0] === 'acp' && mode !== 'acp' && mode !== 'cancel' && mode !== 'outside' && mode !== 'symlink' && mode !== 'missing-location') {
   console.error("error: unknown command 'acp'"); process.exit(1);
 }
 if (args[0] !== 'acp' && mode === 'incompatible') {
@@ -197,7 +197,7 @@ process.stdin.on('data', chunk => {
       continue;
     }
     if (request.method === 'initialize') {
-      const result = mode === 'acp' || mode === 'cancel' || mode === 'outside' || mode === 'missing-location' ? {
+      const result = mode === 'acp' || mode === 'cancel' || mode === 'outside' || mode === 'symlink' || mode === 'missing-location' ? {
         protocolVersion: 1,
         agentInfo: { name: 'Kimi Code CLI', version: '9.9.9-test' },
         agentCapabilities: {
@@ -238,7 +238,7 @@ process.stdin.on('data', chunk => {
       if (mode !== 'cancel') process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: 'permission-1', method: 'session/request_permission', params: {
         sessionId: 'fake-acp-session',
         toolCall: { toolCallId: 'tool-1', title: 'edit', kind: 'edit', status: 'pending', ...(mode === 'missing-location' ? {} : { locations: [{
-          path: mode === 'outside' ? '/tmp/aec-s-outside-scope.ts' : process.cwd() + '/file.ts'
+          path: mode === 'outside' ? '/tmp/aec-s-outside-scope.ts' : mode === 'symlink' ? process.cwd() + '/escape/outside.ts' : process.cwd() + '/file.ts'
         }] }) },
         options: [
           { optionId: 'allow', name: 'Allow once', kind: 'allow_once' },
@@ -305,6 +305,12 @@ test("Kimi ACP controls execution, read-only review, resume, permissions, stream
   const outside = await runKimiAcp({ binary: fakeKimi("outside"), workspace, prompt: "execute", kind: "execute" });
   assert.equal(outside.permissionSummary.allowedOnce, 0);
   assert.equal(outside.permissionSummary.rejected, 1);
+
+  const outsideTarget = tempDir("aec-s-kimi-symlink-target-");
+  symlinkSync(outsideTarget, join(workspace, "escape"));
+  const symlinkEscape = await runKimiAcp({ binary: fakeKimi("symlink"), workspace, prompt: "execute", kind: "execute" });
+  assert.equal(symlinkEscape.permissionSummary.allowedOnce, 0);
+  assert.equal(symlinkEscape.permissionSummary.rejected, 1);
 
   const missingLocation = await runKimiAcp({ binary: fakeKimi("missing-location"), workspace, prompt: "execute", kind: "execute" });
   assert.equal(missingLocation.permissionSummary.allowedOnce, 0);

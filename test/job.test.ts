@@ -92,6 +92,17 @@ test("kills Agent descendant processes when a supervised command times out", asy
   assert.equal(existsSync(marker), false);
 });
 
+test("kills descendant processes when a direct command times out", async () => {
+  const directory = tempDir("aec-s-direct-process-tree-");
+  const marker = join(directory, "descendant-write.txt");
+  const grandchild = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'leaked'), 500)`;
+  const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{stdio:'ignore'});setInterval(()=>{},1000)`;
+  const result = await execCommand({ program: process.execPath, args: ["-e", parent], timeoutSeconds: 0.05 });
+  assert.equal(result.timedOut, true);
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(existsSync(marker), false);
+});
+
 test("forwards manual cancellation to the Runtime before the process-group backstop", async () => {
   if (process.platform === "win32") return;
   const directory = tempDir("aec-s-manual-cancel-");

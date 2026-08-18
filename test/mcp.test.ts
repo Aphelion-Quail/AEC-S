@@ -8,6 +8,7 @@ import { AecSDatabase } from "../src/db.js";
 import { createGitRepository } from "./helpers.js";
 import { aecSVersion } from "../src/version.js";
 import { mcpHttpPort, serveMcpHttp } from "../src/mcp.js";
+import type { Run } from "../src/types.js";
 
 test("exposes the AEC-S control and evidence tools over stdio", async () => {
   const home = tempDir("aec-s-mcp-");
@@ -20,11 +21,34 @@ test("exposes the AEC-S control and evidence tools over stdio", async () => {
     title: "Choose ownership",
     body: "Human input required",
   });
+  const executor = db.createAgent({ id: "mcp-executor", name: "MCP executor", adapter: "command", roles: ["executor"] });
+  db.createAgent({ id: "mcp-reviewer", name: "MCP reviewer", adapter: "command", roles: ["reviewer"] });
+  const findingTask = db.createTask({
+    id: "mcp-finding-task",
+    projectId: project.id,
+    title: "Finding task",
+    goal: "Exercise Finding tools",
+    scope: { writeGlobs: ["finding.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Finding is governed"],
+  });
+  const timestamp = new Date().toISOString();
+  const findingRun: Run = {
+    id: "mcp-finding-run", taskId: findingTask.id, agentId: executor.id, workspaceId: "mcp-finding-workspace",
+    phase: "review", status: "interrupted", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+    taskRevisionId: findingTask.currentRevisionId,
+  };
+  db.createRun(findingRun);
+  const seededFinding = db.createFinding({
+    projectId: project.id, taskId: findingTask.id, runId: findingRun.id,
+    taskRevisionId: findingTask.currentRevisionId!, severity: "blocking", summary: "Reproduce MCP transition",
+    reviewerAgentId: "mcp-reviewer",
+  });
   db.close();
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [builtCliPath(), "mcp"],
-    env: { AEC_S_HOME: home, PATH: process.env.PATH ?? "" },
+    env: { AEC_S_HOME: home, AEC_S_MCP_ACTOR_AGENT_ID: "mcp-reviewer", PATH: process.env.PATH ?? "" },
   });
   const client = new Client({ name: "aec-s-test", version: "1.0.0" });
   await client.connect(transport);
@@ -102,6 +126,25 @@ test("exposes the AEC-S control and evidence tools over stdio", async () => {
       arguments: { projectId: project.id },
     });
     assert.equal(decisions.isError, undefined);
+    const findings = await client.callTool({
+      name: "aec_s_list_findings",
+      arguments: { taskId: findingTask.id },
+    });
+    assert.equal(findings.isError, undefined);
+    const transitioned = await client.callTool({
+      name: "aec_s_transition_finding",
+      arguments: { findingId: seededFinding.id, status: "verified", evidence: "MCP reviewer reproduced it" },
+    });
+    assert.equal(transitioned.isError, undefined);
+    const polled = await client.callTool({ name: "aec_s_poll_outbox", arguments: { projectId: project.id } });
+    assert.equal(polled.isError, undefined);
+    const messages = (polled.structuredContent as { messages: Array<{ id: string }> }).messages;
+    assert.ok(messages.length > 0);
+    const acknowledged = await client.callTool({
+      name: "aec_s_acknowledge_outbox",
+      arguments: { messageId: messages[0]!.id },
+    });
+    assert.equal(acknowledged.isError, undefined);
     const resolved = await client.callTool({
       name: "aec_s_resolve_decision",
       arguments: { decisionId: pendingDecision.id, resolution: { answer: "Core owns state" } },
@@ -151,7 +194,12 @@ test("exposes AEC-S MCP over loopback Streamable HTTP", async () => {
     assert.equal(status.isError, undefined);
     const health = await fetch(url.replace("/mcp", "/healthz"));
     assert.equal(health.status, 200);
-    assert.deepEqual(await health.json(), { status: "ok", service: "aec-s-mcp", version: aecSVersion() });
+    assert.deepEqual(await health.json(), { status: "ok", service: "aec-s-mcp" });
+    const unboundFindingTransition = await client.callTool({
+      name: "aec_s_transition_finding",
+      arguments: { findingId: "unbound-finding", status: "verified", evidence: "must fail closed" },
+    });
+    assert.equal(unboundFindingTransition.isError, true);
     const unauthorized = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(unauthorized.status, 401);
     const missingSession = await fetch(url, {

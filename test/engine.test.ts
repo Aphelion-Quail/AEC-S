@@ -7,8 +7,95 @@ import { AecSDatabase } from "../src/db.js";
 import { AecSEngine } from "../src/engine.js";
 import { adapterFor } from "../src/adapters/agent.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
+import type { Run } from "../src/types.js";
+import { branchHead, revertMergedTask } from "../src/git.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
+
+test("reconciles an orphan active Run whose Task is already terminal", async () => {
+  const home = tempDir("aec-s-orphan-run-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "orphan-run", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "orphan-executor", name: "orphan executor", adapter: "command", roles: ["executor"] });
+  const task = db.createTask({
+    id: "orphan-task", projectId: project.id, title: "Orphan", goal: "Converge stale state",
+    scope: { writeGlobs: ["orphan.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["No active Run remains"],
+  });
+  const timestamp = new Date().toISOString();
+  const run: Run = {
+    id: "orphan-run", taskId: task.id, agentId: agent.id, workspaceId: "orphan-workspace",
+    phase: "validate", status: "active", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+  };
+  db.createRun(run);
+  db.updateTaskStatus(task.id, "cancelled");
+  const engine = new AecSEngine(db);
+  assert.equal(await engine.runOnce(), 1);
+  assert.equal(db.getRun(run.id)?.status, "failed");
+  assert.equal(db.getRun(run.id)?.phase, "done");
+  assert.equal(await engine.runOnce(), 0);
+  db.close();
+});
+
+test("selects the least normalized-loaded eligible Runtime", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-runtime-order-"));
+  const project = db.createProject({ name: "runtime-order", repoPath: createGitRepository() });
+  for (const id of ["loaded-executor", "idle-executor"]) {
+    db.createAgent({
+      id, name: id, adapter: "command", roles: ["executor"], maxConcurrency: 2,
+      config: { binary: process.execPath, execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] } },
+    });
+  }
+  db.db.prepare("UPDATE agents SET current_load=1 WHERE id='loaded-executor'").run();
+  db.createAgent({
+    id: "order-reviewer", name: "order reviewer", adapter: "command", roles: ["reviewer"],
+    config: { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } },
+  });
+  const engine = new AecSEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "runtime-order-task", projectId: project.id, title: "Choose idle", goal: "Create order.txt",
+    scope: { writeGlobs: ["order.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["Idle Runtime is selected"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(db.getLatestRunForTask(task!.id)?.agentId, "idle-executor");
+  db.close();
+});
+
+test("direct Run admission preserves Scope conflicts across recovery paths", async () => {
+  const home = tempDir("aec-s-direct-admission-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "direct-admission", repoPath: createGitRepository(), maxConcurrency: 2 });
+  const agent = db.createAgent({ id: "admission-executor", name: "admission executor", adapter: "command", roles: ["executor"] });
+  const first = db.createTask({
+    id: "admission-first", projectId: project.id, title: "First", goal: "Own shared scope",
+    scope: { writeGlobs: ["shared/**"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["Scope reserved"],
+  });
+  const second = db.createTask({
+    id: "admission-second", projectId: project.id, title: "Second", goal: "Wait for shared scope",
+    scope: { writeGlobs: ["shared/file.ts"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["No overlap"],
+  });
+  db.updateTaskStatus(first.id, "running");
+  db.updateTaskStatus(second.id, "ready");
+  const timestamp = new Date().toISOString();
+  db.createRun({
+    id: "admission-active-run", taskId: first.id, agentId: agent.id, workspaceId: "admission-active-workspace",
+    phase: "execute", status: "active", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+    leaseOwner: "999999:other", leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+  });
+  const engine = new AecSEngine(db, { globalConcurrency: 2 });
+  await engine.runTask(second.id);
+  assert.equal(db.getLatestRunForTask(second.id), undefined);
+
+  db.createRun({
+    id: "admission-interrupted-run", taskId: second.id, agentId: agent.id, workspaceId: "admission-interrupted-workspace",
+    phase: "execute", status: "interrupted", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+  });
+  await engine.runTask(second.id);
+  assert.equal(db.getRun("admission-interrupted-run")?.status, "interrupted");
+  db.close();
+});
 
 function registerFakeAgents(db: AecSDatabase, executeMode = "execute", reviewMode = "review"): void {
   db.createAgent({
@@ -1122,7 +1209,9 @@ test("does not publish a failed Review that provides no blocking Finding", async
   }]);
   await new AecSEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
-  assert.equal(db.getLatestRunForTask(task!.id)?.effects.commit, undefined);
+  assert.equal(db.getLatestRunForTask(task!.id)?.effects.commit?.status, "completed");
+  assert.equal(db.getLatestRunForTask(task!.id)?.effects.push, undefined);
+  assert.equal(db.getLatestRunForTask(task!.id)?.effects.pullRequest, undefined);
   assert.equal(existsSync(join(repo, "empty-failed-review.txt")), false);
   assert.match(String(db.getLatestRunForTask(task!.id)?.error?.message), /blocking Finding/);
   db.close();
@@ -1353,6 +1442,11 @@ test("parks a failed post-merge smoke and creates a bounded Repair Task", async 
   assert.equal(decision?.kind, "failure_exhausted");
   assert.equal(db.listOutbox(project.id).filter((message) => message.decisionId === decision?.id).length, 2);
   assert.ok(db.listEvents(project.id).some((event) => event.type === "revert.parked"));
+  db.updateTaskStatus(repair!.id, "succeeded", { mergeSha: await branchHead(repo, "main") });
+  await new AecSEngine(db).runOnce();
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.equal(db.getLatestRunForTask(task!.id)?.status, "completed");
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "post_merge_repair.resolved"));
   db.close();
 });
 
@@ -1379,6 +1473,9 @@ test("auto-reverts only an explicitly safe local merge under enforce policy", as
   assert.equal(db.getTask(task!.id)?.status, "parked");
   assert.equal(existsSync(join(repo, "auto-revert.txt")), false);
   assert.equal(db.getLatestRunForTask(task!.id)?.effects.revert?.status, "completed");
+  const run = db.getLatestRunForTask(task!.id)!;
+  const currentHead = await branchHead(repo, "main");
+  assert.equal(await revertMergedTask(project, run.effects.merge!.externalRef!, task!.id), currentHead);
   assert.ok(db.listEvents(project.id).some((event) => event.type === "revert.completed"));
   db.close();
 });

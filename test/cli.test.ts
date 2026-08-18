@@ -49,7 +49,8 @@ test("manages Project and Agent configuration through the CLI and reports doctor
   assert.equal(invoke(home, ["agent", "show", "cli-agent"]).name, "CLI Agent");
   assert.equal(invoke(home, ["agent", "update", "cli-agent", agentPatchPath]).availability, "disabled");
   assert.ok(Array.isArray(invoke(home, ["agent", "list"]).agents));
-  assert.equal(invoke(home, ["doctor"]).ok, true);
+  const healthy = invoke(home, ["doctor"]);
+  assert.equal(healthy.ok, true, JSON.stringify(healthy));
   writeFileSync(join(repo, "dirty.txt"), "dirty\n");
   const unhealthy = invoke(home, ["doctor"]);
   assert.equal(unhealthy.ok, false);

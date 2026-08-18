@@ -25,6 +25,11 @@ type BridgeConfig = {
 };
 
 type TokenUsage = { input?: number; output?: number; total?: number };
+const MAX_RUNTIME_PAYLOAD_BYTES = 8 * 1024 * 1024;
+
+function assertBoundedText(value: string, label: string): void {
+  if (Buffer.byteLength(value) > MAX_RUNTIME_PAYLOAD_BYTES) throw new Error(`${label} exceeds 8 MiB`);
+}
 
 function tokenUsage(value: unknown): TokenUsage | undefined {
   if (!value || typeof value !== "object") return undefined;
@@ -49,6 +54,7 @@ function decodeConfig(value: string | undefined): BridgeConfig {
 }
 
 function structured(text: string): unknown {
+  assertBoundedText(text, "Runtime structured result");
   const trimmed = text.trim();
   const candidates = [trimmed];
   for (const match of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(match[1]?.trim() ?? "");
@@ -94,12 +100,17 @@ async function runLegacyKimi(
     if (kind === "review") await session.setPlanMode(true);
     turn = session.prompt(prompt);
     let text = "";
+    let textBytes = 0;
     let usage: TokenUsage | undefined;
     for await (const event of turn) {
       if ("payload" in event) usage = tokenUsage(event.payload) ?? usage;
       if (event.type === "ContentPart" && event.payload && typeof event.payload === "object") {
         const part = event.payload as { type?: unknown; text?: unknown };
-        if (part.type === "text" && typeof part.text === "string") text += part.text;
+        if (part.type === "text" && typeof part.text === "string") {
+          textBytes += Buffer.byteLength(part.text);
+          if (textBytes > MAX_RUNTIME_PAYLOAD_BYTES) throw new Error("Kimi legacy structured result exceeds 8 MiB");
+          text += part.text;
+        }
       }
     }
     const result = await turn.result;
@@ -217,7 +228,13 @@ async function main(): Promise<void> {
     throw new Error("Usage: runtime-bridge <kimi|deepseek_harness> <kind> <workspace> <output> [session] [config]");
   }
   let prompt = "";
-  for await (const chunk of process.stdin) prompt += String(chunk);
+  let promptBytes = 0;
+  for await (const chunk of process.stdin) {
+    const value = String(chunk);
+    promptBytes += Buffer.byteLength(value);
+    if (promptBytes > MAX_RUNTIME_PAYLOAD_BYTES) throw new Error("Runtime prompt exceeds 8 MiB");
+    prompt += value;
+  }
   const config = decodeConfig(encodedConfig);
   const result = runtime === "kimi"
     ? await runKimi(prompt, kind, workspace, sessionId || undefined, config)
@@ -225,6 +242,9 @@ async function main(): Promise<void> {
       ? await runDeepSeek(prompt, kind, workspace, sessionId || undefined, config, dirname(output))
       : undefined;
   if (!result) throw new Error(`Unsupported runtime bridge: ${runtime}`);
+  if (Buffer.byteLength(JSON.stringify(result.value)) > MAX_RUNTIME_PAYLOAD_BYTES) {
+    throw new Error("Runtime structured value exceeds 8 MiB");
+  }
   writeJsonAtomic(output, result.value);
   const kimiResult = runtime === "kimi" ? result as Awaited<ReturnType<typeof runKimi>> : undefined;
   const kimiMetadata = kimiResult ? {
