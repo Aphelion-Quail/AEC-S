@@ -286,12 +286,24 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
 
   await new Promise<void>((resolve, reject) => {
     let httpServer: HttpServer | undefined;
+    let stopping = false;
     const stop = () => {
+      if (stopping) return;
+      stopping = true;
       if (!httpServer) return resolve();
       void Promise.allSettled([...sessions.values()].map(async ({ server, transport }) => {
         await transport.close();
         await server.close();
-      })).finally(() => httpServer!.close((error) => error ? reject(error) : resolve()));
+      })).finally(() => {
+        const forceClose = setTimeout(() => httpServer?.closeAllConnections(), 1_000);
+        forceClose.unref();
+        httpServer!.close((error) => {
+          clearTimeout(forceClose);
+          if (error) reject(error);
+          else resolve();
+        });
+        httpServer!.closeIdleConnections();
+      });
     };
     if (options.signal?.aborted) return resolve();
     const createdServer = app.listen(port, MCP_HTTP_HOST, () => {

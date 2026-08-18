@@ -4,6 +4,7 @@ import type { AecSDatabase } from "./db.js";
 import type {
   Agent,
   AgentRole,
+  ChildEnvironmentProfile,
   CommandSpec,
   Decision,
   EffectState,
@@ -68,6 +69,14 @@ import {
 import { redactJson, redactText } from "./redaction.js";
 import { fingerprint } from "./fingerprint.js";
 import { execCommand } from "./exec.js";
+import { AEC_ERROR, AecError, isAecError } from "./errors.js";
+import { classifyPhaseError } from "./engine-errors.js";
+import {
+  bearsRevisionEvidence,
+  isControlPhase,
+  occupiesRuntimeCapacity,
+  selectDeterministicAgent,
+} from "./engine-policy.js";
 
 type EngineOptions = {
   globalConcurrency?: number;
@@ -194,8 +203,7 @@ export class AecSEngine {
   }
 
   promoteTasks(): void {
-    for (const task of this.db.listTasks()) {
-      if (task.status !== "queued") continue;
+    for (const task of this.db.listTasksByStatus("queued")) {
       const dependencies = task.dependsOn.map((id) => this.db.getTask(id));
       if (dependencies.some((dependency) => !dependency)) {
         this.db.updateTaskStatus(task.id, "operational_blocked", { summary: "A dependency is missing" });
@@ -217,10 +225,9 @@ export class AecSEngine {
     this.recalculateAgentLoad();
     const allActiveRuns = this.db.listActiveRuns();
     const cleanupRuns = allActiveRuns.filter((run) => run.phase === "cleanup");
-    const capacityPhases = new Set<Run["phase"]>(["prepare", "execute", "validate", "review", "repair", "publish"]);
     const capacityRuns = allActiveRuns.filter((run) =>
-      capacityPhases.has(run.phase) && this.db.getTask(run.taskId)?.status !== "paused");
-    const waitingRuns = allActiveRuns.filter((run) => run.phase !== "cleanup" && !capacityPhases.has(run.phase));
+      occupiesRuntimeCapacity(run.phase) && this.db.getTask(run.taskId)?.status !== "paused");
+    const waitingRuns = allActiveRuns.filter((run) => run.phase !== "cleanup" && !occupiesRuntimeCapacity(run.phase));
     const activeRuns = [...cleanupRuns, ...capacityRuns, ...waitingRuns].filter((run) => {
       if (!this.canClaimRun(run)) return false;
       if (run.status !== "interrupted" || run.phase !== "cleanup") return true;
@@ -237,13 +244,14 @@ export class AecSEngine {
       .map((run) => this.db.getTask(run.taskId))
       .filter((task): task is Task => Boolean(task));
     const selected = [...activeTasks];
-    const conflictReservations = [
+    const conflictReservationCandidates = [
       ...activeTasks,
-      ...this.db.listTasks().filter((task) => {
+      ...this.db.listTasksByStatus("operational_blocked").filter((task) => {
         const latest = this.db.getLatestRunForTask(task.id);
-        return task.status === "operational_blocked" && latest?.status === "interrupted" && latest.phase === "remote_checks";
+        return latest?.status === "interrupted" && latest.phase === "remote_checks";
       }),
-    ].filter((task, index, values) => values.findIndex((candidate) => candidate.id === task.id) === index);
+    ];
+    const conflictReservations = [...new Map(conflictReservationCandidates.map((task) => [task.id, task])).values()];
     const reservedLoads = new Map(this.db.listAgents().map((agent) => [agent.id, agent.currentLoad]));
     let slots = Math.max(0, this.globalConcurrency - capacityRuns.length);
     for (const task of this.db.listRunnableTasks()) {
@@ -281,7 +289,7 @@ export class AecSEngine {
       await this.runTask(taskId, preferredAgentId);
     } catch (error) {
       const message = redactText(error instanceof Error ? error.message : String(error));
-      if (message.startsWith("Run lease lost:")) return;
+      if (isAecError(error, AEC_ERROR.runLeaseLost)) return;
       const task = this.db.getTask(taskId);
       if (task && ["ready", "running"].includes(task.status)) {
         this.db.updateTaskStatus(taskId, "operational_blocked", { summary: message });
@@ -306,29 +314,25 @@ export class AecSEngine {
   async refreshAgentAvailability(): Promise<Map<string, RuntimeProbeResult>> {
     const results = new Map<string, RuntimeProbeResult>();
     const probeCache = new Map<string, Promise<RuntimeProbeResult>>();
-    for (const agent of this.db.listAgents()) {
-      if (!agent.enabled || agent.availability === "offline") continue;
-      let healthy = false;
-      let version: string | undefined;
-      try {
-        const cacheKey = JSON.stringify({ adapter: agent.adapter, config: agent.config });
-        let pending = probeCache.get(cacheKey);
-        if (!pending) {
-          pending = this.adapterFactory(agent).probe();
-          probeCache.set(cacheKey, pending);
-        }
-        const probe = await pending;
-        results.set(agent.id, probe);
-        healthy = probe.ok;
-        version = probe.version;
-      } catch (error) {
-        results.set(agent.id, {
-          ok: false,
-          detail: redactText(error instanceof Error ? error.message : String(error)),
-        });
-        healthy = false;
+    const agents = this.db.listAgents().filter((agent) => agent.enabled && agent.availability !== "offline");
+    const probes = agents.map((agent) => {
+      const cacheKey = JSON.stringify({ adapter: agent.adapter, config: agent.config });
+      let pending = probeCache.get(cacheKey);
+      if (!pending) {
+        pending = this.adapterFactory(agent).probe();
+        probeCache.set(cacheKey, pending);
       }
-      this.db.recordAgentHealth(agent.id, healthy, version);
+      return pending.then(
+        (probe) => ({ agent, probe }),
+        (error: unknown) => ({
+          agent,
+          probe: { ok: false, detail: redactText(error instanceof Error ? error.message : String(error)) } as RuntimeProbeResult,
+        }),
+      );
+    });
+    for (const { agent, probe } of await Promise.all(probes)) {
+      results.set(agent.id, probe);
+      this.db.recordAgentHealth(agent.id, probe.ok, probe.version);
     }
     this.lastAgentHealthcheckAt = Date.now();
     return results;
@@ -343,8 +347,7 @@ export class AecSEngine {
   }
 
   private promoteOperationalRetries(): void {
-    for (const task of this.db.listTasks()) {
-      if (task.status !== "operational_blocked") continue;
+    for (const task of this.db.listTasksByStatus("operational_blocked")) {
       const run = this.db.getLatestRunForTask(task.id);
       const retry = run?.error?.operationalRetry;
       const externalWait = run?.error?.externalWait;
@@ -371,8 +374,7 @@ export class AecSEngine {
   }
 
   private promoteCompletedObservations(): void {
-    for (const task of this.db.listTasks()) {
-      if (task.status !== "observing") continue;
+    for (const task of this.db.listTasksByStatus("observing")) {
       const run = this.db.getLatestRunForTask(task.id);
       const observation = run?.error?.stabilityObservation;
       if (!run || run.status !== "interrupted" || run.phase !== "stability_observation" ||
@@ -391,8 +393,7 @@ export class AecSEngine {
   }
 
   private promoteCompletedRepairs(): void {
-    for (const task of this.db.listTasks()) {
-      if (task.status !== "parked") continue;
+    for (const task of this.db.listTasksByStatus("parked")) {
       const run = this.db.getLatestRunForTask(task.id);
       const repairEvidence = run?.error?.postMergeRepair;
       if (!run || run.status !== "interrupted" || !repairEvidence ||
@@ -574,8 +575,7 @@ export class AecSEngine {
       .filter((candidate): candidate is Task => Boolean(candidate) && !["paused", "cancelled", "failed", "succeeded"].includes(candidate!.status));
     if (activeTasks.filter((candidate) => candidate.projectId === task.projectId).length >= project.maxConcurrency) return false;
     if (activeTasks.some((candidate) => candidate.projectId === task.projectId && tasksConflict(task.scope, candidate.scope))) return false;
-    const capacityPhases = new Set<Run["phase"]>(["prepare", "execute", "validate", "review", "repair", "publish"]);
-    const capacityUsed = activeRuns.filter((run) => capacityPhases.has(run.phase)).length;
+    const capacityUsed = activeRuns.filter((run) => occupiesRuntimeCapacity(run.phase)).length;
     return capacityUsed < this.globalConcurrency;
   }
 
@@ -602,9 +602,7 @@ export class AecSEngine {
       try {
         await this.withLeaseHeartbeat(run, async () => {
           const controlStartedAt = Date.now();
-          const controlPhase = new Set<Run["phase"]>([
-            "prepare", "publish", "remote_checks", "merge", "post_merge_smoke", "stability_observation", "revert",
-          ]).has(run.phase);
+          const controlPhase = isControlPhase(run.phase);
           if (await this.reconcileCompletedGitHubMerge(run)) return;
           if (this.reconcileContextRevision(run)) return;
           switch (run.phase) {
@@ -731,8 +729,7 @@ export class AecSEngine {
     const hadRevisionBinding = Boolean(run.taskRevisionId && run.contextFingerprint);
     run.taskRevisionId = current.id;
     run.contextFingerprint = current.contextFingerprint;
-    const evidenceBearingPhases = new Set<Run["phase"]>(["validate", "review", "repair", "publish", "remote_checks", "merge"]);
-    if (hadRevisionBinding && evidenceBearingPhases.has(run.phase)) {
+    if (hadRevisionBinding && bearsRevisionEvidence(run.phase)) {
       run.phase = "validate";
       run.attempt = 1;
       run.validation = [];
@@ -747,7 +744,7 @@ export class AecSEngine {
       type: "run.context_rebound",
       payload: { priorRevisionId, revisionId: current.id, fingerprint: current.contextFingerprint },
     });
-    return hadRevisionBinding && evidenceBearingPhases.has(run.phase);
+    return hadRevisionBinding && bearsRevisionEvidence(run.phase);
   }
 
   private async phaseExecute(run: Run): Promise<void> {
@@ -755,7 +752,7 @@ export class AecSEngine {
     const { path } = buildContextEnvelope(this.db, project, task, run, workspace, run.error);
     const schemas = writeSchemas(run.logDir);
     const adapter = this.adapterFactory(agent);
-    const invocation = adapter.invocation({
+    const invocation = adapter.execute({
       kind: "execute",
       prompt: executionPrompt(path),
       workspacePath: workspace.path,
@@ -976,7 +973,7 @@ export class AecSEngine {
       throw new Error("Reviewer prompt exceeds 8 MiB");
     }
     const reviewerAdapter = this.adapterFactory(reviewer);
-    const invocation = reviewerAdapter.invocation({
+    const invocation = reviewerAdapter.review({
       kind: "review",
       prompt,
       workspacePath: workspace.path,
@@ -990,7 +987,11 @@ export class AecSEngine {
     assertFileSize(postReviewDiff, 8 * 1024 * 1024, "Post-review diff");
     if (!readFileSync(reviewDiff).equals(readFileSync(postReviewDiff))) {
       await restoreWorkspaceHead(workspace.path);
-      throw new Error(`Reviewer ${reviewer.id} modified the task workspace`);
+      throw new AecError(
+        AEC_ERROR.reviewerWorkspaceModified,
+        `Reviewer ${reviewer.id} modified the task workspace`,
+        { reviewerId: reviewer.id },
+      );
     }
     const structuredPath = execution.structuredOutputPath ?? invocation.structuredOutputPath;
     const resultPath = existsSync(structuredPath) ? structuredPath : execution.stdoutPath;
@@ -1043,14 +1044,17 @@ export class AecSEngine {
     const { path } = buildContextEnvelope(this.db, project, task, run, workspace, feedback);
     const schemas = writeSchemas(run.logDir);
     const adapter = this.adapterFactory(agent);
-    const invocation = adapter.invocation({
+    const invocationOptions = {
       kind: "repair",
       prompt: repairPrompt(path),
       workspacePath: workspace.path,
       runDir: run.logDir,
       schemaPath: schemas.worker,
       ...(run.runtimeSessionId ?? run.codexSessionId ? { sessionId: run.runtimeSessionId ?? run.codexSessionId } : {}),
-    });
+    } as const;
+    const invocation = invocationOptions.sessionId
+      ? adapter.resume(invocationOptions)
+      : adapter.repair(invocationOptions);
     const execution = await this.executeInvocation(run, invocation, `repair-${run.repairCount}`, agent.id);
     this.addRunMetric(run, "implementationMs", this.executionDuration(execution));
     const structuredPath = execution.structuredOutputPath ?? invocation.structuredOutputPath;
@@ -1243,8 +1247,7 @@ export class AecSEngine {
       });
       this.setPhase(run, "post_merge_smoke");
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (project.deliveryMode === "local" && message.includes("fast-forward")) {
+      if (project.deliveryMode === "local" && isAecError(error, AEC_ERROR.gitFastForwardRequired)) {
         this.setEffect(run, "merge", { operationId, status: "pending" });
         this.setPhase(run, "publish");
         return;
@@ -1518,6 +1521,7 @@ export class AecSEngine {
   private async executeInvocation(run: Run, invocation: AgentInvocation, label: string, agentId: string): Promise<JobExecution> {
     const workspace = this.db.getWorkspace(run.workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
+    const runtime = this.requireAgent(agentId);
     const authorityHeadSha = run.job?.authorityHeadSha ?? await branchHead(workspace.path, "HEAD");
     const guardedInvocation: AgentInvocation = {
       ...invocation,
@@ -1542,11 +1546,18 @@ export class AecSEngine {
         structuredOutputPath: guardedInvocation.structuredOutputPath,
         agentId,
         authorityHeadSha,
+        environmentProfile: runtime.adapter === "command"
+          ? "restricted"
+          : runtime.adapter,
       },
     );
     const postHeadSha = await branchHead(workspace.path, "HEAD");
     if (postHeadSha !== authorityHeadSha) {
-      throw new Error(`Runtime authority violation: Agent ${agentId} changed Git HEAD during ${label}`);
+      throw new AecError(
+        AEC_ERROR.runtimeAuthorityViolation,
+        `Runtime authority violation: Agent ${agentId} changed Git HEAD during ${label}`,
+        { agentId, label },
+      );
     }
     return execution;
   }
@@ -1561,6 +1572,7 @@ export class AecSEngine {
       structuredOutputPath?: string;
       agentId?: string;
       authorityHeadSha?: string;
+      environmentProfile?: ChildEnvironmentProfile;
       allowFailure?: boolean;
     } = {},
   ): Promise<JobExecution> {
@@ -1583,6 +1595,7 @@ export class AecSEngine {
       }
       input = {
         command,
+        ...(options.environmentProfile ? { environmentProfile: options.environmentProfile } : {}),
         ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
         stdoutPath: paths.stdout,
         stderrPath: paths.stderr,
@@ -1652,7 +1665,8 @@ export class AecSEngine {
   }
 
   private async handlePhaseError(run: Run, error: unknown): Promise<void> {
-    const message = redactText(error instanceof Error ? error.message : String(error));
+    const classified = classifyPhaseError(error, run.phase);
+    const { message } = classified;
     const currentTask = this.requireTask(run.taskId);
     if (currentTask.status === "cancelled") {
       run.job = undefined;
@@ -1671,7 +1685,7 @@ export class AecSEngine {
       this.saveRun(run);
       return;
     }
-    if (message.startsWith("Agent capacity unavailable:")) {
+    if (classified.category === "agent_capacity") {
       const previous = run.error?.externalWait;
       const startedAt = previous && typeof previous === "object" && !Array.isArray(previous)
         ? String((previous as JsonObject).startedAt ?? nowIso())
@@ -1697,7 +1711,7 @@ export class AecSEngine {
       ...(operationalRetry !== undefined ? { operationalRetry } : {}),
     });
     run.job = undefined;
-    if (message.startsWith("Runtime authority violation:")) {
+    if (classified.category === "runtime_authority") {
       const task = currentTask;
       const offenderId = run.phase === "review" ? run.review?.reviewerAgentId : run.agentId;
       if (offenderId) this.db.updateAgent(offenderId, { availability: "unavailable" });
@@ -1738,7 +1752,7 @@ export class AecSEngine {
       await this.rotateOrEscalate(run, run.error);
       return;
     }
-    if (run.phase === "review" && message.includes("modified the task workspace")) {
+    if (classified.category === "reviewer_mutation") {
       const reviewerId = run.review?.reviewerAgentId;
       if (reviewerId) this.db.updateAgent(reviewerId, { availability: "unavailable" });
       this.scheduleOperationalRetry(run, message);
@@ -1765,7 +1779,7 @@ export class AecSEngine {
       this.saveRun(run);
       return;
     }
-    if (run.phase === "remote_checks" && message.startsWith("GitHub checks failed")) {
+    if (classified.category === "github_checks") {
       this.setPhase(run, "repair", { error: this.failureEvidence(run, { phase: run.phase, message }) });
       return;
     }
@@ -2121,36 +2135,19 @@ export class AecSEngine {
     loadOverride?: Map<string, number>,
     excludedFamilies = new Set<string>(),
   ): Agent | undefined {
-    return this.db
-      .listAgents()
-      .filter(
-        (agent) =>
-          agent.enabled &&
-          agent.availability === "available" &&
-          agent.roles.includes(role) &&
-          (agent.adapter === "command" || agent.runtimeCapabilities?.structuredOutput === true) &&
-          (role !== "reviewer" || agent.adapter === "command" || agent.runtimeCapabilities?.reviewMode === true) &&
-          (loadOverride?.get(agent.id) ?? agent.currentLoad) < agent.maxConcurrency &&
-          !excluded.has(agent.id) &&
-          !excludedFamilies.has(agent.runtimeFamily ?? agent.adapter) &&
-          capabilities.every((capability) => agent.capabilities.includes(capability)),
-      )
-      .sort((left, right) => {
-        const loadDelta =
-          (loadOverride?.get(left.id) ?? left.currentLoad) / left.maxConcurrency -
-          (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency;
-        if (loadDelta !== 0) return loadDelta;
-        const assignmentDelta =
-          Date.parse(left.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") -
-          Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z");
-        if (assignmentDelta !== 0) return assignmentDelta;
-        return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
-      })[0];
+    return selectDeterministicAgent({
+      agents: this.db.listAgents(),
+      role,
+      capabilities,
+      excluded,
+      excludedFamilies,
+      ...(loadOverride ? { loadOverride } : {}),
+    });
   }
 
   private recalculateAgentLoad(): void {
     const jobs = new Map<string, Run>();
-    for (const run of this.db.listRuns()) {
+    for (const run of this.db.listRunsWithJobs()) {
       if (!run.job?.agentId) continue;
       const resultExists = existsSync(run.job.resultPath);
       const alive = run.job.pid ? processAlive(run.job.pid) : false;
@@ -2176,7 +2173,11 @@ export class AecSEngine {
       }
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
-    throw new Error(`Agent capacity unavailable: ${agentId}`);
+    throw new AecError(
+      AEC_ERROR.agentCapacityUnavailable,
+      `Agent capacity unavailable: ${agentId}`,
+      { agentId },
+    );
   }
 
   private failureEvidence(run: Run, value: JsonObject): JsonObject {
@@ -2247,7 +2248,7 @@ export class AecSEngine {
   private renewLease(run: Run): void {
     const leaseUntil = this.leaseTime();
     if (!this.db.renewRunLease(run.id, this.leaseOwner, leaseUntil)) {
-      throw new Error(`Run lease lost: ${run.id}`);
+      throw new AecError(AEC_ERROR.runLeaseLost, `Run lease lost: ${run.id}`, { runId: run.id });
     }
     run.leaseUntil = leaseUntil;
     run.leaseOwner = this.leaseOwner;
@@ -2265,7 +2266,7 @@ export class AecSEngine {
     heartbeat.unref();
     try {
       const value = await operation();
-      if (heartbeatError) throw heartbeatError;
+      if (heartbeatError) this.renewLease(run);
       return value;
     } finally {
       clearInterval(heartbeat);
@@ -2300,7 +2301,9 @@ export class AecSEngine {
 
   private saveRun(run: Run): void {
     run.updatedAt = nowIso();
-    if (!this.db.saveRun(run, this.leaseOwner)) throw new Error(`Run lease lost: ${run.id}`);
+    if (!this.db.saveRun(run, this.leaseOwner)) {
+      throw new AecError(AEC_ERROR.runLeaseLost, `Run lease lost: ${run.id}`, { runId: run.id });
+    }
   }
 
   private executionDuration(execution: JobExecution): number {

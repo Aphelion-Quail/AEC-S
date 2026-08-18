@@ -697,6 +697,11 @@ export class AecSDatabase {
     return rows.map((row) => this.taskFromRow(row));
   }
 
+  listTasksByStatus(status: TaskStatus): Task[] {
+    return (this.db.prepare("SELECT * FROM tasks WHERE status=? ORDER BY priority DESC, created_at, id").all(status) as Row[])
+      .map((row) => this.taskFromRow(row));
+  }
+
   listRunnableTasks(): Task[] {
     return (
       this.db
@@ -1238,6 +1243,11 @@ export class AecSDatabase {
     return rows.map((row) => this.runFromRow(row));
   }
 
+  listRunsWithJobs(): Run[] {
+    return (this.db.prepare("SELECT * FROM runs WHERE job_json IS NOT NULL ORDER BY started_at, rowid").all() as Row[])
+      .map((row) => this.runFromRow(row));
+  }
+
   listLatestRuns(projectId?: string): Run[] {
     const sql = `SELECT runs.* FROM runs
       JOIN tasks ON tasks.id = runs.task_id
@@ -1636,9 +1646,37 @@ export class AecSDatabase {
     return (this.db.prepare(sql).all(...args) as Row[]).map((row) => this.outboxFromRow(row));
   }
 
+  listDeliverableOutbox(channel: OutboxMessage["channel"], at = nowIso()): OutboxMessage[] {
+    return (this.db.prepare(`SELECT * FROM outbox_messages
+      WHERE channel=? AND status IN ('pending','delivering')
+        AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+      ORDER BY created_at, id`).all(channel, at) as Row[]).map((row) => this.outboxFromRow(row));
+  }
+
+  claimOutboxDelivery(id: string, at: string, leaseUntil: string): OutboxMessage | undefined {
+    return this.transaction(() => {
+      const result = this.db.prepare(`UPDATE outbox_messages
+        SET status='delivering', attempts=attempts+1, next_attempt_at=?
+        WHERE id=? AND status IN ('pending','delivering')
+          AND (next_attempt_at IS NULL OR next_attempt_at<=?)`).run(leaseUntil, id, at);
+      if (result.changes !== 1) return undefined;
+      const row = this.db.prepare("SELECT * FROM outbox_messages WHERE id=?").get(id) as Row | undefined;
+      return row ? this.outboxFromRow(row) : undefined;
+    });
+  }
+
+  markOutboxDeliveryFailed(id: string, nextAttemptAt: string): OutboxMessage {
+    this.db.prepare(`UPDATE outbox_messages SET status='pending', next_attempt_at=?
+      WHERE id=? AND status='delivering'`).run(nextAttemptAt, id);
+    const row = this.db.prepare("SELECT * FROM outbox_messages WHERE id=?").get(id) as Row | undefined;
+    if (!row) throw new Error(`Outbox message not found: ${id}`);
+    return this.outboxFromRow(row);
+  }
+
   markOutboxDelivered(id: string): OutboxMessage {
-    this.db.prepare(`UPDATE outbox_messages SET status='delivered', attempts=attempts+1, delivered_at=?
-      WHERE id=? AND status!='acknowledged'`).run(nowIso(), id);
+    this.db.prepare(`UPDATE outbox_messages SET status='delivered',
+      attempts=attempts+CASE WHEN status='pending' THEN 1 ELSE 0 END,
+      next_attempt_at=NULL, delivered_at=? WHERE id=? AND status!='acknowledged'`).run(nowIso(), id);
     const row = this.db.prepare("SELECT * FROM outbox_messages WHERE id=?").get(id) as Row | undefined;
     if (!row) throw new Error(`Outbox message not found: ${id}`);
     return this.outboxFromRow(row);

@@ -5,8 +5,13 @@ function escapeRegex(value: string): string {
   return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
 }
 
+const globCache = new Map<string, RegExp>();
+const MAX_GLOB_CACHE_ENTRIES = 1_024;
+
 export function globToRegExp(glob: string): RegExp {
   const normalized = glob.replaceAll("\\", "/").replace(/^\.\//, "");
+  const cached = globCache.get(normalized);
+  if (cached) return cached;
   let pattern = "";
   for (let index = 0; index < normalized.length; index += 1) {
     const char = normalized[index]!;
@@ -28,7 +33,13 @@ export function globToRegExp(glob: string): RegExp {
       pattern += escapeRegex(char);
     }
   }
-  return new RegExp(`^${pattern}$`);
+  const compiled = new RegExp(`^${pattern}$`);
+  if (globCache.size >= MAX_GLOB_CACHE_ENTRIES) {
+    const oldest = globCache.keys().next().value as string | undefined;
+    if (oldest !== undefined) globCache.delete(oldest);
+  }
+  globCache.set(normalized, compiled);
+  return compiled;
 }
 
 export function matchesAny(path: string, globs: string[]): boolean {

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import type { Project, Task } from "./types.js";
 import { execChecked, execCommand, execCommandToFile } from "./exec.js";
 import { matchesAny } from "./glob.js";
+import { AEC_ERROR, AecError } from "./errors.js";
 
 const projectLocks = new Map<string, Promise<void>>();
 const LOCK_RETRY_MS = 100;
@@ -349,7 +350,24 @@ export async function localMerge(project: Project, branch: string, expectedTaskS
     }
     const status = await execChecked(git(project.repoPath, ["status", "--porcelain"]));
     if (status) throw new Error(`Project working tree is not clean: ${project.repoPath}`);
-    await execChecked({ ...git(project.repoPath, ["merge", "--ff-only", branch]), timeoutSeconds: 300 });
+    const canFastForward = await execCommand(git(project.repoPath, ["merge-base", "--is-ancestor", currentHead, expectedTaskSha]));
+    if (canFastForward.exitCode !== 0) {
+      throw new AecError(
+        AEC_ERROR.gitFastForwardRequired,
+        `Local target ${project.targetBranch} cannot fast-forward to ${expectedTaskSha}`,
+        { currentHead, expectedTaskSha },
+      );
+    }
+    try {
+      await execChecked({ ...git(project.repoPath, ["merge", "--ff-only", branch]), timeoutSeconds: 300 });
+    } catch (error) {
+      throw new AecError(
+        AEC_ERROR.gitFastForwardRequired,
+        `Local target ${project.targetBranch} changed before the fast-forward merge completed`,
+        { currentHead, expectedTaskSha },
+        { cause: error },
+      );
+    }
     return await branchHead(project.repoPath, project.targetBranch);
   });
 }

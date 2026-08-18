@@ -1,5 +1,7 @@
 export type JsonObject = Record<string, unknown>;
 
+export type ChildEnvironmentProfile = "restricted" | "codex" | "kimi" | "deepseek_harness";
+
 export type CommandSpec = {
   program: string;
   args: string[];
@@ -219,7 +221,6 @@ export type RunPhase =
   | "post_merge_smoke"
   | "stability_observation"
   | "revert"
-  | "diagnose"
   | "cleanup"
   | "done";
 
@@ -421,6 +422,7 @@ export type OutboxMessage = {
 
 export type JobInput = {
   command: CommandSpec;
+  environmentProfile?: ChildEnvironmentProfile;
   stdin?: string;
   stdoutPath: string;
   stderrPath: string;

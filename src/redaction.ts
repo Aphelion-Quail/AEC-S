@@ -1,24 +1,32 @@
-const SECRET_PATTERNS: RegExp[] = [
-  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/g,
-  /\bsk-[A-Za-z0-9_-]{16,}\b/g,
-  /\bAKIA[0-9A-Z]{16}\b/g,
-  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g,
-  /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi,
-  /\b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API_KEY|PRIVATE_KEY))\s*=\s*([^\s,;]+)/gi,
-  /(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi,
+type SecretPattern = readonly [RegExp, string | ((...args: string[]) => string)];
+
+const SECRET_PATTERNS: SecretPattern[] = [
+  [/\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b/g, "[REDACTED]"],
+  [/\bgithub_pat_[A-Za-z0-9_]{20,}\b/g, "[REDACTED]"],
+  [/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED]"],
+  [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]"],
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, "[REDACTED]"],
+  [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED]"],
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]"],
+  [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, "[REDACTED]"],
+  [/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "[REDACTED]"],
+  [
+    /\b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API_KEY|PRIVATE_KEY))\s*=\s*([^\s,;]+)/gi,
+    (_match: string, key: string) => `${key}=[REDACTED]`,
+  ],
+  [
+    /(["']?)([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY))\1\s*:\s*(["'])([^"'\r\n]+)\3/gi,
+    (_match: string, quote: string, key: string, valueQuote: string) => `${quote}${key}${quote}: ${valueQuote}[REDACTED]${valueQuote}`,
+  ],
+  [/[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi, "[REDACTED]"],
 ];
 
 const SECRET_KEY_PATTERN = /(?:token|password|secret|api[_-]?key|private[_-]?key|credential|authorization)/i;
 
 export function redactText(value: string, maxLength = 4_000): string {
   let result = value;
-  for (const pattern of SECRET_PATTERNS) {
-    result = result.replace(pattern, (match, key: string | undefined) =>
-      key && /(?:TOKEN|PASSWORD|SECRET|API_KEY|PRIVATE_KEY)/i.test(key) ? `${key}=[REDACTED]` : "[REDACTED]",
-    );
+  for (const [pattern, replacement] of SECRET_PATTERNS) {
+    result = result.replace(pattern, replacement as never);
   }
   return result.length > maxLength ? `${result.slice(0, maxLength)}…[truncated]` : result;
 }

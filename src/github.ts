@@ -1,6 +1,7 @@
 import type { Project, Task } from "./types.js";
 import { execChecked, execCommand } from "./exec.js";
 import { withProjectGitLock } from "./git.js";
+import { AEC_ERROR, AecError } from "./errors.js";
 
 type PullRequest = {
   number: number;
@@ -147,7 +148,12 @@ export async function inspectRequiredChecks(
   const selected = checks.filter((check) => project.requiredChecks.includes(check.name));
   if (project.requiredChecks.some((name) => !checks.some((check) => check.name === name))) return "pending";
   if (selected.some((check) => check.bucket === "fail" || check.bucket === "cancel")) {
-    throw new Error(`GitHub checks failed: ${selected.filter((check) => check.bucket === "fail" || check.bucket === "cancel").map((check) => check.name).join(", ")}`);
+    const failedChecks = selected.filter((check) => check.bucket === "fail" || check.bucket === "cancel").map((check) => check.name);
+    throw new AecError(
+      AEC_ERROR.githubChecksFailed,
+      `GitHub checks failed: ${failedChecks.join(", ")}`,
+      { prNumber, failedChecks },
+    );
   }
   return selected.every((check) => check.bucket === "pass") ? "passed" : "pending";
 }

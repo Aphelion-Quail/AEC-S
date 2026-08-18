@@ -108,6 +108,8 @@ node dist/src/cli.js service restart
 
 Agent 与 Validation 命令由独立 job supervisor 执行，输出、最终结果和 PID 都落盘；超时会终止整个子进程组。Daemon 重启后会继续等待存活 job，读取已完成 job，或从最近安全阶段恢复。Run 写入由 lease owner 围栏保护，Agent 并发由数据库原子 slot 控制。Commit、Push、PR 和 Merge 均保存确定性 operation ID；`uncertain` 状态先对账，不盲目重试。
 
+子进程环境按能力隔离。Git、Validation 和普通命令探测只获得最小化的用户、语言区域、临时目录与可执行路径环境，不继承 Daemon 中的任意密钥；一等 Runtime 进程也只额外获得 Codex、Kimi 和 DeepSeek Harness 所需的凭据变量。GitHub 应通过 `gh auth login` 完成认证；Validation 命令不得依赖环境中偶然存在的秘密变量。
+
 LaunchAgent 会保存稳定的后台 `PATH`，默认覆盖 Homebrew、系统工具、常见用户 bin 目录以及 ChatGPT 内置 Codex。健康切换采用防抖：一次失败只记录 degraded 样本，连续失败达到配置阈值后才进入 `unavailable`，恢复也要求连续成功。缺少某个 Runtime 只阻塞依赖它的 Task；等待 Checks、Merge、Human 与稳定性观察不占 Runtime 容量。
 
 普通 Git、GitHub、验证器启动和其他运行期基础设施错误使用持久化指数退避自动恢复，默认最多重试五次；重试耗尽后才创建 `failure_exhausted` Human Decision。验证命令正常启动后的非零退出仍属于代码 Gate 失败，会进入 Repair；命令本身无法启动属于运维失败，不要求 Agent 修改代码。
@@ -126,8 +128,13 @@ aec-s decision list [project-id]
 aec-s decision show <decision-id>
 aec-s decision resolve <decision-id> <resolution.json>
 aec-s decision record <decision.json>
+aec-s run [task-id]
+aec-s daemon
+aec-s service install|start|stop|restart|status|uninstall
 aec-s doctor
 aec-s init [--no-service]
+aec-s mcp
+aec-s mcp-http
 ```
 
 Human resolution 示例：
@@ -190,7 +197,7 @@ WorkBuddy 桌面版可通过其内置 CLI 添加同一个 stdio server（确保�
 http://127.0.0.1:7337/mcp
 ```
 
-该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 最多保留 64 个标准 Streamable HTTP Session，空闲 30 分钟后过期，并支持 POST、GET/SSE 和 DELETE 终止。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`，且不会暴露版本。AEC-S 不通过 npm 包分发，因此不要在 GUI 中选择 npx。
+该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。该令牌属于控制面能力：持有者可以提交由 AEC-S 宿主用户权限执行的 Validation 命令。应把它视为一个已认证的本地 Shell Session，绝不能交给不可信客户端；如怀疑泄露，应立即撤销对应客户端的访问。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 最多保留 64 个标准 Streamable HTTP Session，空闲 30 分钟后过期，并支持 POST、GET/SSE 和 DELETE 终止；关闭服务时会终止空闲 keep-alive 连接，并为其余连接设置强制收敛边界。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`，且不会暴露版本。AEC-S 不通过 npm 包分发，因此不要在 GUI 中选择 npx。
 
 Finding 状态迁移不再接受调用者自报身份。专用 Reviewer MCP 进程必须用 `AEC_S_MCP_ACTOR_AGENT_ID` 绑定一个已启用 Reviewer；共享 daemon 未绑定 Reviewer 时，该工具默认拒绝。Human 方向仍通过 Decision 工具进入，不冒充 Reviewer。
 
@@ -225,7 +232,7 @@ npm run test:all
 npm run test:runtimes:live
 ```
 
-`test:all` 执行 lint、严格类型检查、许可证策略与覆盖率门槛。GitHub Actions 只使用协议级替身，不使用真实凭据。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，只输出版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本。
+`test:all` 执行 lint、严格类型检查、许可证策略、强制包策略与覆盖率门槛。包策略会独立要求所有安装脚本包逐项匹配已审核的 `allowScripts` 名称和版本，并保证所有 DSH 预发布包维持精确锁定，因此安全性不依赖包管理器是否执行 `allowScripts`。GitHub Actions 只使用协议级替身，不使用真实凭据。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，只输出版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本。
 
 测试覆盖正式十实体投影、TaskRevision/Finding 证据、确定性调度与健康防抖、Scope 冲突、Validation/Review Repair、supervisor 恢复、合并后收敛、全部十一个 MCP 工具，以及 Git/GitHub 副作用幂等。独立的真实门禁进一步验证 Codex/Kimi/DSH 的执行、Review、Repair/Resume、Cancel 隔离和健康阈值。
 
