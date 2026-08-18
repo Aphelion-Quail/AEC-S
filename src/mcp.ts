@@ -3,10 +3,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { IncomingMessage, Server as HttpServer, ServerResponse } from "node:http";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { AecSDatabase } from "./db.js";
 import { AecSEngine } from "./engine.js";
-import { decisionInputSchema, directiveSchema, idSchema, resolutionSchema, taskInputSchema } from "./input.js";
+import { decisionInputSchema, directiveSchema, idSchema, repoGlobSchema, resolutionSchema, taskInputSchema } from "./input.js";
+import { readMcpHttpToken } from "./paths.js";
 import { aecSVersion } from "./version.js";
 
 const MCP_HTTP_HOST = "127.0.0.1";
@@ -27,7 +30,7 @@ function result(value: unknown) {
   };
 }
 
-function createAecSMcpServer(db: AecSDatabase): McpServer {
+function createAecSMcpServer(db: AecSDatabase, actorAgentId = process.env.AEC_S_MCP_ACTOR_AGENT_ID?.trim()): McpServer {
   const engine = new AecSEngine(db);
   const server = new McpServer({ name: "aec-s-core", version: aecSVersion() });
 
@@ -85,6 +88,71 @@ function createAecSMcpServer(db: AecSDatabase): McpServer {
     async (input) => result({ decision: db.createDecision({ ...input, status: "resolved" }) }),
   );
 
+  server.registerTool(
+    "aec_s_list_findings",
+    {
+      description: "List durable review Findings and their evidence state.",
+      inputSchema: z.object({
+        taskId: idSchema.optional(),
+        status: z.enum(["proposed", "structurally_valid", "verified", "dismissed", "resolved"]).optional(),
+      }).strict(),
+    },
+    async ({ taskId, status }) => result({ findings: db.listFindings(taskId, status) }),
+  );
+
+  server.registerTool(
+    "aec_s_transition_finding",
+    {
+      description: "Verify, dismiss, or resolve a Finding using explicit evidence.",
+      inputSchema: z.object({
+        findingId: idSchema,
+        status: z.enum(["verified", "dismissed", "resolved"]),
+        evidence: z.string().min(1),
+      }).strict(),
+    },
+    async ({ findingId, status, evidence }) => {
+      if (!actorAgentId) throw new Error("Finding transitions require a server-bound AEC_S_MCP_ACTOR_AGENT_ID");
+      return result({ finding: db.transitionFinding(findingId, status, evidence, actorAgentId) });
+    },
+  );
+
+  server.registerTool(
+    "aec_s_expand_task_scope",
+    {
+      description: "Create a new immutable Task Revision after deterministic Scope Expansion validation.",
+      inputSchema: z.object({
+        taskId: idSchema,
+        addWriteGlobs: z.array(repoGlobSchema),
+        addWatchGlobs: z.array(repoGlobSchema),
+        evidence: z.string().min(1),
+      }).strict(),
+    },
+    async ({ taskId, ...proposal }) => result({ revision: db.createScopeExpansionRevision(taskId, proposal) }),
+  );
+
+  server.registerTool(
+    "aec_s_poll_outbox",
+    {
+      description: "Poll durable Human-on-Exception messages. Delivery alone does not acknowledge them.",
+      inputSchema: z.object({ projectId: idSchema.optional() }).strict(),
+    },
+    async ({ projectId }) => {
+      const messages = db.listOutbox(projectId, true)
+        .filter((message) => message.channel === "mcp" && message.status !== "acknowledged")
+        .map((message) => message.status === "pending" ? db.markOutboxDelivered(message.id) : message);
+      return result({ messages });
+    },
+  );
+
+  server.registerTool(
+    "aec_s_acknowledge_outbox",
+    {
+      description: "Acknowledge one durable Human-on-Exception message.",
+      inputSchema: z.object({ messageId: idSchema }).strict(),
+    },
+    async ({ messageId }) => result({ message: db.acknowledgeOutbox(messageId) }),
+  );
+
   return server;
 }
 
@@ -95,6 +163,8 @@ export async function serveMcp(db: AecSDatabase): Promise<void> {
 
 export type McpHttpOptions = {
   port?: number;
+  token?: string;
+  actorAgentId?: string;
   signal?: AbortSignal;
   onListening?: (url: string) => void;
 };
@@ -114,29 +184,55 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
     throw new Error(`Invalid MCP HTTP port: ${port}`);
   }
   const app = createMcpExpressApp({ host: MCP_HTTP_HOST });
+  const expectedToken = options.token ?? readMcpHttpToken(db.paths);
+  const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
+
+  const authorized = (request: IncomingMessage, response: ServerResponse): boolean => {
+    const supplied = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1] ?? "";
+    const suppliedBytes = Buffer.from(supplied);
+    const expectedBytes = Buffer.from(expectedToken);
+    if (suppliedBytes.length === expectedBytes.length && timingSafeEqual(suppliedBytes, expectedBytes)) return true;
+    response.setHeader("www-authenticate", "Bearer");
+    jsonResponse(response, 401, {
+      jsonrpc: "2.0",
+      error: { code: -32001, message: "Unauthorized" },
+      id: null,
+    });
+    return false;
+  };
+
+  const sessionFor = (request: IncomingMessage) => {
+    const value = request.headers["mcp-session-id"];
+    return typeof value === "string" ? sessions.get(value) : undefined;
+  };
 
   app.get("/healthz", (_request: IncomingMessage, response: ServerResponse) => {
     jsonResponse(response, 200, { status: "ok", service: "aec-s-mcp", version: aecSVersion() });
   });
   app.post("/mcp", async (request: ParsedHttpRequest, response: ServerResponse) => {
-    const server = createAecSMcpServer(db);
-    const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: undefined,
-      enableJsonResponse: true,
-    });
-    let closed = false;
-    const close = async () => {
-      if (closed) return;
-      closed = true;
-      await transport.close();
-      await server.close();
-    };
-    response.on("close", () => void close());
+    if (!authorized(request, response)) return;
     try {
-      await server.connect(transport);
-      await transport.handleRequest(request, response, request.body);
+      let session = sessionFor(request);
+      if (!session && isInitializeRequest(request.body)) {
+        const server = createAecSMcpServer(db, options.actorAgentId);
+        let transport!: StreamableHTTPServerTransport;
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
+          onsessioninitialized: (sessionId) => { sessions.set(sessionId, { server, transport }); },
+        });
+        transport.onclose = () => {
+          if (transport.sessionId) sessions.delete(transport.sessionId);
+        };
+        await server.connect(transport);
+        session = { server, transport };
+      }
+      if (!session) {
+        jsonResponse(response, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing MCP session" }, id: null });
+        return;
+      }
+      await session.transport.handleRequest(request, response, request.body);
     } catch {
-      await close();
       if (!response.headersSent) {
         jsonResponse(response, 500, {
           jsonrpc: "2.0",
@@ -146,19 +242,30 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
       }
     }
   });
+  app.get("/mcp", async (request: ParsedHttpRequest, response: ServerResponse) => {
+    if (!authorized(request, response)) return;
+    const session = sessionFor(request);
+    if (!session) return jsonResponse(response, 400, { error: "Invalid or missing MCP session" });
+    await session.transport.handleRequest(request, response);
+  });
+  app.delete("/mcp", async (request: ParsedHttpRequest, response: ServerResponse) => {
+    if (!authorized(request, response)) return;
+    const session = sessionFor(request);
+    if (!session) return jsonResponse(response, 400, { error: "Invalid or missing MCP session" });
+    await session.transport.handleRequest(request, response);
+  });
   app.all("/mcp", (_request: IncomingMessage, response: ServerResponse) => {
-    jsonResponse(response, 405, {
-      jsonrpc: "2.0",
-      error: { code: -32000, message: "Method not allowed" },
-      id: null,
-    });
+    jsonResponse(response, 405, { error: "Method not allowed" });
   });
 
   await new Promise<void>((resolve, reject) => {
     let httpServer: HttpServer | undefined;
     const stop = () => {
       if (!httpServer) return resolve();
-      httpServer.close((error) => error ? reject(error) : resolve());
+      void Promise.allSettled([...sessions.values()].map(async ({ server, transport }) => {
+        await transport.close();
+        await server.close();
+      })).finally(() => httpServer!.close((error) => error ? reject(error) : resolve()));
     };
     if (options.signal?.aborted) return resolve();
     const createdServer = app.listen(port, MCP_HTTP_HOST, () => {

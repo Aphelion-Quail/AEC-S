@@ -12,18 +12,25 @@ The current source and npm package do not bundle `node_modules`, third-party nat
 
 | Component | Version | License | Copyright or project |
 | --- | --- | --- | --- |
+| [Agent Client Protocol TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk) | 0.23.0 | Apache-2.0 | Zed Industries and contributors |
+| [Kimi Agent SDK](https://github.com/MoonshotAI/kimi-agent-sdk) | 0.1.8 | MIT | Moonshot AI |
+| [DeepSeek Harness SDK, credential seam, and pinned runtime composition packages](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
+| [Cordis](https://github.com/cordiverse/cordis) | 4.0.1 | MIT | Cordis contributors |
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-The locked production dependency graph contains 93 packages: 83 MIT, 2 BSD-3-Clause, 7 ISC, and 1 BSD-2-Clause.
+The locked production dependency graph contains 192 packages: 176 MIT, 1 Apache-2.0, 5 BSD-3-Clause, 8 ISC, 1 BSD-2-Clause, and 1 Python-2.0. DSH packages are pinned to one `0.1.0-rc.6` package/runtime line; AEC-S additionally verifies the JSON-RPC server identity through an initialization handshake. A mismatch is an unavailable Runtime, not a command-adapter fallback.
 
-The non-MIT transitive production dependencies are:
+The non-MIT production dependencies are:
 
 | Component | Version | License |
 | --- | --- | --- |
+| `@agentclientprotocol/sdk` | 0.23.0 | Apache-2.0 |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
 | `fast-uri` | 3.1.5 | BSD-3-Clause |
 | `qs` | 6.15.3 | BSD-3-Clause |
+| `@deepseek-ai/node-addon-landlock-run` and platform packages | 0.1.1 | BSD-3-Clause |
+| `argparse` | 2.0.1 | Python-2.0 |
 | `inherits` | 2.0.4 | ISC |
 | `isexe` | 2.0.0 | ISC |
 | `once` | 1.4.0 | ISC |
@@ -32,7 +39,7 @@ The non-MIT transitive production dependencies are:
 | `wrappy` | 1.0.2 | ISC |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 
-All other production dependencies currently recorded in `package-lock.json` use the MIT License.
+All production dependencies not identified above currently use the MIT License.
 
 ## Direct development dependencies
 
@@ -49,4 +56,4 @@ The locked development-only graph contains 72 packages: 51 MIT and 21 Apache-2.0
 
 If a future distribution bundles dependency source, `node_modules`, a standalone executable, native binaries, or a container image containing these components, that distribution must include every applicable third-party copyright notice, complete license text, disclaimer, and any required upstream NOTICE content.
 
-The authoritative component versions are recorded in `package-lock.json`. The CI license policy permits only the currently reviewed SPDX identifiers: Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, and MIT. A new or missing license fails CI and requires explicit review.
+The authoritative component versions are recorded in `package-lock.json`. The CI license policy permits only the currently reviewed SPDX identifiers: Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MIT, and Python-2.0. A new or missing license fails CI and requires explicit review.

@@ -9,7 +9,7 @@ import { createGitRepository } from "./helpers.js";
 import { aecSVersion } from "../src/version.js";
 import { mcpHttpPort, serveMcpHttp } from "../src/mcp.js";
 
-test("exposes the six AEC-S MCP tools over stdio", async () => {
+test("exposes the AEC-S control and evidence tools over stdio", async () => {
   const home = tempDir("aec-s-mcp-");
   const db = new AecSDatabase(home);
   const project = db.createProject({ id: "mcp-project", name: "MCP", repoPath: createGitRepository() });
@@ -33,12 +33,17 @@ test("exposes the six AEC-S MCP tools over stdio", async () => {
     const tools = await client.listTools();
     const names = tools.tools.map((tool) => tool.name).sort();
     assert.deepEqual(names, [
+      "aec_s_acknowledge_outbox",
       "aec_s_apply_directive",
+      "aec_s_expand_task_scope",
       "aec_s_list_decisions",
+      "aec_s_list_findings",
+      "aec_s_poll_outbox",
       "aec_s_record_decision",
       "aec_s_resolve_decision",
       "aec_s_status",
       "aec_s_submit_task_graph",
+      "aec_s_transition_finding",
     ]);
     for (const tool of tools.tools) {
       assert.equal(tool.inputSchema.type, "object", `${tool.name} must expose an object input schema`);
@@ -67,6 +72,16 @@ test("exposes the six AEC-S MCP tools over stdio", async () => {
       },
     });
     assert.equal(graph.isError, undefined);
+    const unsafeExpansion = await client.callTool({
+      name: "aec_s_expand_task_scope",
+      arguments: {
+        taskId: "mcp-task",
+        addWriteGlobs: ["../outside.txt"],
+        addWatchGlobs: [],
+        evidence: "attempt traversal",
+      },
+    });
+    assert.equal(unsafeExpansion.isError, true);
     const paused = await client.callTool({
       name: "aec_s_apply_directive",
       arguments: { action: "pause", taskIds: ["mcp-task"] },
@@ -114,27 +129,35 @@ test("exposes AEC-S MCP over loopback Streamable HTTP", async () => {
   const db = new AecSDatabase(home);
   db.createProject({ id: "mcp-http-project", name: "MCP HTTP", repoPath: createGitRepository() });
   const controller = new AbortController();
+  const httpToken = `test-${"mcp-http-token".repeat(3)}`;
   let resolveUrl!: (url: string) => void;
   const listening = new Promise<string>((resolve) => { resolveUrl = resolve; });
   const serving = serveMcpHttp(db, {
     port: 0,
+    token: httpToken,
     signal: controller.signal,
     onListening: resolveUrl,
   });
   const url = await listening;
   const client = new Client({ name: "aec-s-http-test", version: "1.0.0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+  await client.connect(new StreamableHTTPClientTransport(new URL(url), {
+    requestInit: { headers: { authorization: `Bearer ${httpToken}` } },
+  }));
   try {
     assert.deepEqual(client.getServerVersion(), { name: "aec-s-core", version: aecSVersion() });
     const tools = await client.listTools();
-    assert.equal(tools.tools.length, 6);
+    assert.equal(tools.tools.length, 11);
     const status = await client.callTool({ name: "aec_s_status", arguments: { projectId: "mcp-http-project" } });
     assert.equal(status.isError, undefined);
     const health = await fetch(url.replace("/mcp", "/healthz"));
     assert.equal(health.status, 200);
     assert.deepEqual(await health.json(), { status: "ok", service: "aec-s-mcp", version: aecSVersion() });
-    const unsupported = await fetch(url);
-    assert.equal(unsupported.status, 405);
+    const unauthorized = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+    assert.equal(unauthorized.status, 401);
+    const missingSession = await fetch(url, {
+      headers: { authorization: `Bearer ${httpToken}` },
+    });
+    assert.equal(missingSession.status, 400);
   } finally {
     await client.close();
     controller.abort();

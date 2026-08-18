@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import type { CommandSpec } from "./types.js";
 
 const MAX_CAPTURED_CHARACTERS = 8 * 1024 * 1024;
@@ -54,6 +55,7 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
   });
   const output = createWriteStream(outputPath, { mode: 0o600 });
   let stderr = "";
+  let outputBytes = 0;
   let timedOut = false;
   const timeout = setTimeout(() => {
     timedOut = true;
@@ -74,8 +76,23 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
       resolve({ exitCode, signal, stdout: "", stderr, timedOut });
     });
   });
-  const [result] = await Promise.all([completed, pipeline(child.stdout, output)]);
-  return result;
+  const limiter = new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      outputBytes += chunk.length;
+      if (outputBytes > MAX_CAPTURED_CHARACTERS) callback(new Error("Command file output exceeds 8 MiB"));
+      else callback(null, chunk);
+    },
+  });
+  const writing = pipeline(child.stdout, limiter, output).then(
+    () => undefined,
+    (error: unknown) => {
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      return error instanceof Error ? error : new Error(String(error));
+    },
+  );
+  const [result, writeError] = await Promise.all([completed, writing]);
+  return writeError ? { ...result, exitCode: null, stderr: appendBounded(stderr, writeError.message) } : result;
 }
 
 function appendBounded(current: string, chunk: string): string {

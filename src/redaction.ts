@@ -7,6 +7,8 @@ const SECRET_PATTERNS: RegExp[] = [
   /(https?:\/\/)[^\s/@:]+:[^\s/@]+@/gi,
 ];
 
+const SECRET_KEY_PATTERN = /(?:token|password|secret|api[_-]?key|private[_-]?key|credential|authorization)/i;
+
 export function redactText(value: string, maxLength = 4_000): string {
   let result = value;
   for (const pattern of SECRET_PATTERNS) {
@@ -21,7 +23,10 @@ export function redactJson<T>(value: T): T {
   if (typeof value === "string") return redactText(value) as T;
   if (Array.isArray(value)) return value.map((item) => redactJson(item)) as T;
   if (value && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([key, child]) => [key, redactJson(child)])) as T;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => [
+      key,
+      SECRET_KEY_PATTERN.test(key) ? "[REDACTED]" : redactJson(child),
+    ])) as T;
   }
   return value;
 }

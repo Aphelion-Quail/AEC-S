@@ -9,6 +9,7 @@ const allowedLicenses = new Set([
   "BSD-3-Clause",
   "ISC",
   "MIT",
+  "Python-2.0",
 ]);
 
 const lockPath = resolve(process.argv[2] ?? "package-lock.json");

@@ -31,7 +31,7 @@ test("manages Project and Agent configuration through the CLI and reports doctor
   const agentPatchPath = join(inputs, "agent-patch.json");
   const repo = createGitRepository();
   writeFileSync(projectPath, JSON.stringify({ id: "cli-project", name: "CLI", repoPath: repo }));
-  writeFileSync(projectPatchPath, JSON.stringify({ intent: "Updated through CLI", maxConcurrency: 3 }));
+  writeFileSync(projectPatchPath, JSON.stringify({ intent: "Updated through CLI", intentVersion: 2, maxConcurrency: 3 }));
   writeFileSync(agentPath, JSON.stringify({
     id: "cli-agent",
     name: "CLI Agent",
@@ -47,7 +47,7 @@ test("manages Project and Agent configuration through the CLI and reports doctor
   assert.ok(Array.isArray(invoke(home, ["project", "list"]).projects));
   assert.equal(invoke(home, ["agent", "add", agentPath]).id, "cli-agent");
   assert.equal(invoke(home, ["agent", "show", "cli-agent"]).name, "CLI Agent");
-  assert.equal(invoke(home, ["agent", "update", "cli-agent", agentPatchPath]).availability, "degraded");
+  assert.equal(invoke(home, ["agent", "update", "cli-agent", agentPatchPath]).availability, "disabled");
   assert.ok(Array.isArray(invoke(home, ["agent", "list"]).agents));
   assert.equal(invoke(home, ["doctor"]).ok, true);
   writeFileSync(join(repo, "dirty.txt"), "dirty\n");

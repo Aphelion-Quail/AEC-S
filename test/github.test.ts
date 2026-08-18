@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecSDatabase } from "../src/db.js";
 import { AecSEngine } from "../src/engine.js";
-import { mergePullRequest, waitForRequiredChecks } from "../src/github.js";
+import { inspectRequiredChecks, mergePullRequest, waitForRequiredChecks } from "../src/github.js";
 import { branchHead, commitTask, createWorktree } from "../src/git.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 import type { Project, Run, Workspace } from "../src/types.js";
@@ -62,7 +62,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
     process.exit(1);
   }
   cp.execFileSync('git', ['push', '--force', 'origin', actual + ':refs/heads/main'], { stdio: 'ignore' });
-  write({ ...state, state: 'MERGED', head: actual, mergeSha: '1111111111111111111111111111111111111111' });
+  write({ ...state, state: 'MERGED', head: actual, mergeSha: actual });
 } else if (args[0] === 'pr' && args[1] === 'view') {
   const state = read();
   process.stdout.write(JSON.stringify({ number: 1, url: 'https://example.test/pr/1', state: state.state, headRefOid: state.head, mergeCommit: state.mergeSha ? { oid: state.mergeSha } : null }));
@@ -119,8 +119,15 @@ if (args[0] === 'pr' && args[1] === 'list') {
       },
     ]);
     await engine.runTask(task!.id);
+    for (let cycle = 0; cycle < 20 && db.getTask(task!.id)?.status !== "succeeded"; cycle += 1) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 275));
+      await engine.runOnce();
+    }
     assert.equal(db.getTask(task!.id)?.status, "succeeded");
-    assert.equal(db.getTask(task!.id)?.mergeSha, "1111111111111111111111111111111111111111");
+    assert.equal(
+      db.getTask(task!.id)?.mergeSha,
+      execFileSync("git", ["--git-dir", remote, "rev-parse", "refs/heads/main"], { encoding: "utf8" }).trim(),
+    );
     const run = db.getLatestRunForTask(task!.id)!;
     assert.equal(run.effects.pullRequest?.status, "completed");
     assert.equal(run.effects.merge?.status, "completed");
@@ -306,6 +313,23 @@ function githubProject(repoPath: string, requiredChecks: string[]): Project {
 test("rejects missing required checks before querying GitHub", async () => {
   const repo = createGitRepository();
   await assert.rejects(waitForRequiredChecks(githubProject(repo, []), repo, 1, 1, undefined, 1), /at least one/);
+});
+
+test("does not treat a skipped required GitHub check as passing", async () => {
+  const repo = createGitRepository();
+  const fakeBin = tempDir("aec-s-skipped-gh-");
+  const ghPath = join(fakeBin, "gh");
+  writeFileSync(ghPath, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify([{ name: 'test', state: 'SKIPPED', bucket: 'skipping' }]));
+`);
+  chmodSync(ghPath, 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${fakeBin}:${oldPath ?? ""}`;
+  try {
+    assert.equal(await inspectRequiredChecks(githubProject(repo, ["test"]), repo, 1), "pending");
+  } finally {
+    process.env.PATH = oldPath;
+  }
 });
 
 test("fails closed on GitHub authentication errors and unexpected merged heads", async () => {
