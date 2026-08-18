@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import type { AecSDatabase } from "./db.js";
 import type {
@@ -36,11 +36,14 @@ import {
   createWorktree,
   fetchRemote,
   fetchRemoteUnlocked,
+  isAncestor,
   localMerge,
+  mergeBase,
   outOfScopePaths,
   projectBaseRef,
   rebaseInProgress,
   rebaseOntoTarget,
+  restoreWorkspaceHead,
   revertMergedTask,
   verifyMergedRevision,
   workspaceHasChanges,
@@ -209,6 +212,7 @@ export class AecSEngine {
     if (this.schedulerCycles % 100 === 0) this.db.pruneEvents();
     this.promoteOperationalRetries();
     this.promoteCompletedObservations();
+    this.promoteCompletedRepairs();
     this.promoteTasks();
     this.recalculateAgentLoad();
     const allActiveRuns = this.db.listActiveRuns();
@@ -386,6 +390,41 @@ export class AecSEngine {
     }
   }
 
+  private promoteCompletedRepairs(): void {
+    for (const task of this.db.listTasks()) {
+      if (task.status !== "parked") continue;
+      const run = this.db.getLatestRunForTask(task.id);
+      const repairEvidence = run?.error?.postMergeRepair;
+      if (!run || run.status !== "interrupted" || !repairEvidence ||
+          typeof repairEvidence !== "object" || Array.isArray(repairEvidence)) continue;
+      const repairTaskId = String((repairEvidence as JsonObject).repairTaskId ?? "");
+      const repair = repairTaskId ? this.db.getTask(repairTaskId) : undefined;
+      if (repair?.status !== "succeeded") continue;
+      this.db.transaction(() => {
+        if (this.db.getTask(task.id)?.status !== "parked") return;
+        const currentRun = this.db.getRun(run.id);
+        if (!currentRun || currentRun.status !== "interrupted" || currentRun.leaseOwner) return;
+        this.db.updateTaskStatus(task.id, "succeeded", {
+          summary: `Post-merge convergence restored by Repair Task ${repair.id}`,
+          mergeSha: repair.mergeSha ?? task.mergeSha ?? currentRun.effects.merge?.externalRef ?? null,
+        });
+        currentRun.phase = "cleanup";
+        currentRun.error = redactJson({
+          ...currentRun.error,
+          postMergeRepair: { repairTaskId: repair.id, resolvedAt: nowIso() },
+        });
+        if (!this.db.saveRun(currentRun, undefined)) throw new Error(`Run changed while resolving post-merge Repair: ${currentRun.id}`);
+        this.db.appendEvent({
+          projectId: task.projectId,
+          taskId: task.id,
+          runId: currentRun.id,
+          type: "post_merge_repair.resolved",
+          payload: { repairTaskId: repair.id },
+        });
+      });
+    }
+  }
+
   async runTask(taskId: string, preferredAgentId?: string): Promise<void> {
     if (this.inProcess.has(taskId)) return;
     this.inProcess.add(taskId);
@@ -394,10 +433,42 @@ export class AecSEngine {
       let task = this.requireTask(taskId);
       let run = this.db.getLatestRunForTask(taskId);
       const cleanupRecovery = run?.status === "interrupted" && run.phase === "cleanup" && run.effects.merge?.status === "completed";
+      if (["cancelled", "succeeded", "failed"].includes(task.status) && run?.status === "active") {
+        if (!this.claimRun(run)) return;
+        if (task.status === "succeeded") {
+          run.phase = "cleanup";
+          this.saveRun(run);
+          await this.executeRun(run.id);
+        } else {
+          if (run.job?.pid) {
+            const runtime = this.db.getAgent(run.job.agentId ?? run.agentId);
+            if (runtime) this.adapterFactory(runtime).cancel(run.job.pid);
+          }
+          if (run.job?.agentId) this.db.releaseAgentSlot(run.job.id);
+          run.job = undefined;
+          run.phase = "done";
+          run.status = "failed";
+          run.leaseUntil = undefined;
+          run.leaseOwner = undefined;
+          this.saveRun(run);
+          this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
+          this.db.appendEvent({
+            projectId: task.projectId,
+            taskId: task.id,
+            runId: run.id,
+            type: "run.terminal_task_reconciled",
+            payload: { taskStatus: task.status },
+          });
+        }
+        return;
+      }
       if (["paused", "awaiting_human", "cancelled", "succeeded", "failed"].includes(task.status) && !cleanupRecovery) return;
       if (run?.status === "interrupted" && (task.status === "ready" || cleanupRecovery)) {
-        const leaseUntil = this.leaseTime();
-        if (!this.db.resumeInterruptedRun(run.id, this.leaseOwner, leaseUntil)) return;
+        const resumed = this.db.transaction(() => {
+          if (!cleanupRecovery && !this.canAdmitTask(task, run!.id)) return false;
+          return this.db.resumeInterruptedRun(run!.id, this.leaseOwner, this.leaseTime());
+        });
+        if (!resumed) return;
         run = this.requireRun(run.id);
         if (!cleanupRecovery) this.db.updateTaskStatus(task.id, "running");
       } else if (!run || run.status !== "active") {
@@ -485,6 +556,7 @@ export class AecSEngine {
     };
     const created = this.db.transaction(() => {
       if (this.db.getTask(task.id)?.status !== "ready") return false;
+      if (!this.canAdmitTask(task)) return false;
       this.db.createRun(run);
       this.db.markAgentAssigned(agent.id);
       this.db.createWorkspace(workspace);
@@ -492,6 +564,19 @@ export class AecSEngine {
       return true;
     });
     return created ? run : undefined;
+  }
+
+  private canAdmitTask(task: Task, excludeRunId?: string): boolean {
+    const project = this.requireProject(task.projectId);
+    const activeRuns = this.db.listActiveRuns().filter((run) => run.id !== excludeRunId && run.phase !== "cleanup");
+    const activeTasks = activeRuns
+      .map((run) => this.db.getTask(run.taskId))
+      .filter((candidate): candidate is Task => Boolean(candidate) && !["paused", "cancelled", "failed", "succeeded"].includes(candidate!.status));
+    if (activeTasks.filter((candidate) => candidate.projectId === task.projectId).length >= project.maxConcurrency) return false;
+    if (activeTasks.some((candidate) => candidate.projectId === task.projectId && tasksConflict(task.scope, candidate.scope))) return false;
+    const capacityPhases = new Set<Run["phase"]>(["prepare", "execute", "validate", "review", "repair", "publish"]);
+    const capacityUsed = activeRuns.filter((run) => capacityPhases.has(run.phase)).length;
+    return capacityUsed < this.globalConcurrency;
   }
 
   private async executeRun(runId: string): Promise<void> {
@@ -822,6 +907,10 @@ export class AecSEngine {
 
   private async phaseReview(run: Run): Promise<void> {
     const { task, project, workspace } = this.contextFor(run);
+    // Commit the already-validated executor state before exposing the
+    // worktree to an independent reviewer. This gives AEC-S a deterministic
+    // restoration point if a supposedly read-only adapter mutates files.
+    await this.ensureCommit(run, project, task, workspace);
     const executor = this.requireAgent(run.agentId);
     const revision = task.currentRevisionId ? this.db.getTaskRevision(task.currentRevisionId) : undefined;
     const excludedFamilies = revision?.gateProfile.review === "strict" &&
@@ -900,6 +989,7 @@ export class AecSEngine {
     await writeDiff(workspace.path, run.baseSha, postReviewDiff);
     assertFileSize(postReviewDiff, 8 * 1024 * 1024, "Post-review diff");
     if (!readFileSync(reviewDiff).equals(readFileSync(postReviewDiff))) {
+      await restoreWorkspaceHead(workspace.path);
       throw new Error(`Reviewer ${reviewer.id} modified the task workspace`);
     }
     const structuredPath = execution.structuredOutputPath ?? invocation.structuredOutputPath;
@@ -987,7 +1077,7 @@ export class AecSEngine {
     }
     if (await rebaseInProgress(workspace.path)) {
       await continueRebase(workspace.path);
-      run.baseSha = await branchHead(project.repoPath, projectBaseRef(project));
+      run.baseSha = await mergeBase(workspace.path, "HEAD", projectBaseRef(project));
       this.db.updateWorkspaceBaseline(workspace.id, run.baseSha);
       run.effects.commit = {
         operationId: this.operationId(project.id, task.id, run.id, "commit"),
@@ -1012,8 +1102,9 @@ export class AecSEngine {
     if (project.deliveryMode === "github") await fetchRemote(project);
     const targetHead = await branchHead(project.repoPath, projectBaseRef(project));
     if (targetHead !== run.baseSha) {
+      const forwardDrift = await isAncestor(project.repoPath, run.baseSha, targetHead);
       const targetChanges = await changedPathsBetween(project.repoPath, run.baseSha, targetHead);
-      const relevant = changesAffectTask(task, targetChanges);
+      const relevant = !forwardDrift || changesAffectTask(task, targetChanges);
       const driftCommits = await commitCountBetween(project.repoPath, run.baseSha, targetHead);
       const driftSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(run.startedAt)) / 1_000));
       const exceedsCommitBudget = project.operationalConfig?.driftMaxCommits !== undefined &&
@@ -1030,7 +1121,9 @@ export class AecSEngine {
         });
       }
       try {
-        await rebaseOntoTarget(project, workspace.path);
+        const rebasedTarget = await rebaseOntoTarget(project, workspace.path);
+        run.baseSha = rebasedTarget;
+        this.db.updateWorkspaceBaseline(workspace.id, rebasedTarget);
       } catch (error) {
         this.setPhase(run, "repair", {
           error: this.failureEvidence(run, {
@@ -1042,8 +1135,6 @@ export class AecSEngine {
         });
         return;
       }
-      run.baseSha = targetHead;
-      this.db.updateWorkspaceBaseline(workspace.id, targetHead);
       run.effects.commit = {
         operationId: this.operationId(project.id, task.id, run.id, "commit"),
         status: "completed",
@@ -1064,7 +1155,7 @@ export class AecSEngine {
   }
 
   private async phaseRemoteChecks(run: Run): Promise<void> {
-    const { task, project, workspace } = this.contextFor(run);
+    const { project, workspace } = this.contextFor(run);
     const prRef = run.effects.pullRequest?.externalRef;
     if (!prRef) throw new Error("PR effect has no external reference");
     const prNumber = Number(prRef.split("#").at(-1));
@@ -1094,7 +1185,7 @@ export class AecSEngine {
     run.leaseUntil = undefined;
     run.leaseOwner = undefined;
     this.saveRun(run);
-    this.db.updateTaskStatus(task.id, "operational_blocked", { summary: `Waiting for required checks until ${nextAttemptAt}` });
+    this.updateTaskStatusFromControl(run, "operational_blocked", { summary: `Waiting for required checks until ${nextAttemptAt}` });
   }
 
   private async phaseMerge(run: Run): Promise<void> {
@@ -1102,7 +1193,7 @@ export class AecSEngine {
     const commitSha = await branchHead(workspace.path, "HEAD");
     const operationId = this.operationId(project.id, task.id, run.id, "merge");
     if (run.effects.merge?.status === "completed" && run.effects.merge.externalRef) {
-      if (task.status !== "observing") this.db.updateTaskStatus(task.id, "observing", {
+      if (task.status !== "observing") this.updateTaskStatusFromControl(run, "observing", {
         summary: `Merged at ${run.effects.merge.externalRef}; post-merge convergence pending`,
         mergeSha: run.effects.merge.externalRef,
       });
@@ -1113,7 +1204,7 @@ export class AecSEngine {
       const currentTarget = await branchHead(project.repoPath, project.targetBranch);
       if (currentTarget === commitSha) {
         this.setEffect(run, "merge", { operationId, status: "completed", externalRef: currentTarget });
-        this.db.updateTaskStatus(task.id, "observing", { summary: `Merged at ${currentTarget}; post-merge convergence pending`, mergeSha: currentTarget });
+        this.updateTaskStatusFromControl(run, "observing", { summary: `Merged at ${currentTarget}; post-merge convergence pending`, mergeSha: currentTarget });
         this.setPhase(run, "post_merge_smoke");
         return;
       }
@@ -1146,7 +1237,7 @@ export class AecSEngine {
         mergeSha = await localMerge(project, workspace.branch, commitSha);
       }
       this.setEffect(run, "merge", { operationId, status: "completed", externalRef: mergeSha });
-      this.db.updateTaskStatus(task.id, "observing", {
+      this.updateTaskStatusFromControl(run, "observing", {
         summary: `Merged at ${mergeSha}; post-merge convergence pending`,
         mergeSha,
       });
@@ -1168,6 +1259,15 @@ export class AecSEngine {
   }
 
   private async phasePostMergeSmoke(run: Run): Promise<void> {
+    const { project } = this.contextFor(run);
+    if (project.deliveryMode === "local") {
+      await withProjectGitLock(project, async () => await this.phasePostMergeSmokeLocked(run));
+      return;
+    }
+    await this.phasePostMergeSmokeLocked(run);
+  }
+
+  private async phasePostMergeSmokeLocked(run: Run): Promise<void> {
     const { task, project } = this.contextFor(run);
     const mergeSha = run.effects.merge?.externalRef;
     if (!mergeSha) throw new Error("Post-merge smoke requires an authoritative merge SHA");
@@ -1186,6 +1286,9 @@ export class AecSEngine {
         this.addRunMetric(run, "validationMs", this.executionDuration(execution));
         this.addRunMetric(run, "validationRuns", 1);
         const mutated = await workspaceHasChanges(smokeRoot);
+        if (execution.result.status === "spawn_error") {
+          throw new Error(`Post-merge smoke could not start: ${original.program}`);
+        }
         if (execution.result.status !== "completed" || execution.result.exitCode !== 0 || mutated) {
           this.setEffect(run, "postMergeSmoke", { operationId, status: "completed", externalRef: `failed:${mergeSha}` });
           this.db.appendEvent({ projectId: project.id, taskId: task.id, runId: run.id, type: "post_merge_smoke.failed", payload: { mergeSha, index, mutated } });
@@ -1206,7 +1309,7 @@ export class AecSEngine {
   }
 
   private async phaseStabilityObservation(run: Run): Promise<void> {
-    const { task, project } = this.contextFor(run);
+    const { project } = this.contextFor(run);
     const seconds = project.operationalConfig?.stabilityObservationSeconds ?? 0;
     const existing = run.error?.stabilityObservation;
     if (seconds > 0 && (!existing || typeof existing !== "object" || Array.isArray(existing))) {
@@ -1216,11 +1319,11 @@ export class AecSEngine {
       run.leaseUntil = undefined;
       run.leaseOwner = undefined;
       this.saveRun(run);
-      this.db.updateTaskStatus(task.id, "observing", { summary: `Stability observation until ${completesAt}` });
+      this.updateTaskStatusFromControl(run, "observing", { summary: `Stability observation until ${completesAt}` });
       return;
     }
     const mergeSha = run.effects.merge?.externalRef;
-    this.db.updateTaskStatus(task.id, "succeeded", {
+    this.updateTaskStatusFromControl(run, "succeeded", {
       summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
       ...(mergeSha ? { mergeSha } : {}),
     });
@@ -1235,7 +1338,7 @@ export class AecSEngine {
       candidate.dependsOn.includes(task.id) && !["cancelled", "failed", "parked"].includes(candidate.status));
     const canRevert = policy === "enforce" && task.revertSafe === true && project.deliveryMode === "local" &&
       Boolean(mergeSha) && successors.length === 0;
-    if (canRevert) {
+    if (canRevert && run.effects.revert?.status !== "completed") {
       const operationId = this.operationId(project.id, task.id, run.id, "revert");
       this.setEffect(run, "revert", { operationId, status: "started", externalRef: mergeSha });
       try {
@@ -1261,7 +1364,7 @@ export class AecSEngine {
         proposedRiskClass: "core",
         environmentRequirements: task.environmentRequirements,
         revertSafe: task.revertSafe,
-        priority: task.priority + 1,
+        priority: Math.min(100, task.priority + 1),
       });
       this.db.updateTaskStatus(repair.id, "parked", { summary: "Created from post-merge smoke evidence; awaiting controlled admission" });
     }
@@ -1282,7 +1385,11 @@ export class AecSEngine {
       }, null, 2),
       options: ["resume_task", "cancel_task"],
     });
-    this.db.updateTaskStatus(task.id, "parked", {
+    run.error = this.failureEvidence(run, {
+      ...run.error,
+      postMergeRepair: { repairTaskId: repairId },
+    });
+    this.updateTaskStatusFromControl(run, "parked", {
       summary: canRevert
         ? `Post-merge smoke failed; merge reverted and Repair Task ${repairId} awaits Decision ${decision.id}`
         : `Post-merge smoke failed; Repair Task ${repairId} awaits Decision ${decision.id}`,
@@ -1317,7 +1424,7 @@ export class AecSEngine {
     if (!merged) return false;
     const operationId = this.operationId(project.id, task.id, run.id, "merge");
     this.setEffect(run, "merge", { operationId, status: "completed", externalRef: merged.mergeSha });
-    this.db.updateTaskStatus(task.id, "observing", {
+    this.updateTaskStatusFromControl(run, "observing", {
       summary: `Merged at ${merged.mergeSha}; post-merge convergence pending`,
       mergeSha: merged.mergeSha,
     });
@@ -1328,7 +1435,7 @@ export class AecSEngine {
   private async phaseCleanup(run: Run): Promise<void> {
     const { task, project, workspace } = this.contextFor(run);
     if (task.status !== "succeeded" && run.effects.merge?.status === "completed" && run.effects.merge.externalRef) {
-      this.db.updateTaskStatus(task.id, "observing", {
+      this.updateTaskStatusFromControl(run, "observing", {
         summary: `Recovered merge ${run.effects.merge.externalRef}; post-merge convergence pending`,
         mergeSha: run.effects.merge.externalRef,
       });
@@ -1353,6 +1460,16 @@ export class AecSEngine {
       type: "run.completed",
       payload: { merge: run.effects.merge?.externalRef },
     });
+  }
+
+  private updateTaskStatusFromControl(
+    run: Run,
+    status: Task["status"],
+    extra?: { summary?: string | null; mergeSha?: string | null },
+  ): void {
+    if (!this.db.updateTaskStatusUnlessControlled(run.taskId, status, extra)) {
+      throw new Error(`Task control state changed during ${run.phase}`);
+    }
   }
 
   private async ensureCommit(run: Run, project: Project, task: Task, workspace: Workspace): Promise<void> {
@@ -1458,6 +1575,12 @@ export class AecSEngine {
         result: join(run.logDir, `${label}-${suffix}.result.json`),
         input: join(run.logDir, `${label}-${suffix}.input.json`),
       };
+      if (options.fixedPaths && [paths.stdout, paths.stderr, paths.result, paths.input].some((path) => existsSync(path))) {
+        const previous = newId("previous");
+        for (const path of [paths.stdout, paths.stderr, paths.result, paths.input]) {
+          if (existsSync(path)) renameSync(path, `${path}.${previous}`);
+        }
+      }
       input = {
         command,
         ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
@@ -1546,6 +1669,25 @@ export class AecSEngine {
       run.leaseUntil = undefined;
       run.leaseOwner = undefined;
       this.saveRun(run);
+      return;
+    }
+    if (message.startsWith("Agent capacity unavailable:")) {
+      const previous = run.error?.externalWait;
+      const startedAt = previous && typeof previous === "object" && !Array.isArray(previous)
+        ? String((previous as JsonObject).startedAt ?? nowIso())
+        : nowIso();
+      const nextAttemptAt = new Date(Date.now() + 1_000).toISOString();
+      run.error = this.failureEvidence(run, {
+        externalWait: { type: "agent_capacity", startedAt, nextAttemptAt, message },
+      });
+      run.job = undefined;
+      run.status = "interrupted";
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatusUnlessControlled(run.taskId, "operational_blocked", {
+        summary: `Waiting for Runtime capacity until ${nextAttemptAt}`,
+      });
       return;
     }
     const operationalRetry = run.error?.operationalRetry;
@@ -1993,14 +2135,17 @@ export class AecSEngine {
           !excludedFamilies.has(agent.runtimeFamily ?? agent.adapter) &&
           capabilities.every((capability) => agent.capabilities.includes(capability)),
       )
-      .sort(
-        (left, right) =>
+      .sort((left, right) => {
+        const loadDelta =
           (loadOverride?.get(left.id) ?? left.currentLoad) / left.maxConcurrency -
-            (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency ||
+          (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency;
+        if (loadDelta !== 0) return loadDelta;
+        const assignmentDelta =
           Date.parse(left.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") -
-            Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") ||
-          left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
-      )[0];
+          Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z");
+        if (assignmentDelta !== 0) return assignmentDelta;
+        return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+      })[0];
   }
 
   private recalculateAgentLoad(): void {
@@ -2021,7 +2166,7 @@ export class AecSEngine {
   }
 
   private async waitForAgentSlot(agentId: string, runId: string, jobId: string, run: Run): Promise<void> {
-    const deadline = Date.now() + 60_000;
+    const deadline = Date.now() + 1_000;
     let nextHeartbeat = Date.now();
     while (Date.now() < deadline) {
       if (this.db.reserveAgentSlot(agentId, runId, jobId)) return;

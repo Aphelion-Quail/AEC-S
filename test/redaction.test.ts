@@ -12,3 +12,13 @@ test("redacts common credentials before errors and Agent evidence are persisted"
   assert.match(redacted, /REDACTED/);
   assert.deepEqual(redactJson({ nested: [input] }), { nested: [redacted] });
 });
+
+test("redacts private keys, cloud identifiers, JWTs, and Slack tokens", () => {
+  const aws = `AKIA${"A1".repeat(8)}`;
+  const slack = `xoxb-${"abc123".repeat(4)}`;
+  const jwt = ["eyJ" + "a".repeat(12), "b".repeat(12), "c".repeat(12)].join(".");
+  const pem = [`-----BEGIN ${"PRIVATE KEY"}-----`, "not-real-key-material", `-----END ${"PRIVATE KEY"}-----`].join("\n");
+  const redacted = redactText([aws, slack, jwt, pem].join("\n"));
+  for (const secret of [aws, slack, jwt, "not-real-key-material"]) assert.equal(redacted.includes(secret), false);
+  assert.deepEqual(redactJson({ authorization: "opaque-value" }), { authorization: "[REDACTED]" });
+});

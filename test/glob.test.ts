@@ -6,6 +6,12 @@ test("matches repository path globs", () => {
   assert.equal(matchesAny("src/core/a.ts", ["src/core/**"]), true);
   assert.equal(matchesAny("src/ui/a.ts", ["src/core/**"]), false);
   assert.equal(matchesAny("README.md", ["*.md"]), true);
+  assert.equal(matchesAny("src/a.ts", ["src/?.ts"]), true);
+  assert.equal(matchesAny("src/ab.ts", ["src/?.ts"]), false);
+  assert.equal(matchesAny("src/file.ts", ["src/**/file.ts"]), true);
+  assert.equal(matchesAny("src/nested/file.ts", ["src/**/file.ts"]), true);
+  assert.equal(matchesAny("src/a.ts", ["src/[ab].ts"]), false, "character classes are intentionally literal");
+  assert.equal(matchesAny("src/a.ts", ["src/{a,b}.ts"]), false, "braces are intentionally literal");
 });
 
 test("allows only scope-independent tasks to run concurrently", () => {

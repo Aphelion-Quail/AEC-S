@@ -52,6 +52,7 @@ export function launchAgentPlist(
   <key>EnvironmentVariables</key><dict>
     <key>AEC_S_HOME</key><string>${xml(paths.home)}</string>
     <key>HOME</key><string>${xml(homedir())}</string>
+    <key>NODE_ENV</key><string>production</string>
     <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}${runtimeHomeEnvironment}
   </dict>
   <key>RunAtLoad</key><true/>

@@ -46,7 +46,7 @@ node dist/src/cli.js doctor
 
 对于 Codex，AEC-S 会搜索 `PATH`，以及 ChatGPT.app 和 Codex.app 使用的系统级与用户级 macOS 应用目录。因此，应用内置的 Codex 不要求用户创建 Shell 软链接或手动修改 `PATH`。
 
-对于 Kimi，AEC-S 会同时搜索 `PATH` 和 `~/.kimi-code/bin/kimi`，在不读取或输出 Token 的前提下检查 Provider 元数据，然后协商 Runtime 能力。主控制通道是由锁定版本的官方 ACP TypeScript SDK 驱动的 stdio ACP。就绪探测实际执行 initialize、Session create/delete 与 load/resume，并分别记录协商得到的 cancel/stream 支持及 `plan`/`auto` 模式；真实 cancel、stream、resume 和权限行为由协议回归测试及维护者本机 live gate 验证，不再把“能力广告”表述成探测时已经执行。旧 Agent SDK wire 只能通过显式 `transport: "agent_sdk_wire"` 使用；ACP 失败后绝不静默切换 Transport。`stream-json` Prompt 模式仅用于诊断，通用 command Adapter 也不计为 Kimi。
+对于 Kimi，AEC-S 会同时搜索 `PATH` 和 `~/.kimi-code/bin/kimi`，在不读取或输出 Token 的前提下检查 Provider 元数据，然后协商 Runtime 能力。主控制通道是由锁定版本的官方 ACP TypeScript SDK 驱动的 stdio ACP。就绪探测实际执行 initialize、Session create/delete 与 load/resume，并分别记录协商得到的 cancel/stream 支持及 `plan`/`auto` 模式；真实 cancel、stream、resume 和权限行为由协议回归测试及维护者本机 live gate 验证，不再把“能力广告”表述成探测时已经执行。旧 Agent SDK wire 只能通过显式 `transport: "agent_sdk_wire"` 使用；它采用 SDK 自动执行模式，不具备 ACP 的逐工具位置授权保证。ACP 失败后绝不静默切换 Transport。`stream-json` Prompt 模式仅用于诊断，通用 command Adapter 也不计为 Kimi。
 
 对于 DSH，AEC-S 会验证所有直接锁定的 `@deepseek-ai/dsh-*` 软件包，通过 DSH 自己的 Credential seam 查询 `DEEPSEEK_API_KEY` 是否已配置，并分别对 Executor 与 Reviewer composition 执行 stdio JSON-RPC 初始化。两套 composition 均挂载 `dsh-credentials-local`，因此 DSH 已存入 `$DSH_HOME/.credentials.yaml` 的认证可直接复用，无需把 Key 复制到 AEC-S、SQLite、日志或 LaunchAgent plist。`dsh web` 是独立产品进程，既非运行前提，也不会被接管为 Run 进程；AEC-S 为每个活动 Run 启动隔离的 headless DSH 子进程，确保取消一个 Run 不影响其他 Run。
 
@@ -104,9 +104,11 @@ node dist/src/cli.js service status
 node dist/src/cli.js service restart
 ```
 
+`node dist/src/cli.js daemon` 会在前台一并运行 Scheduler、持久化 Outbox 投递和带认证的 HTTP MCP；`node dist/src/cli.js mcp-http` 仅运行 HTTP MCP，供诊断使用；stdio 端点仍为 `node dist/src/cli.js mcp`。
+
 Agent 与 Validation 命令由独立 job supervisor 执行，输出、最终结果和 PID 都落盘；超时会终止整个子进程组。Daemon 重启后会继续等待存活 job，读取已完成 job，或从最近安全阶段恢复。Run 写入由 lease owner 围栏保护，Agent 并发由数据库原子 slot 控制。Commit、Push、PR 和 Merge 均保存确定性 operation ID；`uncertain` 状态先对账，不盲目重试。
 
-LaunchAgent 会保存稳定的后台 `PATH`。健康切换采用防抖：一次失败只记录 degraded 样本，连续失败达到配置阈值后才进入 `unavailable`，恢复也要求连续成功。缺少某个 Runtime 只阻塞依赖它的 Task；等待 Checks、Merge、Human 与稳定性观察不占 Runtime 容量。
+LaunchAgent 会保存稳定的后台 `PATH`，默认覆盖 Homebrew、系统工具、常见用户 bin 目录以及 ChatGPT 内置 Codex。健康切换采用防抖：一次失败只记录 degraded 样本，连续失败达到配置阈值后才进入 `unavailable`，恢复也要求连续成功。缺少某个 Runtime 只阻塞依赖它的 Task；等待 Checks、Merge、Human 与稳定性观察不占 Runtime 容量。
 
 普通 Git、GitHub、验证器启动和其他运行期基础设施错误使用持久化指数退避自动恢复，默认最多重试五次；重试耗尽后才创建 `failure_exhausted` Human Decision。验证命令正常启动后的非零退出仍属于代码 Gate 失败，会进入 Repair；命令本身无法启动属于运维失败，不要求 Agent 修改代码。
 
@@ -188,7 +190,7 @@ WorkBuddy 桌面版可通过其内置 CLI 添加同一个 stdio server（确保�
 http://127.0.0.1:7337/mcp
 ```
 
-该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 保留标准 Streamable HTTP Session，并支持 POST、GET/SSE 和 DELETE 终止。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`。AEC-S 尚未发布 npm 包，因此当前不要在 GUI 中选择 npx。
+该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 最多保留 64 个标准 Streamable HTTP Session，空闲 30 分钟后过期，并支持 POST、GET/SSE 和 DELETE 终止。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`，且不会暴露版本。AEC-S 不通过 npm 包分发，因此不要在 GUI 中选择 npx。
 
 Finding 状态迁移不再接受调用者自报身份。专用 Reviewer MCP 进程必须用 `AEC_S_MCP_ACTOR_AGENT_ID` 绑定一个已启用 Reviewer；共享 daemon 未绑定 Reviewer 时，该工具默认拒绝。Human 方向仍通过 Decision 工具进入，不冒充 Reviewer。
 
@@ -204,7 +206,7 @@ AEC-S 不使用 admin merge，也不绕过 branch protection。真实回归仓�
 
 正式公共模型保留十个顶层实体：Project、Task、TaskRevision、Run、Agent、Workspace、Finding、Decision、OutboxMessage 与 Event。Runtime Session/健康样本保存在 Run/Agent 内，校准、Gate 和控制事实不扩张为组织实体。
 
-只注册用户信任的仓库和命令。Codex 使用显式 workspace-write/read-only。Kimi Executor Session 使用 ACP `auto` 模式，只对位置完整且明确位于 worktree 内的请求签发单次 Permission；位置缺失、为空或在外部时一律拒绝，并持久化 Session ID 供 Repair 恢复。Kimi Review 使用 `plan` 模式且拒绝全部 Permission。DSH Executor 使用 `workspace-write`，Reviewer 不挂载文件工具。Secret 配置、Decision Resolution、Finding/Scope 证据、Outbox、Event 与返回状态会在持久化前被拒绝或脱敏。监督日志、结构化结果、Diff 和内嵌 Reviewer Prompt 均有硬大小上限。
+只注册用户信任的仓库和命令。Codex 使用显式 workspace-write/read-only。Kimi Executor Session 使用 ACP `auto` 模式，只对位置完整且经 realpath 确认位于 worktree 内的请求签发单次 Permission；位置缺失、为空、在外部或通过符号链接逃逸时一律拒绝，并持久化 Session ID 供 Repair 恢复。Kimi Review 使用 `plan` 模式且拒绝全部 Permission。DSH Executor 使用 `workspace-write`，Reviewer 不挂载文件工具。Secret 配置会被拒绝，Decision Resolution、Finding/Scope 证据、Outbox、Event 与返回状态中的已知凭据格式会在持久化前脱敏；这种模式匹配防线不能替代“不要把凭据写入 Task 输入”。监督日志、结构化结果、Diff、Runtime 响应和内嵌 Reviewer Prompt 均有硬大小上限。
 
 Task 要求的 Environment Contract 组件会在 `prepare` 阶段校验注册命令、版本和 Agent 能力。Scope Calibration 与 Progressive DAG Parking 会记录明确的 `observe|enforce` 策略证据；`observe` 下的 Scope Expansion 必须经 Human Decision 才能准入新 Revision。Drift Budget 触发有界同步事件，Validation 生成文件后还会再次检查 Risk Floor。两种模式下，确定性安全不变量始终执行。
 

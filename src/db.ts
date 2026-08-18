@@ -1,4 +1,4 @@
-import { chmodSync } from "node:fs";
+import { chmodSync, existsSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import type {
   Agent,
@@ -52,7 +52,7 @@ function assertNoPersistedSecrets(value: unknown, location: string, rejectEnviro
   }
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (/(?:token|password|secret|api[_-]?key|private[_-]?key|credential)/i.test(key) ||
+    if (/(?:token|password|secret|api[_-]?key|private[_-]?key|credential|authorization)/i.test(key) ||
         (rejectEnvironmentMaps && /^(?:env|environment)$/i.test(key))) {
       throw new Error(`${location}.${key} is secret-bearing configuration and cannot be persisted`);
     }
@@ -103,6 +103,7 @@ export class AecSDatabase {
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate(options.allowLegacyMigration ?? false);
+    this.secureDatabaseFiles();
   }
 
   close(): void {
@@ -131,6 +132,13 @@ export class AecSDatabase {
       throw error;
     } finally {
       this.transactionDepth -= 1;
+      if (outermost) this.secureDatabaseFiles();
+    }
+  }
+
+  private secureDatabaseFiles(): void {
+    for (const path of [this.paths.database, `${this.paths.database}-wal`, `${this.paths.database}-shm`]) {
+      if (existsSync(path)) chmodSync(path, 0o600);
     }
   }
 
@@ -401,7 +409,7 @@ export class AecSDatabase {
 
   createProject(input: ProjectInput): Project {
     input = projectInputSchema.parse(input) as ProjectInput;
-    assertNoPersistedSecrets(input, "project");
+    assertNoPersistedSecrets(input, "project", true);
     const project: Project = {
       id: input.id ?? newId("project"),
       name: input.name,
@@ -472,7 +480,7 @@ export class AecSDatabase {
   updateProject(id: string, patch: ProjectUpdate): Project {
     const current = this.getProject(id);
     if (!current) throw new Error(`Project not found: ${id}`);
-    assertNoPersistedSecrets(patch, "project.update");
+    assertNoPersistedSecrets(patch, "project.update", true);
     if (patch.intent !== undefined && patch.intent !== current.intent && patch.intentVersion !== (current.intentVersion ?? 1) + 1) {
       throw new Error("Changing Project Intent requires intentVersion to increase by exactly one");
     }
@@ -565,7 +573,7 @@ export class AecSDatabase {
 
   createTask(input: TaskInput): Task {
     input = taskInputSchema.parse(input) as TaskInput;
-    assertNoPersistedSecrets(input, "task");
+    assertNoPersistedSecrets(input, "task", true);
     const timestamp = nowIso();
     const revisionId = newId("revision");
     const proposedRiskClass = input.proposedRiskClass ?? "normal";
@@ -619,7 +627,8 @@ export class AecSDatabase {
       updatedAt: timestamp,
       currentRevisionId: revisionId,
     };
-    this.db
+    return this.transaction(() => {
+      this.db
       .prepare(`INSERT INTO tasks (
         id, project_id, title, goal, scope_json, depends_on_json, constraints_json,
         acceptance_json, validation_json, required_caps_json, requires_full, priority,
@@ -672,7 +681,8 @@ export class AecSDatabase {
       type: "task.created",
       payload: { title: task.title },
     });
-    return task;
+      return task;
+    });
   }
 
   getTask(id: string): Task | undefined {
@@ -709,6 +719,32 @@ export class AecSDatabase {
       taskId: id,
       type: "task.status_changed",
       payload: { from: task.status, to: status },
+    });
+  }
+
+  updateTaskStatusUnlessControlled(
+    id: string,
+    status: TaskStatus,
+    extra?: { summary?: string | null; mergeSha?: string | null },
+  ): boolean {
+    return this.transaction(() => {
+      const task = this.getTask(id);
+      if (!task) throw new Error(`Task not found: ${id}`);
+      if (["paused", "cancelled"].includes(task.status)) return false;
+      const updatedAt = nowIso();
+      const summary = extra && Object.hasOwn(extra, "summary") ? extra.summary ?? null : task.terminalSummary ?? null;
+      const mergeSha = extra && Object.hasOwn(extra, "mergeSha") ? extra.mergeSha ?? null : task.mergeSha ?? null;
+      const result = this.db
+        .prepare("UPDATE tasks SET status = ?, terminal_summary = ?, merge_sha = ?, updated_at = ? WHERE id = ? AND status = ?")
+        .run(status, summary, mergeSha, updatedAt, id, task.status);
+      if (result.changes !== 1) return false;
+      this.appendEvent({
+        projectId: task.projectId,
+        taskId: id,
+        type: "task.status_changed",
+        payload: { from: task.status, to: status },
+      });
+      return true;
     });
   }
 
@@ -972,8 +1008,10 @@ export class AecSDatabase {
     const availability = !enabled
       ? "disabled"
       : current.availability === "disabled" && patch.enabled === true ? "registered" : next.availability ?? current.availability;
+    const resetHealth = patch.availability !== undefined;
     this.db.prepare(`UPDATE agents SET roles_json=?, capabilities_json=?, enabled=?, availability=?,
-      max_concurrency=?, config_json=?, runtime_family=?, runtime_capabilities_json=? WHERE id=?`)
+      max_concurrency=?, config_json=?, runtime_family=?, runtime_capabilities_json=?,
+      health_successes=?, health_failures=? WHERE id=?`)
       .run(...([
         JSON.stringify(next.roles ?? current.roles),
         JSON.stringify(next.capabilities ?? current.capabilities),
@@ -983,6 +1021,8 @@ export class AecSDatabase {
         JSON.stringify(next.config ?? current.config),
         next.runtimeFamily ?? current.runtimeFamily,
         JSON.stringify({ ...current.runtimeCapabilities, ...next.runtimeCapabilities }),
+        resetHealth ? 0 : current.healthSuccesses ?? 0,
+        resetHealth ? 0 : current.healthFailures ?? 0,
         id,
       ] as SqlValue[]));
     this.appendEvent({ type: "agent.updated", payload: { agentId: id, fields: Object.keys(patch) } });
@@ -992,7 +1032,7 @@ export class AecSDatabase {
   reserveAgentSlot(agentId: string, runId: string, jobId: string): boolean {
     return this.transaction(() => {
       const agent = this.getAgent(agentId);
-      if (!agent || !agent.enabled || ["registered", "unavailable", "disabled", "offline"].includes(agent.availability)) return false;
+      if (!agent || !agent.enabled || !["available", "busy", "degraded"].includes(agent.availability)) return false;
       const count = Number((this.db.prepare("SELECT COUNT(*) AS count FROM agent_leases WHERE agent_id=?").get(agentId) as Row).count);
       if (count >= agent.maxConcurrency) return false;
       const result = this.db.prepare("INSERT OR IGNORE INTO agent_leases(job_id, agent_id, run_id, created_at) VALUES (?, ?, ?, ?)")
@@ -1187,7 +1227,7 @@ export class AecSDatabase {
   }
 
   getLatestRunForTask(taskId: string): Run | undefined {
-    const row = this.db.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC LIMIT 1").get(taskId) as Row | undefined;
+    const row = this.db.prepare("SELECT * FROM runs WHERE task_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1").get(taskId) as Row | undefined;
     return row ? this.runFromRow(row) : undefined;
   }
 
@@ -1334,7 +1374,8 @@ export class AecSDatabase {
       createdAt: nowIso(),
       ...(input.status === "resolved" ? { resolvedAt: nowIso() } : {}),
     };
-    this.db
+    return this.transaction(() => {
+      this.db
       .prepare(`INSERT INTO decisions(
         id, project_id, task_id, kind, status, title, body, options_json,
         resolution_json, created_at, resolved_at
@@ -1376,7 +1417,8 @@ export class AecSDatabase {
         body: decision.body,
       });
     }
-    return decision;
+      return decision;
+    });
   }
 
   listDecisions(projectId?: string, status?: Decision["status"]): Decision[] {
@@ -1402,25 +1444,27 @@ export class AecSDatabase {
   }
 
   resolveDecision(id: string, resolution: JsonObject): Decision {
-    const decision = this.getDecision(id);
-    if (!decision) throw new Error(`Decision not found: ${id}`);
-    if (decision.status === "resolved") throw new Error(`Decision is already resolved: ${id}`);
-    const resolvedAt = nowIso();
     resolution = redactJson(resolution);
-    const result = this.db
-      .prepare("UPDATE decisions SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ? AND status = 'pending'")
-      .run(JSON.stringify(resolution), resolvedAt, id);
-    if (result.changes !== 1) throw new Error(`Decision is already resolved: ${id}`);
-    this.appendEvent({
-      projectId: decision.projectId,
-      taskId: decision.taskId,
-      type: "decision.resolved",
-      payload: { decisionId: id },
+    return this.transaction(() => {
+      const decision = this.getDecision(id);
+      if (!decision) throw new Error(`Decision not found: ${id}`);
+      if (decision.status === "resolved") throw new Error(`Decision is already resolved: ${id}`);
+      const resolvedAt = nowIso();
+      const result = this.db
+        .prepare("UPDATE decisions SET status = 'resolved', resolution_json = ?, resolved_at = ? WHERE id = ? AND status = 'pending'")
+        .run(JSON.stringify(resolution), resolvedAt, id);
+      if (result.changes !== 1) throw new Error(`Decision is already resolved: ${id}`);
+      this.appendEvent({
+        projectId: decision.projectId,
+        taskId: decision.taskId,
+        type: "decision.resolved",
+        payload: { decisionId: id },
+      });
+      for (const message of this.listOutbox(decision.projectId).filter((item) => item.decisionId === id)) {
+        this.acknowledgeOutbox(message.id);
+      }
+      return this.getDecision(id)!;
     });
-    for (const message of this.listOutbox(decision.projectId).filter((item) => item.decisionId === id)) {
-      this.acknowledgeOutbox(message.id);
-    }
-    return this.getDecision(id)!;
   }
 
   private decisionFromRow(row: Row): Decision {
@@ -1451,7 +1495,8 @@ export class AecSDatabase {
       file: input.file ?? null,
       line: input.line ?? null,
     });
-    const active = this.db.prepare(`SELECT * FROM findings
+    return this.transaction(() => {
+      const active = this.db.prepare(`SELECT * FROM findings
       WHERE signature=? AND task_revision_id=? AND status IN ('structurally_valid','verified')
       ORDER BY updated_at DESC LIMIT 1`).get(signature, input.taskRevisionId) as Row | undefined;
     if (active) return this.findingFromRow(active);
@@ -1485,7 +1530,8 @@ export class AecSDatabase {
       type: dismissed ? "finding.auto_dismissed" : "finding.created",
       payload: { findingId: finding.id, signature },
     });
-    return finding;
+      return finding;
+    });
   }
 
   getFinding(id: string): Finding | undefined {
@@ -1508,35 +1554,38 @@ export class AecSDatabase {
     evidence: string,
     actorAgentId: string,
   ): Finding {
-    const finding = this.getFinding(id);
-    if (!finding) throw new Error(`Finding not found: ${id}`);
-    if (!evidence.trim()) throw new Error("Finding transition requires evidence");
-    const allowed = status === "verified"
-      ? finding.status === "structurally_valid"
-      : status === "dismissed"
-        ? ["structurally_valid", "verified"].includes(finding.status)
-        : finding.status === "verified";
-    if (!allowed) throw new Error(`Invalid Finding transition: ${finding.status} -> ${status}`);
-    const run = this.getRun(finding.runId);
-    if (run?.agentId === actorAgentId && ["dismissed", "resolved"].includes(status)) {
-      throw new Error("Implementer cannot terminate a Finding against its own Run");
-    }
-    const actor = this.getAgent(actorAgentId);
-    if (!actor?.enabled || !actor.roles.includes("reviewer")) {
-      throw new Error("Finding transitions require an enabled Reviewer identity");
-    }
     evidence = redactText(evidence);
-    this.db.prepare(`UPDATE findings SET status=?, evidence=CASE WHEN ?='verified' THEN ? ELSE evidence END,
-      resolution_evidence=CASE WHEN ?!='verified' THEN ? ELSE resolution_evidence END, updated_at=? WHERE id=?`)
-      .run(status, status, evidence, status, evidence, nowIso(), id);
-    this.appendEvent({
-      projectId: finding.projectId,
-      taskId: finding.taskId,
-      runId: finding.runId,
-      type: `finding.${status}`,
-      payload: { findingId: id },
+    return this.transaction(() => {
+      const finding = this.getFinding(id);
+      if (!finding) throw new Error(`Finding not found: ${id}`);
+      if (!evidence.trim()) throw new Error("Finding transition requires evidence");
+      const allowed = status === "verified"
+        ? finding.status === "structurally_valid"
+        : status === "dismissed"
+          ? ["structurally_valid", "verified"].includes(finding.status)
+          : finding.status === "verified";
+      if (!allowed) throw new Error(`Invalid Finding transition: ${finding.status} -> ${status}`);
+      const run = this.getRun(finding.runId);
+      if (run?.agentId === actorAgentId && ["dismissed", "resolved"].includes(status)) {
+        throw new Error("Implementer cannot terminate a Finding against its own Run");
+      }
+      const actor = this.getAgent(actorAgentId);
+      if (!actor?.enabled || !actor.roles.includes("reviewer")) {
+        throw new Error("Finding transitions require an enabled Reviewer identity");
+      }
+      const result = this.db.prepare(`UPDATE findings SET status=?, evidence=CASE WHEN ?='verified' THEN ? ELSE evidence END,
+        resolution_evidence=CASE WHEN ?!='verified' THEN ? ELSE resolution_evidence END, updated_at=? WHERE id=? AND status=?`)
+        .run(status, status, evidence, status, evidence, nowIso(), id, finding.status);
+      if (result.changes !== 1) throw new Error(`Finding changed while applying transition: ${id}`);
+      this.appendEvent({
+        projectId: finding.projectId,
+        taskId: finding.taskId,
+        runId: finding.runId,
+        type: `finding.${status}`,
+        payload: { findingId: id, actorAgentId },
+      });
+      return this.getFinding(id)!;
     });
-    return this.getFinding(id)!;
   }
 
   hasVerifiedBlockingFindings(taskId: string, taskRevisionId?: string): boolean {
@@ -1561,19 +1610,21 @@ export class AecSDatabase {
 
   enqueueOutbox(input: Pick<OutboxMessage, "projectId" | "decisionId" | "dedupeKey" | "channel" | "title" | "body">): OutboxMessage {
     input = redactJson(input);
-    const existing = this.db.prepare("SELECT * FROM outbox_messages WHERE dedupe_key=?").get(input.dedupeKey) as Row | undefined;
-    if (existing) return this.outboxFromRow(existing);
     const message: OutboxMessage = {
       id: newId("outbox"), projectId: input.projectId, ...(input.decisionId ? { decisionId: input.decisionId } : {}),
       dedupeKey: input.dedupeKey, status: "pending", channel: input.channel,
       title: input.title, body: input.body, attempts: 0, createdAt: nowIso(),
     };
-    this.db.prepare(`INSERT INTO outbox_messages(
-      id, project_id, decision_id, dedupe_key, status, channel, title, body, attempts, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .run(message.id, message.projectId, message.decisionId ?? null, message.dedupeKey, message.status,
-        message.channel, message.title, message.body, message.attempts, message.createdAt);
-    return message;
+    return this.transaction(() => {
+      this.db.prepare(`INSERT OR IGNORE INTO outbox_messages(
+        id, project_id, decision_id, dedupe_key, status, channel, title, body, attempts, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        .run(message.id, message.projectId, message.decisionId ?? null, message.dedupeKey, message.status,
+          message.channel, message.title, message.body, message.attempts, message.createdAt);
+      const row = this.db.prepare("SELECT * FROM outbox_messages WHERE dedupe_key=?").get(input.dedupeKey) as Row | undefined;
+      if (!row) throw new Error(`Outbox message could not be persisted: ${input.dedupeKey}`);
+      return this.outboxFromRow(row);
+    });
   }
 
   listOutbox(projectId?: string, pendingOnly = false): OutboxMessage[] {

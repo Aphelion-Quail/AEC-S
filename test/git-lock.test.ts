@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
@@ -29,8 +29,8 @@ test("serializes Project Git sections across AEC-S processes", async () => {
   assert.notEqual(events[0]![0], events[2]![0]);
   const project = { ...projectFor(repo), id: "lock-location" };
   const databasePath = await projectLockDatabasePath(project);
-  assert.equal(databasePath.startsWith(repo), false, "coordination locks must not live in the target repository");
-  assert.equal(existsSync(join(repo, ".git", "aec-s-project-git-lock.sqlite")), false);
+  assert.equal(databasePath, join(realpathSync(join(repo, ".git")), "aec-s-project-git-lock.sqlite"));
+  assert.equal(existsSync(databasePath), true);
 });
 
 function projectFor(repo: string): Project {
@@ -60,4 +60,18 @@ test("releases the in-process queue when file-lock acquisition fails", async () 
     new Promise<string>((_, reject) => setTimeout(() => reject(new Error("second lock attempt deadlocked")), 2_000)),
   ]);
   assert.equal(result, "acquired");
+});
+
+test("releases the in-process queue when file-lock release fails", async () => {
+  const repo = createGitRepository();
+  const project: Project = { ...projectFor(repo), id: "release-failure" };
+  const databasePath = await projectLockDatabasePath(project);
+  await assert.rejects(withProjectGitLock(project, async () => {
+    unlinkSync(databasePath);
+  }));
+  const result = await Promise.race([
+    withProjectGitLock(project, async () => "recovered"),
+    new Promise<string>((_, reject) => setTimeout(() => reject(new Error("release failure deadlocked the queue")), 2_000)),
+  ]);
+  assert.equal(result, "recovered");
 });

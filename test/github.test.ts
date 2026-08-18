@@ -49,6 +49,7 @@ if (args[0] === 'pr' && args[1] === 'list') {
   } else if (state.checks === 1) {
     write({ ...state, checks: 2 });
     process.stdout.write(JSON.stringify([{ name: 'test', state: 'FAILURE', bucket: 'fail' }]));
+    process.exit(1);
   } else {
     process.stdout.write(JSON.stringify([{ name: 'test', state: 'SUCCESS', bucket: 'pass' }]));
   }

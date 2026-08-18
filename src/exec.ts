@@ -1,10 +1,22 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 import type { CommandSpec } from "./types.js";
 
 const MAX_CAPTURED_CHARACTERS = 8 * 1024 * 1024;
+
+function killProcessTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  if (child.pid && process.platform !== "win32") {
+    try {
+      process.kill(-child.pid, signal);
+      return;
+    } catch {
+      // Fall through to the direct child when the process group is gone.
+    }
+  }
+  child.kill(signal);
+}
 
 export type ExecResult = {
   exitCode: number | null;
@@ -20,14 +32,17 @@ export async function execCommand(command: CommandSpec, stdin?: string): Promise
       cwd: command.cwd,
       env: { ...process.env, ...command.env },
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     });
     let stdout = "";
     let stderr = "";
     let timedOut = false;
+    let forceKill: NodeJS.Timeout | undefined;
     const timeout = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      killProcessTree(child, "SIGTERM");
+      forceKill = setTimeout(() => killProcessTree(child, "SIGKILL"), 2_000);
+      forceKill.unref();
     }, (command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
     child.stdout.setEncoding("utf8");
@@ -36,10 +51,13 @@ export async function execCommand(command: CommandSpec, stdin?: string): Promise
     child.stderr.on("data", (chunk: string) => (stderr = appendBounded(stderr, chunk)));
     child.on("error", (error) => {
       clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
       reject(error);
     });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      killProcessTree(child, "SIGKILL");
       resolve({ exitCode, signal, stdout, stderr, timedOut });
     });
     if (stdin !== undefined) child.stdin.end(stdin);
@@ -52,15 +70,18 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
     cwd: command.cwd,
     env: { ...process.env, ...command.env },
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32",
   });
   const output = createWriteStream(outputPath, { mode: 0o600 });
   let stderr = "";
   let outputBytes = 0;
   let timedOut = false;
+  let forceKill: NodeJS.Timeout | undefined;
   const timeout = setTimeout(() => {
     timedOut = true;
-    child.kill("SIGTERM");
-    setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+    killProcessTree(child, "SIGTERM");
+    forceKill = setTimeout(() => killProcessTree(child, "SIGKILL"), 2_000);
+    forceKill.unref();
   }, (command.timeoutSeconds ?? 300) * 1_000);
   timeout.unref();
   child.stderr.setEncoding("utf8");
@@ -68,11 +89,14 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
   const completed = new Promise<ExecResult>((resolve, reject) => {
     child.on("error", (error) => {
       clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
       output.destroy(error);
       reject(error);
     });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timeout);
+      if (forceKill) clearTimeout(forceKill);
+      killProcessTree(child, "SIGKILL");
       resolve({ exitCode, signal, stdout: "", stderr, timedOut });
     });
   });
@@ -86,8 +110,9 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
   const writing = pipeline(child.stdout, limiter, output).then(
     () => undefined,
     (error: unknown) => {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      killProcessTree(child, "SIGTERM");
+      forceKill = setTimeout(() => killProcessTree(child, "SIGKILL"), 2_000);
+      forceKill.unref();
       return error instanceof Error ? error : new Error(String(error));
     },
   );

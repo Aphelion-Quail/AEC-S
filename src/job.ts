@@ -60,11 +60,9 @@ export async function runJobFile(inputPath: string): Promise<void> {
       detached: process.platform !== "win32",
     });
     let timedOut = false;
-    let cancellationRequested = false;
     let terminateTree: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     const forwardCancellation = (): void => {
-      cancellationRequested = true;
       // Signal the controlled Runtime entrypoint first so protocol-aware
       // adapters can issue session/cancel or close their composition cleanly.
       // A bounded process-group kill remains the deterministic backstop.
@@ -122,9 +120,9 @@ export async function runJobFile(inputPath: string): Promise<void> {
       // while descendants remain in the detached process group. Clearing the
       // timers without this final sweep would let those descendants outlive a
       // completed cancellation result and continue mutating the workspace.
-      if (cancellationRequested) {
-        killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
-      }
+      // A Runtime is not allowed to leave detached helpers behind after its
+      // entrypoint has completed, even on the nominal success path.
+      killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
@@ -168,6 +166,7 @@ export function processAlive(pid: number, inspector: ProcessInspector = inspectP
   try {
     process.kill(pid, 0);
   } catch {
+    processStateCache.delete(pid);
     return false;
   }
   const useCache = inspector === inspectProcess;
@@ -187,7 +186,13 @@ export function processAlive(pid: number, inspector: ProcessInspector = inspectP
       ? true
       : !state.startsWith("Z");
   }
-  if (useCache) processStateCache.set(pid, { checkedAt: Date.now(), alive });
+  if (useCache) {
+    if (processStateCache.size >= 1_024 && !processStateCache.has(pid)) {
+      const oldest = processStateCache.keys().next().value as number | undefined;
+      if (oldest !== undefined) processStateCache.delete(oldest);
+    }
+    processStateCache.set(pid, { checkedAt: Date.now(), alive });
+  }
   return alive;
 }
 

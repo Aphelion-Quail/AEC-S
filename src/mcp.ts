@@ -183,9 +183,12 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
   if (!Number.isInteger(port) || port < 0 || port > 65_535) {
     throw new Error(`Invalid MCP HTTP port: ${port}`);
   }
+  process.env.NODE_ENV ??= "production";
   const app = createMcpExpressApp({ host: MCP_HTTP_HOST });
   const expectedToken = options.token ?? readMcpHttpToken(db.paths);
-  const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport }>();
+  const sessions = new Map<string, { server: McpServer; transport: StreamableHTTPServerTransport; lastUsedAt: number }>();
+  const sessionTtlMs = 30 * 60 * 1_000;
+  const maxSessions = 64;
 
   const authorized = (request: IncomingMessage, response: ServerResponse): boolean => {
     const supplied = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1] ?? "";
@@ -203,15 +206,38 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
 
   const sessionFor = (request: IncomingMessage) => {
     const value = request.headers["mcp-session-id"];
-    return typeof value === "string" ? sessions.get(value) : undefined;
+    const session = typeof value === "string" ? sessions.get(value) : undefined;
+    if (session) session.lastUsedAt = Date.now();
+    return session;
+  };
+
+  const pruneSessions = async (): Promise<void> => {
+    const expired = [...sessions.entries()]
+      .filter(([, session]) => Date.now() - session.lastUsedAt > sessionTtlMs)
+      .map(([id]) => id);
+    while (sessions.size - expired.length >= maxSessions) {
+      const oldest = [...sessions.entries()]
+        .filter(([id]) => !expired.includes(id))
+        .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)[0];
+      if (!oldest) break;
+      expired.push(oldest[0]);
+    }
+    await Promise.allSettled(expired.map(async (id) => {
+      const session = sessions.get(id);
+      sessions.delete(id);
+      if (!session) return;
+      await session.transport.close();
+      await session.server.close();
+    }));
   };
 
   app.get("/healthz", (_request: IncomingMessage, response: ServerResponse) => {
-    jsonResponse(response, 200, { status: "ok", service: "aec-s-mcp", version: aecSVersion() });
+    jsonResponse(response, 200, { status: "ok", service: "aec-s-mcp" });
   });
   app.post("/mcp", async (request: ParsedHttpRequest, response: ServerResponse) => {
     if (!authorized(request, response)) return;
     try {
+      await pruneSessions();
       let session = sessionFor(request);
       if (!session && isInitializeRequest(request.body)) {
         const server = createAecSMcpServer(db, options.actorAgentId);
@@ -219,13 +245,13 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           enableJsonResponse: true,
-          onsessioninitialized: (sessionId) => { sessions.set(sessionId, { server, transport }); },
+          onsessioninitialized: (sessionId) => { sessions.set(sessionId, { server, transport, lastUsedAt: Date.now() }); },
         });
         transport.onclose = () => {
           if (transport.sessionId) sessions.delete(transport.sessionId);
         };
         await server.connect(transport);
-        session = { server, transport };
+        session = { server, transport, lastUsedAt: Date.now() };
       }
       if (!session) {
         jsonResponse(response, 400, { jsonrpc: "2.0", error: { code: -32000, message: "Invalid or missing MCP session" }, id: null });
