@@ -6,7 +6,7 @@
 
 AEC-S is a local control plane for multi-agent software engineering collaboration. Agents reason, implement, and review; AEC-S persists engineering state, isolates workspaces, enforces authoritative gates, and reconciles Git and GitHub side effects.
 
-This repository implements the complete planned MVP: SQLite state, immutable task DAGs, Codex and generic command adapters, parallel worktrees, scoped validation, independent review and repair, restart recovery, MCP, human decision entry points, and GitHub PR/check/squash-merge delivery.
+This repository is the AEC-S 1.0 release-candidate implementation. Codex, Kimi Code CLI, and DeepSeek Harness are first-class runtimes; the generic command adapter remains available but does not count as heterogeneous scheduling proof. The version remains `0.9.0-rc.1` until the maintainer-only three-runtime live gate produces a fully passing sanitized report.
 
 ## Core invariants
 
@@ -23,7 +23,9 @@ This repository implements the complete planned MVP: SQLite state, immutable tas
 - macOS (the LaunchAgent service is macOS-only)
 - Node.js 26+
 - Git
-- Codex CLI (for real agent tasks)
+- Codex CLI
+- Kimi Code CLI (AEC-S also searches the official `~/.kimi-code/bin/kimi` location)
+- DeepSeek authentication managed by DSH (inherited environment or its owner-only credential store) and the pinned DSH `0.1.0-rc.6` composition
 - GitHub CLI `gh` (for GitHub delivery)
 
 Install and verify:
@@ -32,10 +34,21 @@ Install and verify:
 npm install
 npm run build
 npm test
+node dist/src/cli.js init
 node dist/src/cli.js doctor
 ```
 
 The default state directory is `~/Library/Application Support/AEC-S`. Set `AEC_S_HOME` to use a separate directory. It contains `aec-s.db`, run logs and envelopes, and worktrees.
+
+### Runtime detection
+
+`aec-s init` does not treat “executable found” as “ready.” It reports four independent facts for every Runtime: installation, authentication, SDK/protocol compatibility, and visibility from the AEC-S background process. A successful login is never converted into a “please log in again” message merely because a later compatibility check failed.
+
+For Codex, AEC-S searches `PATH` plus the system and per-user macOS application locations used by ChatGPT.app and Codex.app. A bundled Codex therefore does not require a shell symlink or a manually edited `PATH`.
+
+For Kimi, AEC-S searches `PATH` and `~/.kimi-code/bin/kimi`, checks provider metadata without reading or printing tokens, and then negotiates Runtime capabilities. The primary transport is ACP over stdio through the pinned official ACP TypeScript SDK. The readiness probe exercises initialize, Session create/delete, and load/resume; it separately records negotiated cancel/stream support and the available `plan`/`auto` modes. Actual cancel, streaming, resume, and permissions are exercised by protocol regression tests and the maintainer-only live gate—not overstated as work performed by the readiness probe itself. The older Agent SDK wire remains available only through explicit `transport: "agent_sdk_wire"`; AEC-S never silently changes transport after an ACP failure. `stream-json` prompt mode is diagnostic only, and the generic command Adapter never counts as Kimi.
+
+For DSH, AEC-S verifies every directly pinned `@deepseek-ai/dsh-*` package, asks DSH's own credential seam whether `DEEPSEEK_API_KEY` is configured, and initializes both the Executor and Reviewer compositions over stdio JSON-RPC. The compositions mount `dsh-credentials-local`, so an authentication already stored by DSH in `$DSH_HOME/.credentials.yaml` is reused without copying the key into AEC-S, SQLite, logs, or the LaunchAgent plist. `dsh web` is an independent product process and is neither required nor adopted as a Run process; AEC-S intentionally launches one isolated headless DSH child per active Run so cancelling one Run cannot affect another.
 
 ## Shortest local loop
 
@@ -52,26 +65,26 @@ node dist/src/cli.js run
 node dist/src/cli.js status example-project
 ```
 
-Task definitions are immutable after submission. To change direction, cancel the old task and submit a new task with `replacesTaskId`.
+Task identity is immutable after submission. Execution assumptions change only through an increasing `TaskRevision`; deterministic Scope Expansion creates a new Revision and recalculates risk and gates. Direction changes still use a replacement Task.
 
 ## Scheduling and validation
 
-Scheduling considers only roles, required capabilities, availability, and current load. Global concurrency defaults to 2, project concurrency is limited by `maxConcurrency`, and a project's Git publishing section is always serialized.
+Scheduling uses only reproducible facts: role and required capabilities, runtime protocol capabilities, health/availability, free slots, normalized load, longest-unassigned time, and stable ID. It never uses model scoring, self-recommendation, or an AI router.
 
 Two tasks run concurrently only when their scopes can be proven disjoint:
 
 ```text
-A.write ∩ (B.write ∪ B.impact) = ∅
-B.write ∩ (A.write ∪ A.impact) = ∅
+A.write ∩ (B.write ∪ B.watch) = ∅
+B.write ∩ (A.write ∪ A.watch) = ∅
 ```
 
-Task input must explicitly provide `writeGlobs` and `impactGlobs`. An empty `writeGlobs` means the scope cannot be determined, so execution is conservatively serialized and full validation is triggered. An explicitly empty `impactGlobs` means the submitter confirms that there is no additional impact scope. Workers may debug freely and run exploratory tests during execution; AEC-S recognizes only the following commands as authoritative gates:
+Task input must explicitly provide `writeGlobs` and `watchGlobs`. `impactGlobs` is accepted only as pre-1.0 compatibility input and is never emitted. An empty `writeGlobs` remains conservatively serialized and fully validated. Workers may run exploratory tests; only registered commands are authoritative gates:
 
 1. Project `defaultValidation`
 2. Task `validationCommands`
 3. Project `fullValidation` when its conditions are met
 
-The MVP intentionally supports a restricted glob subset: `*` matches any characters within one path segment, `?` matches one non-`/` character, and `**` may cross path segments. Character classes and braces have no expansion semantics. Every pattern must be repository-relative. If AEC-S cannot prove two patterns disjoint, it conservatively serializes the tasks.
+AEC-S 1.0 intentionally supports a restricted glob subset: `*` matches any characters within one path segment, `?` matches one non-`/` character, and `**` may cross path segments. Character classes and braces have no expansion semantics. Every pattern must be repository-relative. If AEC-S cannot prove two patterns disjoint, it conservatively serializes the tasks.
 
 When the target branch changes during task execution, AEC-S compares `oldBase..newBase` only at the publishing boundary. Unrelated changes reuse existing validation and review results. Related changes rerun only that task's authoritative validation and review. Conflicts enter repair.
 
@@ -93,7 +106,7 @@ node dist/src/cli.js service restart
 
 Agent and validation commands run under an independent job supervisor. Output, final results, and PIDs are persisted; timeouts terminate the entire child process group. After a daemon restart, AEC-S waits for a live job, consumes a completed job, or resumes from the latest safe phase. Run writes are fenced by lease ownership, and agent concurrency is controlled by atomic database slots. Commit, push, PR, and merge operations use deterministic operation IDs. An `uncertain` operation is reconciled instead of blindly retried.
 
-The LaunchAgent stores a stable background `PATH` covering Homebrew, system tools, common user bins, and ChatGPT's bundled Codex by default. Set `AEC_S_SERVICE_PATH` before installation to override it. The daemon periodically probes enabled agents: a failed probe marks an agent `degraded`, recovery marks it `available` again, and an explicitly `offline` agent is never changed automatically.
+The LaunchAgent stores a stable background `PATH` covering Homebrew, system tools, common user bins, and ChatGPT's bundled Codex by default. Health transitions are debounced: one failure records degradation, while the configured consecutive threshold is required before `unavailable`; recovery is also consecutive. A missing runtime blocks only tasks that require it. Checks, merge, Human input, and stability observation do not occupy runtime capacity.
 
 Ordinary Git, GitHub, validator-launch, and other runtime infrastructure failures use persistent exponential backoff, with five attempts by default. A `failure_exhausted` human decision is created only after retries are exhausted. A nonzero exit after a validation command starts normally remains a code-gate failure and enters repair; failure to launch the command is an operational failure and does not ask an agent to change code.
 
@@ -101,6 +114,7 @@ Ordinary Git, GitHub, validator-launch, and other runtime infrastructure failure
 
 ```text
 aec-s project add|list|show|update [...]
+aec-s project import <path> [--apply]
 aec-s agent add|list|show|update [...]
 aec-s status [project-id]
 aec-s graph submit <graph.json>
@@ -111,6 +125,7 @@ aec-s decision show <decision-id>
 aec-s decision resolve <decision-id> <resolution.json>
 aec-s decision record <decision.json>
 aec-s doctor
+aec-s init [--no-service]
 ```
 
 Example human resolution:
@@ -129,7 +144,7 @@ stdio server:
 node /absolute/path/to/AEC-S/dist/src/cli.js mcp
 ```
 
-It exposes six tools:
+It exposes eleven tools:
 
 - `aec_s_status`
 - `aec_s_submit_task_graph`
@@ -137,6 +152,11 @@ It exposes six tools:
 - `aec_s_list_decisions`
 - `aec_s_resolve_decision`
 - `aec_s_record_decision`
+- `aec_s_list_findings`
+- `aec_s_transition_finding`
+- `aec_s_expand_task_scope`
+- `aec_s_poll_outbox`
+- `aec_s_acknowledge_outbox`
 
 Example configuration for a generic MCP client:
 
@@ -168,7 +188,9 @@ If the WorkBuddy GUI connector accepts only HTTP or npx, use the local Streamabl
 http://127.0.0.1:7337/mcp
 ```
 
-The endpoint listens only on loopback and is not exposed to the LAN or internet. Set `AEC_S_MCP_HTTP_PORT` to change the port, then rerun `aec-s service install` so the LaunchAgent persists the new environment setting. The health endpoint is `http://127.0.0.1:7337/healthz`. AEC-S is not published as an npm package, so do not select npx in the GUI at this time.
+The endpoint listens only on loopback and requires `Authorization: Bearer <token>` on every MCP request. `aec-s init` creates the token at `$AEC_S_HOME/mcp-http.token` with mode `0600`; configure it only in a client's secret/header field and never copy it into a repository, log, or task input. Clients that cannot set an HTTP header must use the stdio configuration above. The server keeps standard Streamable HTTP sessions and supports POST, GET/SSE, and DELETE termination. Set `AEC_S_MCP_HTTP_PORT` to change the port, then rerun `aec-s service install`. The unauthenticated health endpoint is `http://127.0.0.1:7337/healthz`. AEC-S is not published as an npm package, so do not select npx in the GUI.
+
+Finding transitions do not accept a caller-supplied identity. A dedicated reviewer MCP process must bind an enabled Reviewer with `AEC_S_MCP_ACTOR_AGENT_ID`; the shared daemon endpoint fails closed for this tool when no reviewer identity is bound. Human direction continues through Decision tools rather than impersonating a Reviewer.
 
 WorkBuddy converts natural language into a structured task DAG, directive, or resolution. A minimal escalation integration can periodically call `aec_s_list_decisions(status="pending")`, deduplicate human notifications by decision ID, and return the decision through `aec_s_resolve_decision`. AEC-S does not need chat history as engineering memory.
 
@@ -180,9 +202,13 @@ AEC-S does not use admin merge or bypass branch protection. Create real regressi
 
 ## Data and security boundaries
 
-The MVP has seven entities: Project, Task, Run, Agent, Workspace, Event, and Decision. Validation, review, artifact paths, and external effect states are stored in the Run. Events are audit records, not an event-sourcing mechanism.
+The public model has ten top-level entities: Project, Task, TaskRevision, Run, Agent, Workspace, Finding, Decision, OutboxMessage, and Event. Runtime sessions and health samples remain inside Run and Agent; calibration, gate, and control facts do not become organizational entities.
 
-Register only repositories and commands you trust. Git worktrees provide write isolation, not a security sandbox. Codex executors and repair agents use an explicit workspace-write mode and workspace cwd; reviewers use read-only mode. Reviewers receive a separately generated context, validation, and diff package, and AEC-S rejects a review adapter that changes the workspace. A generic command adapter remains a user-registered trusted executable. The MVP does not include containers, multi-host execution, A2A, an AI router, agent scoring, or advanced semantic scope analysis.
+Register only repositories and commands you trust. Codex uses explicit workspace-write/read-only modes. Kimi Executor Sessions use ACP `auto` mode, grant only one-shot permission responses with complete worktree-local locations, and persist the Session ID for repair; missing, empty, or external locations are rejected. Kimi Review uses `plan` mode and rejects every permission request. DSH Executor uses `workspace-write`; its Reviewer has no file tools. Secret-bearing configuration, Decision resolution, Finding/Scope evidence, Outbox content, Events, and returned state are rejected or redacted before persistence. Supervised logs, structured results, diffs, and embedded Reviewer prompts have hard size limits.
+
+Required Environment Contract components are verified in `prepare`, including registered commands, versions, and Agent capabilities. Scope Calibration and Progressive DAG Parking emit explicit `observe|enforce` policy evidence; an observed Scope Expansion requires a Human Decision before a new Revision is admitted. Drift budgets trigger a bounded synchronization event, and generated files are checked against the Risk Floor again after validation. Deterministic safety invariants remain active in both modes.
+
+A Task becomes `succeeded` only after merge, registered post-merge smoke, and the configured stability observation window. Smoke failure parks local work unless automatic-revert safety is completely proven and explicitly enforced.
 
 Status queries return only each task's latest run and recent events so that front agents do not load full history. The daemon retains the most recent 50,000 rows in the Event table. Complete Run records remain persisted as engineering facts and are not silently deleted.
 
@@ -194,11 +220,12 @@ npm run lint
 npm test
 npm run test:coverage
 npm run test:all
+npm run test:runtimes:live
 ```
 
-`test:all` builds once, then runs lint, strict type checking, the dependency-license policy, and thresholded coverage tests (lines 80%, branches 65%, functions 80%). The license policy rejects missing, unknown, copyleft, and otherwise unreviewed dependency licenses. GitHub Actions runs the same gate and a production dependency audit on macOS with Node 26.
+`test:all` runs lint, strict type checking, license policy, and thresholded coverage. GitHub Actions uses protocol substitutes and no real credentials. `test:runtimes:live` is maintainer-only, requires `AEC_S_LIVE_RUNTIME_CONFIRM=1`, and writes a sanitized report containing only versions, scenario IDs, PASS/FAIL, time, and schema version.
 
-Tests cover persistence of all seven entities, scope-conflict analysis, special Git paths, ordinary tasks avoiding full validation, high-risk full validation, same-project concurrency and `HEAD` changes, paused scheduling, independent review, validation/review repair, agent rotation, supervisor recovery, cross-process run/project Git exclusion, timed-out process termination, real calls to all six MCP tools, and an idempotent push/PR/check/repair/merge loop using a fake `gh`.
+Tests cover the formal ten-entity projection, Task Revision and Finding evidence, deterministic scheduling and health debounce, scope conflict, validation/review repair, supervisor recovery, post-merge convergence, all eleven MCP tools, and idempotent Git/GitHub effects. The live gate separately proves real Codex/Kimi/DSH execution, review, repair/resume, cancellation isolation, and health thresholds.
 
 ## License and maintenance
 

@@ -1,13 +1,24 @@
 import { join } from "node:path";
 import type { AecSDatabase } from "./db.js";
-import type { Project, Run, Task, Workspace } from "./types.js";
+import type { Project, Run, Task, TaskRevision, Workspace } from "./types.js";
 import { writeJsonAtomic } from "./files.js";
 import { redactJson } from "./redaction.js";
 
 export type ContextEnvelope = {
-  project: { id: string; name: string; intent: string; targetBranch: string };
+  project: {
+    id: string;
+    name: string;
+    intent: string;
+    intentVersion: number;
+    targetBranch: string;
+    environmentContract: Project["environmentContract"];
+    controlPolicy: Project["controlPolicy"];
+  };
   task: Task;
+  taskRevision?: TaskRevision;
+  contextFingerprint?: string;
   decisions: unknown[];
+  findings: unknown[];
   dependencies: Array<{ taskId: string; status: string; summary?: string; mergeSha?: string }>;
   workspace: { path: string; branch: string; baseSha: string };
   validation: Run["validation"];
@@ -27,6 +38,9 @@ export function buildContextEnvelope(
   const decisions = db
     .listDecisions(project.id, "resolved")
     .filter((decision) => !decision.taskId || decision.taskId === task.id || explicit.has(decision.id));
+  const taskRevision = task.currentRevisionId ? db.getTaskRevision(task.currentRevisionId) : undefined;
+  const findings = db.listFindings(task.id).filter((finding) =>
+    finding.status === "verified" || finding.status === "structurally_valid");
   const dependencies = task.dependsOn.map((taskId) => {
     const dependency = db.getTask(taskId);
     return {
@@ -37,9 +51,19 @@ export function buildContextEnvelope(
     };
   });
   const envelope: ContextEnvelope = {
-    project: { id: project.id, name: project.name, intent: project.intent, targetBranch: project.targetBranch },
+    project: {
+      id: project.id,
+      name: project.name,
+      intent: project.intent,
+      intentVersion: project.intentVersion ?? 1,
+      targetBranch: project.targetBranch,
+      environmentContract: redactJson(project.environmentContract),
+      controlPolicy: redactJson(project.controlPolicy),
+    },
     task: redactJson(task),
+    ...(taskRevision ? { taskRevision: redactJson(taskRevision), contextFingerprint: taskRevision.contextFingerprint } : {}),
     decisions: redactJson(decisions),
+    findings: redactJson(findings),
     dependencies,
     workspace: { path: workspace.path, branch: workspace.branch, baseSha: workspace.baseSha },
     validation: redactJson(options.reviewer

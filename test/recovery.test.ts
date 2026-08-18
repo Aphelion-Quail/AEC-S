@@ -198,7 +198,11 @@ test("two AEC-S processes cannot execute the same Run concurrently", async () =>
 test("reconciles a local merge completed before its effect was persisted", async () => {
   const fixture = await prepareExternallyMergedRun("active", "merge");
   await fixture.engine.runTask(fixture.task.id);
-  assert.equal(fixture.db.getTask(fixture.task.id)?.status, "succeeded");
+  assert.equal(
+    fixture.db.getTask(fixture.task.id)?.status,
+    "succeeded",
+    JSON.stringify(fixture.db.getLatestRunForTask(fixture.task.id)?.error),
+  );
   assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.effects.merge?.externalRef, fixture.commitSha);
   assert.equal(fixture.db.getLatestRunForTask(fixture.task.id)?.status, "completed");
   fixture.db.close();

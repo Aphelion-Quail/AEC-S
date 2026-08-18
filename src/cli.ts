@@ -8,6 +8,9 @@ import { runJobFile } from "./job.js";
 import { serveMcp, serveMcpHttp } from "./mcp.js";
 import { doctor } from "./doctor.js";
 import { serviceAction } from "./service.js";
+import { systemOutboxLoop } from "./outbox.js";
+import { initializeAecS, inspectProject } from "./onboarding.js";
+import { redactText } from "./redaction.js";
 import {
   agentInputSchema,
   agentUpdateSchema,
@@ -30,6 +33,7 @@ function output(value: unknown): void {
 function usage(): never {
   process.stderr.write(`AEC-S commands:
   aec-s project <add|list|show|update> [...]
+  aec-s project import <path> [--apply]
   aec-s agent <add|list|show|update> [...]
   aec-s graph submit <graph.json>
   aec-s run [task-id]
@@ -40,6 +44,7 @@ function usage(): never {
   aec-s decision <list|show|resolve|record> [...]
   aec-s service <install|start|stop|restart|status|uninstall>
   aec-s doctor
+  aec-s init [--no-service]
   aec-s mcp
   aec-s mcp-http
 `);
@@ -51,6 +56,10 @@ async function main(): Promise<void> {
   if (command === "internal-job") {
     if (!subcommand) usage();
     await runJobFile(subcommand);
+    return;
+  }
+  if (command === "init") {
+    output(await initializeAecS({ installService: !process.argv.slice(2).includes("--no-service") }));
     return;
   }
   const db = new AecSDatabase();
@@ -70,6 +79,14 @@ async function main(): Promise<void> {
       output(project);
     } else if (command === "project" && subcommand === "update") {
       output(db.updateProject(args[0] ?? usage(), projectUpdateSchema.parse(readInput(args[1] ?? usage()))));
+    } else if (command === "project" && subcommand === "import") {
+      const inspected = await inspectProject(args[0] ?? usage());
+      if (args.includes("--apply")) {
+        await assertGitRepository(inspected.project.repoPath);
+        output({ ...inspected, project: db.createProject(projectInputSchema.parse(inspected.project)) });
+      } else {
+        output(inspected);
+      }
     } else if (command === "agent" && subcommand === "add") {
       output(db.createAgent(agentInputSchema.parse(readInput(args[0] ?? usage()))));
     } else if (command === "agent" && subcommand === "list") {
@@ -91,10 +108,20 @@ async function main(): Promise<void> {
       const controller = new AbortController();
       process.on("SIGTERM", () => controller.abort());
       process.on("SIGINT", () => controller.abort());
-      await Promise.all([
+      const services = [
         engine.daemon(controller.signal),
         serveMcpHttp(db, { signal: controller.signal }),
-      ]);
+        systemOutboxLoop(db, controller.signal),
+      ];
+      const first = await Promise.race(services.map(async (service) => {
+        try { await service; return { ok: true as const }; }
+        catch (error) { return { ok: false as const, error }; }
+      }));
+      const requestedStop = controller.signal.aborted;
+      controller.abort();
+      await Promise.allSettled(services);
+      if (!first.ok) throw first.error;
+      if (!requestedStop) throw new Error("An AEC-S daemon component stopped unexpectedly");
     } else if (command === "status") {
       output(db.statusSnapshot(subcommand));
     } else if (command === "task" && ["pause", "resume", "cancel"].includes(subcommand ?? "")) {
@@ -132,6 +159,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.stack ?? error.message : String(error)}\n`);
+  process.stderr.write(`${redactText(error instanceof Error ? error.message : String(error))}\n`);
   process.exitCode = 1;
 });

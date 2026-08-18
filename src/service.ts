@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, realpathSync, unlinkSync, writeFileSync } from "
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { execCommand } from "./exec.js";
+import type { ExecResult } from "./exec.js";
 import type { AecSPaths } from "./paths.js";
 
 const LABEL = "dev.aec-s.core";
@@ -33,6 +34,12 @@ export function launchAgentPlist(
   const mcpPortEnvironment = mcpHttpPort
     ? `\n    <key>AEC_S_MCP_HTTP_PORT</key><string>${xml(mcpHttpPort)}</string>`
     : "";
+  const runtimeHomeEnvironment = [
+    ["DSH_HOME", process.env.DSH_HOME?.trim()],
+    ["KIMI_SHARE_DIR", process.env.KIMI_SHARE_DIR?.trim()],
+  ].filter((entry): entry is [string, string] => Boolean(entry[1]))
+    .map(([key, value]) => `\n    <key>${key}</key><string>${xml(value)}</string>`)
+    .join("");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -44,7 +51,8 @@ export function launchAgentPlist(
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>AEC_S_HOME</key><string>${xml(paths.home)}</string>
-    <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}
+    <key>HOME</key><string>${xml(homedir())}</string>
+    <key>PATH</key><string>${xml(runtimePath)}</string>${mcpPortEnvironment}${runtimeHomeEnvironment}
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -62,38 +70,47 @@ function xml(value: string): string {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
-export async function serviceAction(action: "install" | "start" | "stop" | "restart" | "status" | "uninstall", paths: AecSPaths): Promise<string> {
-  const plist = plistPath();
+export async function serviceAction(
+  action: "install" | "start" | "stop" | "restart" | "status" | "uninstall",
+  paths: AecSPaths,
+  options: {
+    execute?: (command: Parameters<typeof execCommand>[0]) => Promise<ExecResult>;
+    plist?: string;
+    entry?: string;
+  } = {},
+): Promise<string> {
+  const plist = options.plist ?? plistPath();
+  const execute = options.execute ?? execCommand;
   const domain = `gui/${process.getuid?.() ?? 0}`;
   if (action === "install") {
-    const entry = process.env.AEC_S_CLI_ENTRY ?? process.argv[1];
+    const entry = options.entry ?? process.env.AEC_S_CLI_ENTRY ?? process.argv[1];
     if (!entry) throw new Error("Unable to locate AEC-S CLI entry");
     mkdirSync(join(homedir(), "Library", "LaunchAgents"), { recursive: true });
     const content = launchAgentPlist(entry, paths);
     writeFileSync(plist, content, { mode: 0o600 });
-    await execCommand({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
-    const loaded = await execCommand({ program: "launchctl", args: ["bootstrap", domain, plist], timeoutSeconds: 30 });
+    await execute({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
+    const loaded = await execute({ program: "launchctl", args: ["bootstrap", domain, plist], timeoutSeconds: 30 });
     if (loaded.exitCode !== 0) throw new Error(loaded.stderr.trim() || "launchctl bootstrap failed");
     return `Installed and started ${LABEL}`;
   }
   if (action === "uninstall") {
-    await execCommand({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
+    await execute({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
     if (existsSync(plist)) unlinkSync(plist);
     return `Uninstalled ${LABEL}`;
   }
   if (action === "start") {
-    const result = await execCommand({ program: "launchctl", args: ["bootstrap", domain, plist], timeoutSeconds: 30 });
+    const result = await execute({ program: "launchctl", args: ["bootstrap", domain, plist], timeoutSeconds: 30 });
     if (result.exitCode !== 0 && !result.stderr.includes("already loaded")) throw new Error(result.stderr.trim());
     return `Started ${LABEL}`;
   }
   if (action === "stop") {
-    await execCommand({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
+    await execute({ program: "launchctl", args: ["bootout", domain, plist], timeoutSeconds: 30 });
     return `Stopped ${LABEL}`;
   }
   if (action === "restart") {
-    await execCommand({ program: "launchctl", args: ["kickstart", "-k", `${domain}/${LABEL}`], timeoutSeconds: 30 });
+    await execute({ program: "launchctl", args: ["kickstart", "-k", `${domain}/${LABEL}`], timeoutSeconds: 30 });
     return `Restarted ${LABEL}`;
   }
-  const result = await execCommand({ program: "launchctl", args: ["print", `${domain}/${LABEL}`], timeoutSeconds: 30 });
+  const result = await execute({ program: "launchctl", args: ["print", `${domain}/${LABEL}`], timeoutSeconds: 30 });
   return result.exitCode === 0 ? result.stdout.trim() : `Not running: ${result.stderr.trim()}`;
 }

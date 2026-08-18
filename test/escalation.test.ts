@@ -34,6 +34,8 @@ test("creates a Human decision only after Agent repair options are exhausted", a
   assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
   const [decision] = db.listDecisions(project.id, "pending");
   assert.equal(decision?.kind, "failure_exhausted");
+  engine.applyDirective({ action: "pause", taskIds: [task!.id] });
+  assert.equal(db.getTask(task!.id)?.status, "paused");
   assert.throws(
     () => engine.applyDirective({ action: "resume", taskIds: [task!.id] }),
     /unresolved Human Decision/,

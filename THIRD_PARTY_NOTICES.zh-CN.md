@@ -12,18 +12,25 @@ AEC-S 使用了一些仍受其各自许可证约束的第三方软件。PolyForm
 
 | 组件 | 版本 | 许可证 | 版权所有者或项目 |
 | --- | --- | --- | --- |
+| [Agent Client Protocol TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk) | 0.23.0 | Apache-2.0 | Zed Industries 及贡献者 |
+| [Kimi Agent SDK](https://github.com/MoonshotAI/kimi-agent-sdk) | 0.1.8 | MIT | Moonshot AI |
+| [DeepSeek Harness SDK、Credential seam 与锁定 Runtime composition 包](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
+| [Cordis](https://github.com/cordiverse/cordis) | 4.0.1 | MIT | Cordis 贡献者 |
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-锁定的生产依赖图共包含 93 个软件包：83 个 MIT、2 个 BSD-3-Clause、7 个 ISC 和 1 个 BSD-2-Clause。
+锁定的生产依赖图共包含 192 个软件包：176 个 MIT、1 个 Apache-2.0、5 个 BSD-3-Clause、8 个 ISC、1 个 BSD-2-Clause 和 1 个 Python-2.0。DSH 软件包统一锁定在 `0.1.0-rc.6` 软件包/Runtime 版本线；AEC-S 还会通过初始化握手验证 JSON-RPC Server 身份。版本不匹配时 Runtime 必须不可用，不得回退为 command Adapter。
 
-非 MIT 的生产传递依赖如下：
+非 MIT 的生产依赖如下：
 
 | 组件 | 版本 | 许可证 |
 | --- | --- | --- |
+| `@agentclientprotocol/sdk` | 0.23.0 | Apache-2.0 |
 | `json-schema-typed` | 8.0.2 | BSD-2-Clause |
 | `fast-uri` | 3.1.5 | BSD-3-Clause |
 | `qs` | 6.15.3 | BSD-3-Clause |
+| `@deepseek-ai/node-addon-landlock-run` 及平台包 | 0.1.1 | BSD-3-Clause |
+| `argparse` | 2.0.1 | Python-2.0 |
 | `inherits` | 2.0.4 | ISC |
 | `isexe` | 2.0.0 | ISC |
 | `once` | 1.4.0 | ISC |
@@ -32,7 +39,7 @@ AEC-S 使用了一些仍受其各自许可证约束的第三方软件。PolyForm
 | `wrappy` | 1.0.2 | ISC |
 | `zod-to-json-schema` | 3.25.2 | ISC |
 
-`package-lock.json` 当前记录的其他生产依赖均采用 MIT License。
+除以上已列项目外，`package-lock.json` 当前记录的其他生产依赖均采用 MIT License。
 
 ## 直接开发依赖
 
@@ -49,4 +56,4 @@ AEC-S 使用了一些仍受其各自许可证约束的第三方软件。PolyForm
 
 如果未来的分发物捆绑依赖源码、`node_modules`、独立可执行文件、原生二进制或包含这些组件的容器镜像，则该分发物必须提供每项适用的第三方版权声明、完整许可证、免责声明及上游要求保留的 NOTICE 内容。
 
-组件的权威版本记录在 `package-lock.json` 中。CI 许可证策略只允许当前已经审查的 SPDX 标识符：Apache-2.0、BSD-2-Clause、BSD-3-Clause、ISC 和 MIT。出现新的许可证或缺少许可证信息时，CI 将失败并要求进行明确审查。
+组件的权威版本记录在 `package-lock.json` 中。CI 许可证策略只允许当前已经审查的 SPDX 标识符：Apache-2.0、BSD-2-Clause、BSD-3-Clause、ISC、MIT 和 Python-2.0。出现新的许可证或缺少许可证信息时，CI 将失败并要求进行明确审查。

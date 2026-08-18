@@ -196,13 +196,20 @@ export async function changedPathsBetween(repoPath: string, fromSha: string, toS
   return result.stdout.split("\0").filter(Boolean).sort();
 }
 
+export async function commitCountBetween(repoPath: string, fromSha: string, toSha: string): Promise<number> {
+  const value = await execChecked(git(repoPath, ["rev-list", "--count", `${fromSha}..${toSha}`]));
+  const count = Number(value);
+  if (!Number.isInteger(count) || count < 0) throw new Error(`Invalid Git commit count: ${value}`);
+  return count;
+}
+
 export function outOfScopePaths(task: Task, paths: string[]): string[] {
   if (task.scope.writeGlobs.length === 0) return [];
   return paths.filter((path) => !matchesAny(path, task.scope.writeGlobs));
 }
 
 export function changesAffectTask(task: Task, paths: string[]): boolean {
-  const relevant = [...task.scope.writeGlobs, ...task.scope.impactGlobs];
+  const relevant = [...task.scope.writeGlobs, ...(task.scope.watchGlobs ?? task.scope.impactGlobs ?? [])];
   if (relevant.length === 0) return true;
   return paths.some((path) => matchesAny(path, relevant));
 }
@@ -241,6 +248,41 @@ export async function commitTask(workspacePath: string, task: Task): Promise<str
     timeoutSeconds: 300,
   });
   return await branchHead(workspacePath, "HEAD");
+}
+
+export async function revertMergedTask(project: Project, mergeSha: string, taskId: string): Promise<string> {
+  return await withProjectGitLock(project, async () => {
+    if (project.deliveryMode !== "local") throw new Error("Automatic revert is currently limited to local delivery");
+    const targetHead = await branchHead(project.repoPath, project.targetBranch);
+    if (targetHead !== mergeSha) throw new Error("Automatic revert requires the failed merge to remain the exact target HEAD");
+    await execChecked(git(project.repoPath, [
+      "-c", "user.name=AEC-S", "-c", "user.email=aec-s@local",
+      "revert", "--no-edit", mergeSha,
+    ], 300));
+    const reverted = await branchHead(project.repoPath, project.targetBranch);
+    const message = await execChecked(git(project.repoPath, ["log", "-1", "--format=%B"]));
+    if (!message.includes(`Revert`) || !message.includes(mergeSha.slice(0, 7))) {
+      throw new Error(`Revert commit for ${taskId} could not be reconciled`);
+    }
+    return reverted;
+  });
+}
+
+export async function verifyMergedRevision(project: Project, workspacePath: string, mergeSha: string): Promise<void> {
+  if (project.deliveryMode === "github") {
+    await fetchRemote(project);
+    const ancestor = await execCommand(git(project.repoPath, ["merge-base", "--is-ancestor", mergeSha, projectBaseRef(project)]));
+    if (ancestor.exitCode !== 0) throw new Error(`Merge SHA ${mergeSha} is not on the observed target branch`);
+    const workspaceTree = await execChecked(git(workspacePath, ["rev-parse", "HEAD^{tree}"]));
+    const mergedTree = await execChecked(git(project.repoPath, ["rev-parse", `${mergeSha}^{tree}`]));
+    if (workspaceTree !== mergedTree) throw new Error(`Workspace tree does not represent merge SHA ${mergeSha}`);
+    return;
+  }
+  const ancestor = await execCommand(git(project.repoPath, ["merge-base", "--is-ancestor", mergeSha, project.targetBranch]));
+  if (ancestor.exitCode !== 0) throw new Error(`Merge SHA ${mergeSha} is not on the local target branch`);
+  const workspaceTree = await execChecked(git(workspacePath, ["rev-parse", "HEAD^{tree}"]));
+  const mergedTree = await execChecked(git(project.repoPath, ["rev-parse", `${mergeSha}^{tree}`]));
+  if (workspaceTree !== mergedTree) throw new Error(`Workspace tree does not represent local merge SHA ${mergeSha}`);
 }
 
 export async function rebaseOntoTarget(project: Project, workspacePath: string): Promise<void> {

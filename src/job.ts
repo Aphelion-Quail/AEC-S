@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,37 +10,101 @@ import { jobInputSchema } from "./input.js";
 
 export async function runJobFile(inputPath: string): Promise<void> {
   const input = jobInputSchema.parse(readJson<unknown>(inputPath)) as JobInput;
+  const supervisorLock = `${input.resultPath}.supervisor.lock`;
+  let ownsSupervisorLock = false;
+  const lockDeadline = Date.now() + (input.command.timeoutSeconds ?? 300) * 1_000 + 10_000;
+  while (!ownsSupervisorLock) {
+    if (existsSync(input.resultPath)) return;
+    try {
+      const lock = openSync(supervisorLock, "wx", 0o600);
+      try { writeFileSync(lock, `${process.pid}\n`); } finally { closeSync(lock); }
+      ownsSupervisorLock = true;
+    } catch (error) {
+      if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      let owner = 0;
+      try { owner = Number(readFileSync(supervisorLock, "utf8").trim()); }
+      catch { continue; }
+      if (!Number.isInteger(owner) || owner <= 0 || !processAlive(owner)) {
+        try { unlinkSync(supervisorLock); } catch { /* Another reconciler won. */ }
+        continue;
+      }
+      if (Date.now() >= lockDeadline) throw new Error(`Timed out waiting for existing supervisor ${owner}`);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
   mkdirSync(dirname(input.stdoutPath), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(input.stderrPath), { recursive: true, mode: 0o700 });
   const startedAt = nowIso();
   const stdout = openSync(input.stdoutPath, "a", 0o600);
   const stderr = openSync(input.stderrPath, "a", 0o600);
   let finished = false;
+  let outputLimitExceeded: string | undefined;
+  const outputLimit = 8 * 1024 * 1024;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
   const finish = (result: JobResult): void => {
     if (finished) return;
     finished = true;
     closeSync(stdout);
     closeSync(stderr);
     writeJsonAtomic(input.resultPath, result);
+    if (ownsSupervisorLock) {
+      try { unlinkSync(supervisorLock); } catch { /* Result is already durable. */ }
+    }
   };
   try {
     const child = spawn(input.command.program, input.command.args, {
       cwd: input.command.cwd,
       env: { ...process.env, ...input.command.env },
-      stdio: ["pipe", stdout, stderr],
+      stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
     let timedOut = false;
+    let cancellationRequested = false;
+    let terminateTree: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
+    const forwardCancellation = (): void => {
+      cancellationRequested = true;
+      // Signal the controlled Runtime entrypoint first so protocol-aware
+      // adapters can issue session/cancel or close their composition cleanly.
+      // A bounded process-group kill remains the deterministic backstop.
+      child.kill("SIGTERM");
+      if (!terminateTree) {
+        terminateTree = setTimeout(() => killProcessTree(child.pid, "SIGTERM", () => child.kill("SIGTERM")), 250);
+        terminateTree.unref();
+      }
+      if (!forceKill) {
+        forceKill = setTimeout(() => killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL")), 2_000);
+        forceKill.unref();
+      }
+    };
+    const writeBounded = (descriptor: number, chunk: Buffer, stream: "stdout" | "stderr"): void => {
+      const previous = stream === "stdout" ? stdoutBytes : stderrBytes;
+      const remaining = Math.max(0, outputLimit - previous);
+      if (remaining > 0) writeSync(descriptor, chunk.subarray(0, remaining));
+      if (stream === "stdout") stdoutBytes = previous + chunk.length;
+      else stderrBytes = previous + chunk.length;
+      if (chunk.length > remaining && !outputLimitExceeded) {
+        outputLimitExceeded = `${stream} exceeded 8 MiB`;
+        forwardCancellation();
+      }
+    };
+    child.stdout!.on("data", (chunk: Buffer) => writeBounded(stdout, chunk, "stdout"));
+    child.stderr!.on("data", (chunk: Buffer) => writeBounded(stderr, chunk, "stderr"));
+    const onSignal = (): void => forwardCancellation();
+    process.once("SIGTERM", onSignal);
+    process.once("SIGINT", onSignal);
     const timeout = setTimeout(() => {
       timedOut = true;
-      killProcessTree(child.pid, "SIGTERM", () => child.kill("SIGTERM"));
-      forceKill = setTimeout(() => killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL")), 2_000);
-      forceKill.unref();
+      forwardCancellation();
     }, (input.command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
     child.on("error", (error) => {
       clearTimeout(timeout);
+      if (terminateTree) clearTimeout(terminateTree);
+      if (forceKill) clearTimeout(forceKill);
+      process.off("SIGTERM", onSignal);
+      process.off("SIGINT", onSignal);
       finish({
         status: "spawn_error",
         exitCode: null,
@@ -52,8 +116,25 @@ export async function runJobFile(inputPath: string): Promise<void> {
     });
     child.on("close", (exitCode, signal) => {
       clearTimeout(timeout);
+      if (terminateTree) clearTimeout(terminateTree);
       if (forceKill) clearTimeout(forceKill);
-      finish({ status: timedOut ? "timed_out" : "completed", exitCode, signal, startedAt, finishedAt: nowIso() });
+      // The Runtime entrypoint may exit immediately after its graceful signal
+      // while descendants remain in the detached process group. Clearing the
+      // timers without this final sweep would let those descendants outlive a
+      // completed cancellation result and continue mutating the workspace.
+      if (cancellationRequested) {
+        killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      }
+      process.off("SIGTERM", onSignal);
+      process.off("SIGINT", onSignal);
+      finish({
+        status: outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : "completed",
+        exitCode,
+        signal,
+        ...(outputLimitExceeded ? { error: outputLimitExceeded } : {}),
+        startedAt,
+        finishedAt: nowIso(),
+      });
     });
     child.stdin!.end(input.stdin ?? "");
   } catch (error) {
@@ -122,8 +203,15 @@ function killProcessTree(pid: number | undefined, signal: NodeJS.Signals, fallba
   }
 }
 
-export function startSupervisedJob(input: JobInput, inputPath: string, jobId = newId("job")): JobState {
+export function startSupervisedJob(
+  input: JobInput,
+  inputPath: string,
+  jobId = newId("job"),
+  beforeSpawn?: (pending: JobState) => void,
+): JobState {
   writeJsonAtomic(inputPath, input);
+  const pending: JobState = { id: jobId, inputPath, resultPath: input.resultPath, startedAt: nowIso() };
+  beforeSpawn?.(pending);
   const compiledEntry = fileURLToPath(new URL("./cli.js", import.meta.url));
   const entry = process.env.AEC_S_CLI_ENTRY ?? (existsSync(compiledEntry) ? compiledEntry : process.argv[1]);
   if (!entry) throw new Error("Unable to locate AEC-S CLI entry for job supervisor");
@@ -133,11 +221,8 @@ export function startSupervisedJob(input: JobInput, inputPath: string, jobId = n
   });
   child.unref();
   return {
-    id: jobId,
-    inputPath,
-    resultPath: input.resultPath,
+    ...pending,
     ...(child.pid ? { pid: child.pid } : {}),
-    startedAt: nowIso(),
   };
 }
 

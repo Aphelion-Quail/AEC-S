@@ -2,11 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
 import { join } from "node:path";
+import { statSync } from "node:fs";
 import { AecSDatabase } from "../src/db.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 import type { Run } from "../src/types.js";
 
-test("persists the seven core entity projections", () => {
+test("persists the formal AEC-S entity projections", () => {
   const home = tempDir("aec-s-home-");
   const db = new AecSDatabase(home);
   const project = db.createProject({ name: "fixture", repoPath: createGitRepository() });
@@ -30,9 +31,11 @@ test("persists the seven core entity projections", () => {
   assert.equal(db.getAgent(agent.id)?.name, "fake");
   assert.equal(db.getTask(task.id)?.goal, "Create feature.txt");
   assert.equal(db.getDecision(decision.id)?.status, "resolved");
-  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
+  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal(statSync(db.paths.database).mode & 0o777, 0o600);
+  assert.equal(db.listTaskRevisions(task.id).length, 1);
   const appliedMigrations = db.db.prepare("SELECT version, applied_at FROM schema_migrations ORDER BY version").all();
-  assert.equal(db.updateProject(project.id, { intent: "Updated intent", maxConcurrency: 3 }).intent, "Updated intent");
+  assert.equal(db.updateProject(project.id, { intent: "Updated intent", intentVersion: 2, maxConcurrency: 3 }).intent, "Updated intent");
   assert.equal(db.updateAgent(agent.id, { availability: "degraded", enabled: false }).enabled, false);
   db.updateTaskStatus(task.id, "succeeded", { summary: "done", mergeSha: "abc" });
   db.updateTaskStatus(task.id, "ready", { summary: null, mergeSha: null });
@@ -84,9 +87,9 @@ test("upgrades a pre-lease Run schema through recorded migrations", () => {
   assert.ok(columns.includes("worker_result_path"));
   assert.deepEqual(
     (db.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>).map((row) => row.version),
-    [1, 2, 3, 4],
+    [1, 2, 3, 4, 5, 6, 7],
   );
-  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 4);
+  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
   db.close();
 });
 
@@ -144,8 +147,10 @@ test("fences stale Run writes and atomically resumes an interrupted Run", () => 
   });
   db.createRun({ ...run, id: "run-second", taskId: secondTask.id, workspaceId: "workspace-second", leaseOwner: undefined });
   assert.equal(db.reserveAgentSlot(agent.id, run.id, "job-winner"), true);
+  assert.equal(db.getAgent(agent.id)?.availability, "busy");
   assert.equal(competitor.reserveAgentSlot(agent.id, "run-second", "job-loser"), false);
   db.releaseAgentSlot("job-winner");
+  assert.equal(db.getAgent(agent.id)?.availability, "available");
   assert.equal(competitor.reserveAgentSlot(agent.id, "run-second", "job-loser"), true);
   competitor.releaseAgentSlot("job-loser");
   competitor.close();

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecSDatabase } from "../src/db.js";
 import { AecSEngine } from "../src/engine.js";
+import { adapterFor } from "../src/adapters/agent.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
@@ -96,6 +97,65 @@ async function runScheduledPair(input: {
   db.close();
   return entries;
 }
+
+test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol substitutes", async () => {
+  const repo = createGitRepository();
+  const home = tempDir("aec-s-three-runtime-scheduler-");
+  const timeline = join(home, "three-runtime-timeline.txt");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "three-runtime-scheduler", repoPath: repo, maxConcurrency: 3 });
+  const runtimes = ["codex", "kimi", "deepseek_harness"] as const;
+  for (const runtime of runtimes) {
+    const runtimeCapabilities = { resume: true, cancel: true, stream: true, reviewMode: true, structuredOutput: true };
+    db.createAgent({
+      id: `${runtime}-executor`,
+      name: `${runtime} executor substitute`,
+      adapter: runtime,
+      runtimeFamily: runtime,
+      roles: ["executor"],
+      capabilities: [runtime],
+      runtimeCapabilities,
+    });
+    db.createAgent({
+      id: `${runtime}-reviewer`,
+      name: `${runtime} reviewer substitute`,
+      adapter: runtime,
+      runtimeFamily: runtime,
+      roles: ["reviewer"],
+      capabilities: [runtime],
+      runtimeCapabilities,
+    });
+  }
+  const engine = new AecSEngine(db, {
+    globalConcurrency: 3,
+    adapterFactory: (runtimeAgent) => adapterFor({
+      ...runtimeAgent,
+      adapter: "command",
+      config: runtimeAgent.roles.includes("reviewer")
+        ? { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } }
+        : {
+            binary: process.execPath,
+            execute: { program: process.execPath, args: [fakeAgent, "timeline-triple-barrier", "{workspace}", "{output}", timeline] },
+            repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
+          },
+    }),
+  });
+  const tasks = engine.submitGraph(project.id, runtimes.map((runtime) => ({
+    id: `three-runtime-${runtime}`,
+    projectId: project.id,
+    title: `Schedule ${runtime}`,
+    goal: `Create ${runtime}.txt`,
+    scope: { writeGlobs: [`${runtime}.txt`], watchGlobs: [], tags: ["three-runtime"] },
+    acceptanceCriteria: [`${runtime} protocol substitute completes`],
+    requiredCapabilities: [runtime],
+  })));
+  await engine.runUntilIdle();
+  assert.equal(tasks.every((task) => db.getTask(task.id)?.status === "succeeded"), true);
+  assert.deepEqual(new Set(tasks.map((task) => db.getLatestRunForTask(task.id)?.agentId)), new Set(runtimes.map((runtime) => `${runtime}-executor`)));
+  const starts = readFileSync(timeline, "utf8").trim().split(/\r?\n/).filter((entry) => entry.endsWith(":start"));
+  assert.equal(new Set(starts).size, 3);
+  db.close();
+});
 
 test("runs two independent tasks without invalidating the second on HEAD change", async () => {
   const repo = createGitRepository();
@@ -613,6 +673,73 @@ test("rotates to a second eligible executor after repair attempts are exhausted"
   db.close();
 });
 
+test("debounces Runtime failure before switching from Codex to Kimi", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-cross-runtime-switch-"));
+  const project = db.createProject({ name: "cross-runtime-switch", repoPath: repo });
+  const runtimeCapabilities = { resume: true, cancel: true, stream: true, reviewMode: true, structuredOutput: true };
+  db.createAgent({
+    id: "a-codex-executor",
+    name: "Codex executor substitute",
+    adapter: "codex",
+    runtimeFamily: "codex",
+    roles: ["executor"],
+    runtimeCapabilities,
+  });
+  db.createAgent({
+    id: "b-kimi-executor",
+    name: "Kimi executor substitute",
+    adapter: "kimi",
+    runtimeFamily: "kimi",
+    roles: ["executor"],
+    runtimeCapabilities,
+  });
+  db.createAgent({
+    id: "c-dsh-reviewer",
+    name: "DSH reviewer substitute",
+    adapter: "deepseek_harness",
+    runtimeFamily: "deepseek_harness",
+    roles: ["reviewer"],
+    runtimeCapabilities,
+  });
+  const engine = new AecSEngine(db, {
+    adapterFactory: (runtimeAgent) => adapterFor({
+      ...runtimeAgent,
+      adapter: "command",
+      config: runtimeAgent.id === "a-codex-executor"
+        ? {
+            binary: process.execPath,
+            execute: { program: process.execPath, args: [fakeAgent, "malformed-result", "{workspace}", "{output}"] },
+          }
+        : runtimeAgent.roles.includes("reviewer")
+          ? { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } }
+          : {
+              binary: process.execPath,
+              execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+              repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
+            },
+    }),
+  });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-cross-runtime-switch",
+    projectId: project.id,
+    title: "Switch only after debounced failure",
+    goal: "Create switched.txt",
+    scope: { writeGlobs: ["switched.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Kimi completes after Codex reaches its failure threshold"],
+  }]);
+  await engine.runTask(task!.id);
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.equal(run.agentId, "b-kimi-executor");
+  assert.equal(run.rotationCount, 1);
+  assert.equal(run.metrics?.runtimeSwitches, 1);
+  assert.equal(db.getAgent("a-codex-executor")?.availability, "unavailable");
+  assert.equal(db.listEvents(project.id).some((event) =>
+    event.type === "run.agent_rotated" && event.payload.fromRuntimeFamily === "codex" && event.payload.runtimeFamily === "kimi"), true);
+  db.close();
+});
+
 test("does not bypass the independent Review Gate when no reviewer is available", async () => {
   const repo = createGitRepository();
   const db = new AecSDatabase(tempDir("aec-s-review-gate-"));
@@ -667,6 +794,95 @@ test("runs configured full validation for a high-risk Task path", async () => {
   await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(readFileSync(fullMarker, "utf8"), "yes");
+  db.close();
+});
+
+test("recalculates the Risk Floor after validation generates a high-risk file", async () => {
+  const repo = createGitRepository();
+  const home = tempDir("aec-s-post-validation-risk-");
+  const fullMarker = join(home, "full-validation-ran.txt");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({
+    name: "post-validation-risk",
+    repoPath: repo,
+    highRiskGlobs: ["critical/**"],
+    defaultValidation: [{
+      program: process.execPath,
+      args: ["-e", "require('node:fs').mkdirSync('critical',{recursive:true});require('node:fs').writeFileSync('critical/generated.txt','generated')"],
+    }],
+    fullValidation: [{
+      program: process.execPath,
+      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(fullMarker)},'ran')`],
+    }],
+  });
+  registerFakeAgents(db);
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-post-validation-risk",
+    projectId: project.id,
+    title: "Generated risk",
+    goal: "Generate a registered high-risk artifact",
+    scope: { writeGlobs: ["feature.txt", "critical/**"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Risk is recalculated after validation"],
+  }]);
+  await new AecSEngine(db).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.equal(db.getTaskRevision(db.getTask(task!.id)!.currentRevisionId!)?.effectiveRiskClass, "core");
+  assert.equal(readFileSync(fullMarker, "utf8"), "ran");
+  assert.ok((db.getLatestRunForTask(task!.id)?.metrics?.validationRuns ?? 0) >= 2);
+  db.close();
+});
+
+test("verifies required Environment Contract commands before Runtime execution", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-environment-contract-"));
+  const project = db.createProject({
+    name: "environment-contract",
+    repoPath: createGitRepository(),
+    environmentContract: {
+      version: 1,
+      components: [{
+        id: "toolchain",
+        version: "2.0.0",
+        command: { program: process.execPath, args: ["-e", "process.stdout.write('1.0.0')"] },
+      }],
+    },
+  });
+  registerFakeAgents(db);
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-environment-contract",
+    projectId: project.id,
+    title: "Require toolchain",
+    goal: "Do not execute under the wrong environment",
+    scope: { writeGlobs: ["environment.txt"], watchGlobs: [], tags: [] },
+    environmentRequirements: ["toolchain"],
+    acceptanceCriteria: ["Environment is verified"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.match(db.getTask(task!.id)?.terminalSummary ?? "", /version mismatch/);
+  assert.equal(db.getLatestRunForTask(task!.id)?.phase, "prepare");
+  db.close();
+});
+
+test("keeps Scope Calibration observational until a Human approves the Revision", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-scope-calibration-"));
+  const project = db.createProject({ name: "scope-calibration", repoPath: createGitRepository() });
+  registerFakeAgents(db, "scope-expansion");
+  const engine = new AecSEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-scope-calibration",
+    projectId: project.id,
+    title: "Observe scope",
+    goal: "Request one bounded expansion",
+    scope: { writeGlobs: ["initial.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Human approves the new Revision"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
+  const decision = db.listDecisions(project.id, "pending").find((candidate) => candidate.kind === "policy")!;
+  engine.resolveDecision(decision.id, { action: "approve_scope" });
+  assert.equal(db.getTask(task!.id)?.status, "ready");
+  assert.ok(db.getTask(task!.id)?.scope.writeGlobs.includes("approved.txt"));
   db.close();
 });
 
@@ -726,6 +942,68 @@ test("provides authoritative validation evidence to the independent reviewer", a
   db.close();
 });
 
+test("switches to another eligible Reviewer only after the retained Reviewer reaches its failure threshold", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-reviewer-failover-"));
+  const project = db.createProject({ name: "reviewer-failover", repoPath: repo });
+  db.createAgent({
+    id: "executor",
+    name: "executor",
+    adapter: "command",
+    roles: ["executor"],
+    config: {
+      binary: process.execPath,
+      execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+    },
+  });
+  db.createAgent({
+    id: "a-failing-reviewer",
+    name: "failing reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    config: {
+      binary: process.execPath,
+      review: { program: process.execPath, args: [fakeAgent, "review-malformed", "{workspace}", "{output}"] },
+    },
+  });
+  db.createAgent({
+    id: "b-working-reviewer",
+    name: "working reviewer",
+    adapter: "command",
+    roles: ["reviewer"],
+    config: {
+      binary: process.execPath,
+      review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] },
+    },
+  });
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-reviewer-failover",
+    projectId: project.id,
+    title: "Fail over Review safely",
+    goal: "Create reviewer-failover.txt",
+    scope: { writeGlobs: ["reviewer-failover.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["A second Reviewer completes only after the first is unavailable"],
+  }]);
+
+  await engine.runTask(task!.id);
+  if (db.getTask(task!.id)?.status !== "succeeded") {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await engine.runUntilIdle();
+  }
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  assert.equal(db.getAgent("a-failing-reviewer")?.availability, "unavailable");
+  assert.equal(run.review?.reviewerAgentId, "b-working-reviewer");
+  assert.equal(run.attempt, 1);
+  assert.equal(run.metrics?.runtimeSwitches, 1);
+  assert.equal(db.listEvents(project.id).some((event) =>
+    event.type === "run.reviewer_rotated" &&
+    event.payload.fromAgentId === "a-failing-reviewer" &&
+    event.payload.agentId === "b-working-reviewer"), true);
+  db.close();
+});
+
 test("blocks a Reviewer adapter that mutates the task workspace", async () => {
   const repo = createGitRepository();
   const db = new AecSDatabase(tempDir("aec-s-mutating-reviewer-"));
@@ -743,6 +1021,110 @@ test("blocks a Reviewer adapter that mutates the task workspace", async () => {
   assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
   assert.match(db.getTask(task!.id)?.terminalSummary ?? "", /modified the task workspace/);
   assert.equal(existsSync(join(repo, "reviewer-leak.txt")), false);
+  db.close();
+});
+
+test("does not advance a Task when Runtime output violates the AEC-S Schema", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-malformed-runtime-output-"));
+  const project = db.createProject({ name: "malformed-runtime-output", repoPath: repo });
+  registerFakeAgents(db, "malformed-result");
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-malformed-runtime-output",
+    projectId: project.id,
+    title: "Reject malformed Runtime output",
+    goal: "Never accept incomplete structured output",
+    scope: { writeGlobs: ["malformed.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Malformed output cannot advance engineering state"],
+  }]);
+  await new AecSEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
+  assert.equal(run.phase, "execute");
+  assert.equal(run.workerResult, undefined);
+  assert.equal(run.effects.commit, undefined);
+  assert.equal(existsSync(join(repo, "malformed.txt")), false);
+  assert.match(String(run.error?.message ?? ""), /invalid structured result|output Schema/);
+  db.close();
+});
+
+test("rejects a Runtime that attempts to take Git commit authority", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-runtime-commit-authority-"));
+  const project = db.createProject({ name: "runtime-commit-authority", repoPath: repo });
+  registerFakeAgents(db, "commit-authority-violation");
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-runtime-commit-authority",
+    projectId: project.id,
+    title: "Keep commit authority in AEC-S",
+    goal: "The Runtime may edit but may not commit",
+    scope: { writeGlobs: ["authority.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Runtime commit is detected before validation"],
+  }]);
+  await new AecSEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "awaiting_human");
+  assert.equal(run.phase, "execute");
+  assert.equal(run.workerResult, undefined);
+  assert.equal(run.effects.commit, undefined);
+  assert.equal(existsSync(join(repo, "authority.txt")), false);
+  assert.match(String(run.error?.message ?? ""), /Runtime authority violation/);
+  assert.equal(db.getAgent(run.agentId)?.availability, "unavailable");
+  assert.equal(db.listEvents(project.id).some((event) => event.type === "runtime.authority_violation"), true);
+  assert.equal(db.listDecisions(project.id, "pending").length, 1);
+  db.close();
+});
+
+test("keeps cancellation terminal when a supervised validation job is interrupted", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-cancel-validation-"));
+  const project = db.createProject({ name: "cancel-validation", repoPath: repo });
+  registerFakeAgents(db);
+  const engine = new AecSEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-cancel-validation",
+    projectId: project.id,
+    title: "Cancel validation",
+    goal: "Create cancel-validation.txt",
+    scope: { writeGlobs: ["cancel-validation.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Cancellation remains terminal"],
+    validationCommands: [{ program: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"], timeoutSeconds: 60 }],
+  }]);
+  const running = engine.runTask(task!.id);
+  for (let count = 0; count < 200; count += 1) {
+    const run = db.getLatestRunForTask(task!.id);
+    if (run?.phase === "validate" && run.job?.pid) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(db.getLatestRunForTask(task!.id)?.phase, "validate");
+  engine.applyDirective({ action: "cancel", taskIds: [task!.id] });
+  await running;
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(db.getTask(task!.id)?.status, "cancelled");
+  assert.equal(run.status, "failed");
+  assert.equal(run.error?.operationalRetry, undefined);
+  assert.equal(existsSync(join(repo, "cancel-validation.txt")), false);
+  db.close();
+});
+
+test("does not publish a failed Review that provides no blocking Finding", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-empty-failed-review-"));
+  const project = db.createProject({ name: "empty-failed-review", repoPath: repo });
+  registerFakeAgents(db, "execute", "review-empty-fail");
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-empty-failed-review",
+    projectId: project.id,
+    title: "Reject empty failed Review",
+    goal: "Create empty-failed-review.txt",
+    scope: { writeGlobs: ["empty-failed-review.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["A failed verdict must be actionable"],
+  }]);
+  await new AecSEngine(db, { operationalRetryBaseMs: 60_000 }).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.equal(db.getLatestRunForTask(task!.id)?.effects.commit, undefined);
+  assert.equal(existsSync(join(repo, "empty-failed-review.txt")), false);
+  assert.match(String(db.getLatestRunForTask(task!.id)?.error?.message), /blocking Finding/);
   db.close();
 });
 
@@ -898,6 +1280,105 @@ test("reconciles enabled Agent health while preserving explicit offline state", 
   assert.equal(db.getAgent("manual-offline-agent")?.availability, "offline");
   db.updateAgent("health-agent", { config: { binary: process.execPath } });
   await engine.refreshAgentAvailability();
+  assert.equal(db.getAgent("health-agent")?.availability, "healthy");
+  await engine.refreshAgentAvailability();
   assert.equal(db.getAgent("health-agent")?.availability, "available");
+  db.close();
+});
+
+test("releases Runtime capacity during the post-merge observation window", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-observation-capacity-"));
+  const project = db.createProject({
+    name: "observation-capacity",
+    repoPath: repo,
+    operationalConfig: { stabilityObservationSeconds: 1 },
+  });
+  registerFakeAgents(db);
+  const engine = new AecSEngine(db, { globalConcurrency: 1 });
+  const [observed] = engine.submitGraph(project.id, [{
+    id: "task-observed",
+    projectId: project.id,
+    title: "Observe merged work",
+    goal: "Create observed.txt",
+    scope: { writeGlobs: ["observed.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Observation releases capacity"],
+  }]);
+  await engine.runTask(observed!.id);
+  assert.equal(db.getTask(observed!.id)?.status, "observing");
+  assert.equal(db.getLatestRunForTask(observed!.id)?.status, "interrupted");
+  assert.equal(db.getAgent("executor")?.currentLoad, 0);
+
+  const [next] = engine.submitGraph(project.id, [{
+    id: "task-during-observation",
+    projectId: project.id,
+    title: "Use released capacity",
+    goal: "Create next-observed.txt",
+    scope: { writeGlobs: ["next-observed.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Runs while another Task observes"],
+  }]);
+  await engine.runTask(next!.id);
+  assert.equal(db.getTask(next!.id)?.status, "observing");
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_100));
+  await engine.runUntilIdle();
+  assert.equal(db.getTask(observed!.id)?.status, "succeeded");
+  assert.equal(db.getTask(next!.id)?.status, "succeeded");
+  db.close();
+});
+
+test("parks a failed post-merge smoke and creates a bounded Repair Task", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-post-merge-smoke-"));
+  const project = db.createProject({
+    name: "post-merge-smoke",
+    repoPath: repo,
+    postMergeSmoke: [{ program: process.execPath, args: ["-e", "process.exit(1)"] }],
+  });
+  registerFakeAgents(db);
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-smoke-failure",
+    projectId: project.id,
+    title: "Fail smoke safely",
+    goal: "Create smoke-failure.txt",
+    scope: { writeGlobs: ["smoke-failure.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Failure does not claim convergence"],
+  }]);
+  await new AecSEngine(db).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "parked");
+  assert.equal(db.getTask(task!.id)?.mergeSha !== undefined, true);
+  const repair = db.listTasks(project.id).find((candidate) => candidate.id.startsWith("repair-task-smoke-failure-"));
+  assert.equal(repair?.status, "parked");
+  assert.equal(repair?.proposedRiskClass, "core");
+  const decision = db.listDecisions(project.id, "pending").find((candidate) => candidate.taskId === repair?.id);
+  assert.equal(decision?.kind, "failure_exhausted");
+  assert.equal(db.listOutbox(project.id).filter((message) => message.decisionId === decision?.id).length, 2);
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "revert.parked"));
+  db.close();
+});
+
+test("auto-reverts only an explicitly safe local merge under enforce policy", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-auto-revert-"));
+  const project = db.createProject({
+    name: "auto-revert",
+    repoPath: repo,
+    postMergeSmoke: [{ program: process.execPath, args: ["-e", "process.exit(1)"] }],
+    controlPolicy: { autoRevert: "enforce" },
+  });
+  registerFakeAgents(db);
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-auto-revert",
+    projectId: project.id,
+    title: "Revert safe merge",
+    goal: "Create auto-revert.txt",
+    scope: { writeGlobs: ["auto-revert.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Unsafe mainline state is removed"],
+    revertSafe: true,
+  }]);
+  await new AecSEngine(db).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "parked");
+  assert.equal(existsSync(join(repo, "auto-revert.txt")), false);
+  assert.equal(db.getLatestRunForTask(task!.id)?.effects.revert?.status, "completed");
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "revert.completed"));
   db.close();
 });

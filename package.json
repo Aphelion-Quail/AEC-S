@@ -1,10 +1,10 @@
 {
   "name": "aec-s-core",
-  "version": "0.1.0",
+  "version": "0.9.0-rc.1",
   "private": true,
   "license": "SEE LICENSE IN LICENSE",
   "type": "module",
-  "description": "Agent Equilibrium Control System core infrastructure MVP",
+  "description": "Agent Equilibrium Control System multi-runtime 1.0 release candidate",
   "bin": {
     "aec-s": "dist/src/cli.js"
   },
@@ -15,6 +15,7 @@
     "lint": "oxlint src test scripts --deny-warnings",
     "test:unit": "node --test --test-concurrency=1 dist/test/*.test.js",
     "test": "npm run build && npm run test:unit",
+    "test:runtimes:live": "npm run build && node scripts/test-runtimes-live.mjs",
     "test:coverage:built": "node --test --test-concurrency=1 --experimental-test-coverage --test-coverage-include='dist/src/**/*.js' --test-coverage-include-all --test-coverage-lines=80 --test-coverage-branches=65 --test-coverage-functions=80 dist/test/*.test.js",
     "test:coverage": "npm run build && npm run test:coverage:built",
     "test:all": "npm run lint && npm run check && npm run check:licenses && npm run build && npm run test:coverage:built",
@@ -24,7 +25,35 @@
     "node": ">=26"
   },
   "dependencies": {
+    "@agentclientprotocol/sdk": "0.23.0",
+    "@deepseek-ai/cordis": "4.0.1",
+    "@deepseek-ai/dsh-atomic-write": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-agent-spine-demo": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-app-boot": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-brand": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-credentials": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-credentials-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-fs-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-invariants": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-home-paths": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-launch-environment": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-llm-deepseek": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sandbox-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sandbox-policy": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-client": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-jsonrpc-demo": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-jsonrpc-server": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-sdk-protocol": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-session": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-session-persistence-jsonl": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-terminal": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-terminal-bash": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tool-bash-persistent": "0.1.0-rc.6",
+    "@deepseek-ai/dsh-tool-str-replace-editor": "0.1.0-rc.6",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@moonshot-ai/kimi-agent-sdk": "0.1.8",
     "zod": "^4.4.3"
   },
   "devDependencies": {
@@ -32,5 +61,12 @@
     "oxlint": "^1.76.0",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
+  },
+  "allowScripts": {
+    "@deepseek-ai/dsh-subprocess-local@0.1.0-rc.6": true,
+    "esbuild@0.28.2": true,
+    "fsevents@2.3.3": true,
+    "koffi@3.1.5": true,
+    "node-pty@1.1.0": true
   }
 }

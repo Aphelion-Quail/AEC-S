@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { processAlive, startSupervisedJob, waitForJob } from "../src/job.js";
 import { execCommand } from "../src/exec.js";
@@ -38,6 +38,44 @@ test("bounds captured command output in memory", async () => {
   assert.ok(result.stdout.length <= 8 * 1024 * 1024);
 });
 
+test("terminates supervised commands that exceed the durable log limit", async () => {
+  const directory = tempDir("aec-s-job-output-limit-");
+  const stdoutPath = join(directory, "stdout.log");
+  const job = startSupervisedJob({
+    command: {
+      program: process.execPath,
+      args: ["-e", "for(let i=0;i<9216;i++) process.stdout.write('x'.repeat(1024));setInterval(()=>{},1000)"],
+      timeoutSeconds: 10,
+    },
+    stdoutPath,
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  }, join(directory, "input.json"));
+  const result = await waitForJob(job, 5);
+  assert.equal(result.status, "output_limit");
+  assert.ok(statSync(stdoutPath).size <= 8 * 1024 * 1024);
+});
+
+test("deduplicates supervisors across the persisted pre-spawn crash window", async () => {
+  const directory = tempDir("aec-s-supervisor-dedup-");
+  const marker = join(directory, "side-effect.txt");
+  const input = {
+    command: {
+      program: process.execPath,
+      args: ["-e", `setTimeout(()=>require('node:fs').appendFileSync(${JSON.stringify(marker)},'once'),250)`],
+      timeoutSeconds: 5,
+    },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  };
+  const inputPath = join(directory, "input.json");
+  const first = startSupervisedJob(input, inputPath, "same-job");
+  const reconciler = startSupervisedJob(input, inputPath, "same-job");
+  await Promise.all([waitForJob(first, 5), waitForJob(reconciler, 5)]);
+  assert.equal(readFileSync(marker, "utf8"), "once");
+});
+
 test("kills Agent descendant processes when a supervised command times out", async () => {
   const directory = tempDir("aec-s-process-tree-");
   const marker = join(directory, "descendant-write.txt");
@@ -52,6 +90,27 @@ test("kills Agent descendant processes when a supervised command times out", asy
   assert.equal((await waitForJob(job, 1)).status, "timed_out");
   await new Promise((resolve) => setTimeout(resolve, 600));
   assert.equal(existsSync(marker), false);
+});
+
+test("forwards manual cancellation to the Runtime before the process-group backstop", async () => {
+  if (process.platform === "win32") return;
+  const directory = tempDir("aec-s-manual-cancel-");
+  const ready = join(directory, "runtime-ready.txt");
+  const marker = join(directory, "runtime-sigterm.txt");
+  const program = `require('node:fs').writeFileSync(${JSON.stringify(ready)},'ready');process.once('SIGTERM',()=>{require('node:fs').writeFileSync(${JSON.stringify(marker)},'received');process.exit(0)});setInterval(()=>{},1000)`;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", program], timeoutSeconds: 10 },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  }, join(directory, "input.json"));
+  const deadline = Date.now() + 2_000;
+  while (!existsSync(ready) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(existsSync(ready), true);
+  assert.ok(job.pid);
+  process.kill(-job.pid!, "SIGTERM");
+  await waitForJob(job, 3);
+  assert.equal(readFileSync(marker, "utf8"), "received");
 });
 
 test("falls back to PID existence when the process inspector is unavailable", () => {

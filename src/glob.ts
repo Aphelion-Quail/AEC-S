@@ -78,13 +78,13 @@ function literalDirectoryRoot(glob: string): string {
 }
 
 export function tasksConflict(
-  left: { writeGlobs: string[]; impactGlobs: string[] },
-  right: { writeGlobs: string[]; impactGlobs: string[] },
+  left: { writeGlobs: string[]; watchGlobs?: string[]; impactGlobs?: string[] },
+  right: { writeGlobs: string[]; watchGlobs?: string[]; impactGlobs?: string[] },
 ): boolean {
   if (left.writeGlobs.length === 0 || right.writeGlobs.length === 0) return true;
   return (
-    globsMayOverlap(left.writeGlobs, [...right.writeGlobs, ...right.impactGlobs]) ||
-    globsMayOverlap(right.writeGlobs, [...left.writeGlobs, ...left.impactGlobs])
+    globsMayOverlap(left.writeGlobs, [...right.writeGlobs, ...(right.watchGlobs ?? right.impactGlobs ?? [])]) ||
+    globsMayOverlap(right.writeGlobs, [...left.writeGlobs, ...(left.watchGlobs ?? left.impactGlobs ?? [])])
   );
 }
 

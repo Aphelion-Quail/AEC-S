@@ -46,9 +46,16 @@ export async function doctor(db: AecSDatabase): Promise<Record<string, unknown>>
     }
     return { id: project.id, ok: true, detail: `GitHub delivery via ${project.remoteName}/${project.targetBranch}` };
   }));
+  const agentProbeCache = new Map<string, ReturnType<ReturnType<typeof adapterFor>["probe"]>>();
   const agents = await Promise.all(db.listAgents().map(async (agent) => {
     try {
-      return { id: agent.id, ...(await adapterFor(agent).healthcheck()) };
+      const cacheKey = JSON.stringify({ adapter: agent.adapter, config: agent.config });
+      let probe = agentProbeCache.get(cacheKey);
+      if (!probe) {
+        probe = adapterFor(agent).probe();
+        agentProbeCache.set(cacheKey, probe);
+      }
+      return { id: agent.id, ...(await probe) };
     } catch (error) {
       return { id: agent.id, ok: false, detail: error instanceof Error ? error.message : String(error) };
     }

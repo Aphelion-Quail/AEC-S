@@ -21,12 +21,14 @@ import type {
   Workspace,
 } from "./types.js";
 import { newId, nowIso } from "./ids.js";
-import { adapterFor, type AgentInvocation } from "./adapters/agent.js";
+import { adapterFor, type AgentAdapter, type AgentInvocation } from "./adapters/agent.js";
+import type { RuntimeProbeResult } from "./runtime-probe.js";
 import { buildContextEnvelope, executionPrompt, repairPrompt, reviewPrompt } from "./context.js";
 import {
   branchHead,
   changedPaths,
   changedPathsBetween,
+  commitCountBetween,
   changesAffectTask,
   cleanupWorktree,
   commitTask,
@@ -39,12 +41,14 @@ import {
   projectBaseRef,
   rebaseInProgress,
   rebaseOntoTarget,
+  revertMergedTask,
+  verifyMergedRevision,
   workspaceHasChanges,
   writeDiff,
   withProjectGitLock,
 } from "./git.js";
-import { tasksConflict } from "./glob.js";
-import { parseStructuredOutput, readJson } from "./files.js";
+import { matchesAny, tasksConflict } from "./glob.js";
+import { assertFileSize, parseStructuredOutput, readJson, readTextBounded } from "./files.js";
 import { processAlive, startSupervisedJob, waitForJob } from "./job.js";
 import { authoritativeCommands, resolveValidationCommand, validationPaths } from "./validation.js";
 import { writeSchemas } from "./schemas.js";
@@ -52,13 +56,15 @@ import { taskInputSchema } from "./input.js";
 import {
   createOrGetPullRequest,
   deleteRemoteTaskBranch,
+  inspectRequiredChecks,
   mergePullRequest,
   pushTaskBranch,
   reconcileMergedPullRequest,
   remoteTaskBranchHead,
-  waitForRequiredChecks,
 } from "./github.js";
 import { redactJson, redactText } from "./redaction.js";
+import { fingerprint } from "./fingerprint.js";
+import { execCommand } from "./exec.js";
 
 type EngineOptions = {
   globalConcurrency?: number;
@@ -66,6 +72,7 @@ type EngineOptions = {
   operationalRetryBaseMs?: number;
   maxOperationalRetries?: number;
   agentHealthcheckIntervalMs?: number;
+  adapterFactory?: (agent: Agent) => AgentAdapter;
 };
 
 type JobExecution = {
@@ -80,18 +87,20 @@ export class AecSEngine {
   private readonly leaseHeartbeatMs: number;
   private readonly operationalRetryBaseMs: number;
   private readonly maxOperationalRetries: number;
-  private readonly agentHealthcheckIntervalMs: number;
+  private readonly agentHealthcheckIntervalMs?: number;
+  private readonly adapterFactory: (agent: Agent) => AgentAdapter;
   private readonly inProcess = new Set<string>();
   private readonly leaseOwner = `${process.pid}:${newId("lease")}`;
   private schedulerCycles = 0;
   private lastAgentHealthcheckAt = 0;
 
   constructor(readonly db: AecSDatabase, options: EngineOptions = {}) {
-    this.globalConcurrency = options.globalConcurrency ?? 2;
+    this.globalConcurrency = options.globalConcurrency ?? 3;
     this.leaseHeartbeatMs = options.leaseHeartbeatMs ?? 10_000;
     this.operationalRetryBaseMs = options.operationalRetryBaseMs ?? 5_000;
     this.maxOperationalRetries = options.maxOperationalRetries ?? 5;
-    this.agentHealthcheckIntervalMs = options.agentHealthcheckIntervalMs ?? 60_000;
+    this.agentHealthcheckIntervalMs = options.agentHealthcheckIntervalMs;
+    this.adapterFactory = options.adapterFactory ?? adapterFor;
   }
 
   submitGraph(projectId: string, inputs: TaskInput[]): Task[] {
@@ -102,7 +111,7 @@ export class AecSEngine {
     const normalized = parsedInputs.map((input) => ({ ...input, id: input.id ?? newId("task"), projectId }));
     const graphIds = new Set(normalized.map((input) => input.id!));
     if (graphIds.size !== normalized.length) throw new Error("Task graph contains duplicate IDs");
-    for (const input of normalized) this.validateTaskInput(input);
+    for (const input of normalized) this.validateTaskInput(input, project);
     for (const input of normalized) {
       if (input.replacesTaskId) {
         if (input.replacesTaskId === input.id) throw new Error(`Task ${input.id} cannot replace itself`);
@@ -133,11 +142,19 @@ export class AecSEngine {
           }
         }
       }
+      const deferred = tasks.filter((task) => task.status === "queued").length;
+      if (deferred > 0) {
+        this.db.appendEvent({
+          projectId,
+          type: "policy.progressive_dag_parking",
+          payload: { mode: project.controlPolicy?.progressiveDagParking ?? "observe", deferred, frontier: tasks.length - deferred },
+        });
+      }
       return tasks;
     });
   }
 
-  private validateTaskInput(input: TaskInput): void {
+  private validateTaskInput(input: TaskInput, project?: Project): void {
     if (!input.title.trim()) throw new Error("Task title is required");
     if (!input.goal.trim()) throw new Error("Task goal is required");
     if (input.acceptanceCriteria.length === 0) throw new Error(`Task ${input.id ?? input.title} requires acceptance criteria`);
@@ -145,6 +162,12 @@ export class AecSEngine {
       throw new Error(`Task priority must be between -100 and 100: ${input.id ?? input.title}`);
     }
     for (const command of input.validationCommands ?? []) this.validateCommand(command);
+    if (project) {
+      const environmentIds = new Set((project.environmentContract?.components ?? []).map((component) => component.id));
+      for (const requirement of input.environmentRequirements ?? []) {
+        if (!environmentIds.has(requirement)) throw new Error(`Task ${input.id ?? input.title} requires undeclared Environment component: ${requirement}`);
+      }
+    }
   }
 
   private validateCommand(command: CommandSpec): void {
@@ -185,23 +208,38 @@ export class AecSEngine {
     this.schedulerCycles += 1;
     if (this.schedulerCycles % 100 === 0) this.db.pruneEvents();
     this.promoteOperationalRetries();
+    this.promoteCompletedObservations();
     this.promoteTasks();
     this.recalculateAgentLoad();
     const allActiveRuns = this.db.listActiveRuns();
     const cleanupRuns = allActiveRuns.filter((run) => run.phase === "cleanup");
-    const capacityRuns = allActiveRuns.filter(
-      (run) => run.phase !== "cleanup" && this.db.getTask(run.taskId)?.status !== "paused",
-    );
-    const activeRuns = [...cleanupRuns, ...capacityRuns].filter((run) => this.canClaimRun(run));
+    const capacityPhases = new Set<Run["phase"]>(["prepare", "execute", "validate", "review", "repair", "publish"]);
+    const capacityRuns = allActiveRuns.filter((run) =>
+      capacityPhases.has(run.phase) && this.db.getTask(run.taskId)?.status !== "paused");
+    const waitingRuns = allActiveRuns.filter((run) => run.phase !== "cleanup" && !capacityPhases.has(run.phase));
+    const activeRuns = [...cleanupRuns, ...capacityRuns, ...waitingRuns].filter((run) => {
+      if (!this.canClaimRun(run)) return false;
+      if (run.status !== "interrupted" || run.phase !== "cleanup") return true;
+      const retry = run.error?.operationalRetry;
+      if (!retry || typeof retry !== "object" || Array.isArray(retry)) return true;
+      return Date.parse(String((retry as JsonObject).nextAttemptAt ?? "")) <= Date.now();
+    });
     const work: Array<Promise<void>> = [];
     for (const run of activeRuns) {
       if (this.inProcess.has(run.taskId)) continue;
       work.push(this.runTaskSafely(run.taskId));
     }
-    const activeTasks = capacityRuns
+    const activeTasks = allActiveRuns
       .map((run) => this.db.getTask(run.taskId))
       .filter((task): task is Task => Boolean(task));
     const selected = [...activeTasks];
+    const conflictReservations = [
+      ...activeTasks,
+      ...this.db.listTasks().filter((task) => {
+        const latest = this.db.getLatestRunForTask(task.id);
+        return task.status === "operational_blocked" && latest?.status === "interrupted" && latest.phase === "remote_checks";
+      }),
+    ].filter((task, index, values) => values.findIndex((candidate) => candidate.id === task.id) === index);
     const reservedLoads = new Map(this.db.listAgents().map((agent) => [agent.id, agent.currentLoad]));
     let slots = Math.max(0, this.globalConcurrency - capacityRuns.length);
     for (const task of this.db.listRunnableTasks()) {
@@ -211,11 +249,12 @@ export class AecSEngine {
       if (!project) continue;
       const projectActive = selected.filter((item) => item.projectId === project.id).length;
       if (projectActive >= project.maxConcurrency) continue;
-      if (selected.some((other) => other.projectId === task.projectId && tasksConflict(task.scope, other.scope))) continue;
+      if (conflictReservations.some((other) => other.projectId === task.projectId && tasksConflict(task.scope, other.scope))) continue;
       const reservedAgent = this.selectAgent("executor", task.requiredCapabilities, new Set(), reservedLoads);
       if (!reservedAgent) continue;
       reservedLoads.set(reservedAgent.id, (reservedLoads.get(reservedAgent.id) ?? 0) + 1);
       selected.push(task);
+      conflictReservations.push(task);
       slots -= 1;
       work.push(this.runTaskSafely(task.id, reservedAgent.id));
     }
@@ -225,7 +264,7 @@ export class AecSEngine {
     return work.length;
   }
 
-  async runUntilIdle(maxCycles = 100): Promise<void> {
+  async runUntilIdle(maxCycles = Number.POSITIVE_INFINITY): Promise<void> {
     for (let cycle = 0; cycle < maxCycles; cycle += 1) {
       const count = await this.runOnce();
       if (count === 0) return;
@@ -260,23 +299,42 @@ export class AecSEngine {
     }
   }
 
-  async refreshAgentAvailability(): Promise<void> {
+  async refreshAgentAvailability(): Promise<Map<string, RuntimeProbeResult>> {
+    const results = new Map<string, RuntimeProbeResult>();
+    const probeCache = new Map<string, Promise<RuntimeProbeResult>>();
     for (const agent of this.db.listAgents()) {
       if (!agent.enabled || agent.availability === "offline") continue;
       let healthy = false;
+      let version: string | undefined;
       try {
-        healthy = (await adapterFor(agent).healthcheck()).ok;
-      } catch {
+        const cacheKey = JSON.stringify({ adapter: agent.adapter, config: agent.config });
+        let pending = probeCache.get(cacheKey);
+        if (!pending) {
+          pending = this.adapterFactory(agent).probe();
+          probeCache.set(cacheKey, pending);
+        }
+        const probe = await pending;
+        results.set(agent.id, probe);
+        healthy = probe.ok;
+        version = probe.version;
+      } catch (error) {
+        results.set(agent.id, {
+          ok: false,
+          detail: redactText(error instanceof Error ? error.message : String(error)),
+        });
         healthy = false;
       }
-      const availability = healthy ? "available" : "degraded";
-      if (agent.availability !== availability) this.db.updateAgent(agent.id, { availability });
+      this.db.recordAgentHealth(agent.id, healthy, version);
     }
     this.lastAgentHealthcheckAt = Date.now();
+    return results;
   }
 
   private async refreshAgentAvailabilityIfDue(): Promise<void> {
-    if (Date.now() - this.lastAgentHealthcheckAt < this.agentHealthcheckIntervalMs) return;
+    const configuredInterval = this.db.listProjects().length > 0
+      ? Math.min(...this.db.listProjects().map((project) => project.operationalConfig?.healthProbeIntervalSeconds ?? 60)) * 1_000
+      : 60_000;
+    if (Date.now() - this.lastAgentHealthcheckAt < (this.agentHealthcheckIntervalMs ?? configuredInterval)) return;
     await this.refreshAgentAvailability();
   }
 
@@ -285,6 +343,15 @@ export class AecSEngine {
       if (task.status !== "operational_blocked") continue;
       const run = this.db.getLatestRunForTask(task.id);
       const retry = run?.error?.operationalRetry;
+      const externalWait = run?.error?.externalWait;
+      if (run?.status === "interrupted" && externalWait && typeof externalWait === "object" && !Array.isArray(externalWait)) {
+        const nextAttemptAt = String((externalWait as JsonObject).nextAttemptAt ?? "");
+        if (nextAttemptAt && Date.parse(nextAttemptAt) <= Date.now()) {
+          this.db.updateTaskStatus(task.id, "ready", { summary: "External wait is ready for reconciliation" });
+          this.db.appendEvent({ projectId: task.projectId, taskId: task.id, runId: run.id, type: "run.external_wait_ready", payload: { nextAttemptAt } });
+        }
+        continue;
+      }
       if (!run || run.status !== "interrupted" || !retry || typeof retry !== "object" || Array.isArray(retry)) continue;
       const nextAttemptAt = String((retry as JsonObject).nextAttemptAt ?? "");
       if (!nextAttemptAt || Date.parse(nextAttemptAt) > Date.now()) continue;
@@ -295,6 +362,26 @@ export class AecSEngine {
         runId: run.id,
         type: "run.retry_ready",
         payload: { nextAttemptAt },
+      });
+    }
+  }
+
+  private promoteCompletedObservations(): void {
+    for (const task of this.db.listTasks()) {
+      if (task.status !== "observing") continue;
+      const run = this.db.getLatestRunForTask(task.id);
+      const observation = run?.error?.stabilityObservation;
+      if (!run || run.status !== "interrupted" || run.phase !== "stability_observation" ||
+          !observation || typeof observation !== "object" || Array.isArray(observation)) continue;
+      const completesAt = String((observation as JsonObject).completesAt ?? "");
+      if (!completesAt || Date.parse(completesAt) > Date.now()) continue;
+      this.db.updateTaskStatus(task.id, "ready", { summary: "Stability observation window completed" });
+      this.db.appendEvent({
+        projectId: task.projectId,
+        taskId: task.id,
+        runId: run.id,
+        type: "run.observation_ready",
+        payload: { completesAt },
       });
     }
   }
@@ -362,7 +449,21 @@ export class AecSEngine {
       repairCount: 0,
       rotationCount: 0,
       baseSha,
+      ...(task.currentRevisionId ? { taskRevisionId: task.currentRevisionId } : {}),
+      ...(task.currentRevisionId && this.db.getTaskRevision(task.currentRevisionId)
+        ? { contextFingerprint: this.db.getTaskRevision(task.currentRevisionId)!.contextFingerprint }
+        : {}),
       validation: [],
+      metrics: {
+        implementationMs: 0,
+        controlMs: 0,
+        validationMs: 0,
+        reviewMs: 0,
+        waitMs: 0,
+        validationRuns: 0,
+        repairRuns: 0,
+        runtimeSwitches: 0,
+      },
       effects: {},
       logDir,
       startedAt: timestamp,
@@ -385,6 +486,7 @@ export class AecSEngine {
     const created = this.db.transaction(() => {
       if (this.db.getTask(task.id)?.status !== "ready") return false;
       this.db.createRun(run);
+      this.db.markAgentAssigned(agent.id);
       this.db.createWorkspace(workspace);
       this.db.updateTaskStatus(task.id, "running");
       return true;
@@ -414,7 +516,12 @@ export class AecSEngine {
       this.renewLease(run);
       try {
         await this.withLeaseHeartbeat(run, async () => {
+          const controlStartedAt = Date.now();
+          const controlPhase = new Set<Run["phase"]>([
+            "prepare", "publish", "remote_checks", "merge", "post_merge_smoke", "stability_observation", "revert",
+          ]).has(run.phase);
           if (await this.reconcileCompletedGitHubMerge(run)) return;
+          if (this.reconcileContextRevision(run)) return;
           switch (run.phase) {
             case "prepare":
               await this.phasePrepare(run);
@@ -440,12 +547,22 @@ export class AecSEngine {
             case "merge":
               await this.phaseMerge(run);
               break;
+            case "post_merge_smoke":
+              await this.phasePostMergeSmoke(run);
+              break;
+            case "stability_observation":
+              await this.phaseStabilityObservation(run);
+              break;
+            case "revert":
+              await this.phaseRevert(run);
+              break;
             case "cleanup":
               await this.phaseCleanup(run);
               break;
             default:
               throw new Error(`Unsupported run phase: ${run.phase}`);
           }
+          if (controlPhase && run.status === "active") this.addRunMetric(run, "controlMs", Math.max(1, Date.now() - controlStartedAt));
         });
       } catch (error) {
         await this.handlePhaseError(this.requireRun(runId), error);
@@ -459,6 +576,7 @@ export class AecSEngine {
     const task = this.requireTask(run.taskId);
     const project = this.requireProject(task.projectId);
     const workspace = this.requireWorkspace(run.workspaceId);
+    await this.verifyEnvironmentContract(project, task, run);
     const baseSha = await createWorktree(project, workspace.path, workspace.branch);
     workspace.baseSha = baseSha;
     workspace.status = "active";
@@ -467,26 +585,114 @@ export class AecSEngine {
     this.setPhase(run, "execute", { baseSha });
   }
 
+  private async verifyEnvironmentContract(project: Project, task: Task, run: Run): Promise<void> {
+    const requirements = task.environmentRequirements ?? [];
+    if (requirements.length === 0) return;
+    const agent = this.requireAgent(run.agentId);
+    const verified: Array<{ id: string; version?: string }> = [];
+    for (const requirement of requirements) {
+      const component = project.environmentContract?.components.find((candidate) => candidate.id === requirement);
+      if (!component) throw new Error(`Required Environment component is not declared: ${requirement}`);
+      for (const capability of component.requiredCapabilities ?? []) {
+        if (!agent.capabilities.includes(capability)) {
+          throw new Error(`Environment component ${requirement} requires unavailable Agent capability: ${capability}`);
+        }
+      }
+      let observed = "";
+      if (component.command) {
+        const command = resolveValidationCommand(component.command, project.repoPath);
+        const result = await execCommand(command);
+        if (result.exitCode !== 0 || result.timedOut) {
+          throw new Error(`Environment component ${requirement} failed verification: ${redactText(result.stderr || result.stdout)}`);
+        }
+        observed = `${result.stdout}\n${result.stderr}`.trim();
+      } else if (requirement === "node") {
+        observed = process.version;
+      } else if (requirement === "git") {
+        const result = await execCommand({ program: "git", args: ["--version"], cwd: project.repoPath, timeoutSeconds: 15 });
+        if (result.exitCode !== 0) throw new Error(`Environment component git failed verification: ${redactText(result.stderr)}`);
+        observed = result.stdout.trim();
+      } else {
+        throw new Error(`Environment component ${requirement} requires a verification command`);
+      }
+      if (component.version && !this.environmentVersionMatches(component.version, observed)) {
+        throw new Error(`Environment component ${requirement} version mismatch: expected ${component.version}, observed ${redactText(observed, 300)}`);
+      }
+      verified.push({ id: requirement, ...(component.version ? { version: component.version } : {}) });
+    }
+    this.db.appendEvent({
+      projectId: project.id,
+      taskId: task.id,
+      runId: run.id,
+      type: "environment.verified",
+      payload: { contractVersion: project.environmentContract?.version ?? 1, components: verified },
+    });
+  }
+
+  private environmentVersionMatches(expected: string, observed: string): boolean {
+    const minimum = expected.trim().match(/^>=\s*(\d+)(?:\.\d+\.\d+)?$/);
+    if (minimum) {
+      const actual = observed.match(/v?(\d+)(?:\.\d+\.\d+)?/);
+      return Boolean(actual && Number(actual[1]) >= Number(minimum[1]));
+    }
+    return observed.includes(expected);
+  }
+
+  private reconcileContextRevision(run: Run): boolean {
+    const task = this.requireTask(run.taskId);
+    const current = task.currentRevisionId ? this.db.getTaskRevision(task.currentRevisionId) : undefined;
+    if (!current || (run.taskRevisionId === current.id && run.contextFingerprint === current.contextFingerprint)) return false;
+    const priorRevisionId = run.taskRevisionId;
+    const hadRevisionBinding = Boolean(run.taskRevisionId && run.contextFingerprint);
+    run.taskRevisionId = current.id;
+    run.contextFingerprint = current.contextFingerprint;
+    const evidenceBearingPhases = new Set<Run["phase"]>(["validate", "review", "repair", "publish", "remote_checks", "merge"]);
+    if (hadRevisionBinding && evidenceBearingPhases.has(run.phase)) {
+      run.phase = "validate";
+      run.attempt = 1;
+      run.validation = [];
+      run.review = undefined;
+      run.error = this.failureEvidence(run, { type: "context_revision_changed", priorRevisionId, revisionId: current.id });
+    }
+    this.saveRun(run);
+    this.db.appendEvent({
+      projectId: task.projectId,
+      taskId: task.id,
+      runId: run.id,
+      type: "run.context_rebound",
+      payload: { priorRevisionId, revisionId: current.id, fingerprint: current.contextFingerprint },
+    });
+    return hadRevisionBinding && evidenceBearingPhases.has(run.phase);
+  }
+
   private async phaseExecute(run: Run): Promise<void> {
     const { task, project, workspace, agent } = this.contextFor(run);
     const { path } = buildContextEnvelope(this.db, project, task, run, workspace, run.error);
     const schemas = writeSchemas(run.logDir);
-    const adapter = adapterFor(agent);
+    const adapter = this.adapterFactory(agent);
     const invocation = adapter.invocation({
       kind: "execute",
       prompt: executionPrompt(path),
       workspacePath: workspace.path,
       runDir: run.logDir,
       schemaPath: schemas.worker,
+      ...(run.runtimeSessionId ? { sessionId: run.runtimeSessionId } : {}),
     });
     const execution = await this.executeInvocation(run, invocation, "execute", agent.id);
+    this.addRunMetric(run, "implementationMs", this.executionDuration(execution));
     const structuredPath = execution.structuredOutputPath ?? invocation.structuredOutputPath;
     const resultPath = existsSync(structuredPath) ? structuredPath : execution.stdoutPath;
     const result = redactJson(parseStructuredOutput<WorkerResult>(resultPath));
     this.assertWorkerResult(result);
+    this.db.recordAgentHealth(agent.id, true, agent.runtimeVersion);
     run.workerResult = result;
     run.workerResultPath = resultPath;
-    run.codexSessionId = adapter.extractSessionId(execution.stdoutPath) ?? run.codexSessionId;
+    const sessionId = adapter.extractSessionId(execution.stdoutPath);
+    run.runtimeSessionId = sessionId ?? run.runtimeSessionId;
+    run.codexSessionId = sessionId ?? run.codexSessionId;
+    run.runtimeVersion = adapter.extractRuntimeVersion(execution.stdoutPath) ?? agent.runtimeVersion ?? run.runtimeVersion;
+    this.addTokenUsage(run, adapter.extractTokenUsage(execution.stdoutPath));
+    if (result.scopeExpansion && this.applyScopeExpansion(run, task, result)) return;
     run.error = result.status === "blocked"
       ? this.failureEvidence(run, { workerSummary: result.summary, notes: result.notes })
       : undefined;
@@ -503,6 +709,7 @@ export class AecSEngine {
 
   private async phaseValidate(run: Run): Promise<void> {
     const { task, project, workspace } = this.contextFor(run);
+    let revision = task.currentRevisionId ? this.db.getTaskRevision(task.currentRevisionId) : undefined;
     const paths = await changedPaths(workspace.path, run.baseSha);
     if (paths.length === 0) {
       this.setPhase(run, "repair", { error: this.failureEvidence(run, { type: "no_changes", message: "The task produced no file changes" }) });
@@ -513,19 +720,44 @@ export class AecSEngine {
       this.setPhase(run, "repair", { error: this.failureEvidence(run, { type: "scope_violation", paths: outside }) });
       return;
     }
+    if (revision?.effectiveRiskClass !== "core" && paths.some((path) => matchesAny(path, project.highRiskGlobs))) {
+      revision = this.db.createRiskElevationRevision(task.id, `Actual changed paths crossed the Project Risk Floor: ${paths.join(", ")}`);
+      run.taskRevisionId = revision.id;
+      run.contextFingerprint = revision.contextFingerprint;
+      run.validation = [];
+      run.review = undefined;
+      this.saveRun(run);
+      this.db.appendEvent({
+        projectId: project.id,
+        taskId: task.id,
+        runId: run.id,
+        type: "policy.temporary_risk_elevation",
+        payload: { mode: project.controlPolicy?.temporaryRiskElevation ?? "observe", revisionId: revision.id },
+      });
+    }
     const diffPath = join(run.logDir, `task-${run.id}.diff`);
     await writeDiff(workspace.path, run.baseSha, diffPath);
+    assertFileSize(diffPath, 8 * 1024 * 1024, "Task diff");
     run.diffPath = diffPath;
-    const commands = authoritativeCommands(project, task, paths);
+    const validationTask = revision?.gateProfile.validation === "applicable"
+      ? { ...task, requiresFullValidation: true }
+      : task;
+    const commands = authoritativeCommands(project, validationTask, paths);
     for (let index = run.validation.length; index < commands.length; index += 1) {
       const original = commands[index]!;
       const command = resolveValidationCommand(original, workspace.path);
       const name = `${command.program} ${command.args.join(" ")}`.trim();
-      const pathsForCommand = validationPaths(run.logDir, index, `${command.program}-${run.attempt}-${run.repairCount}`);
+      const pathsForCommand = validationPaths(
+        run.logDir,
+        index,
+        `${command.program}-${run.attempt}-${run.repairCount}-${run.baseSha.slice(0, 12)}-${run.taskRevisionId ?? "unbound"}`,
+      );
       const execution = await this.executeCommand(run, command, `validation-${index}`, {
         fixedPaths: pathsForCommand,
         allowFailure: true,
       });
+      this.addRunMetric(run, "validationMs", this.executionDuration(execution));
+      this.addRunMetric(run, "validationRuns", 1);
       if (execution.result.status === "spawn_error") {
         throw new Error(`Authoritative validation could not start: ${name}`);
       }
@@ -554,19 +786,81 @@ export class AecSEngine {
       });
       return;
     }
+    if (revision?.effectiveRiskClass !== "core" && postValidationPaths.some((path) => matchesAny(path, project.highRiskGlobs))) {
+      revision = this.db.createRiskElevationRevision(task.id, `Validation generated paths that crossed the Project Risk Floor: ${postValidationPaths.join(", ")}`);
+      run.taskRevisionId = revision.id;
+      run.contextFingerprint = revision.contextFingerprint;
+      run.validation = [];
+      run.review = undefined;
+      this.db.appendEvent({
+        projectId: project.id,
+        taskId: task.id,
+        runId: run.id,
+        type: "policy.temporary_risk_elevation",
+        payload: { mode: project.controlPolicy?.temporaryRiskElevation ?? "observe", revisionId: revision.id, source: "post_validation" },
+      });
+      this.setPhase(run, "validate", { attempt: 1 });
+      return;
+    }
     // The independent reviewer must see the authoritative post-validation diff,
     // including any generated file that is intentionally within Task scope.
     await writeDiff(workspace.path, run.baseSha, diffPath);
-    const reviewer = this.selectAgent("reviewer", task.requiredCapabilities, new Set([run.agentId]));
+    assertFileSize(diffPath, 8 * 1024 * 1024, "Post-validation diff");
+    if (revision?.gateProfile.review === "none") {
+      this.setPhase(run, "publish", { attempt: 1, review: { completed: true, summary: "Review not required by Gate Profile", findings: [] } });
+      return;
+    }
+    const executor = this.requireAgent(run.agentId);
+    const excludedFamilies = revision?.gateProfile.review === "strict" &&
+        (project.controlPolicy?.strictReviewMinRuntimeFamilies ?? 1) > 1
+      ? new Set([executor.runtimeFamily ?? executor.adapter])
+      : new Set<string>();
+    const reviewer = this.selectAgent("reviewer", task.requiredCapabilities, new Set([run.agentId]), undefined, excludedFamilies);
     if (!reviewer) throw new Error(`No independent reviewer is available for task ${task.id}`);
     this.setPhase(run, "review", { attempt: 1 });
   }
 
   private async phaseReview(run: Run): Promise<void> {
     const { task, project, workspace } = this.contextFor(run);
-    const reviewer = this.selectAgent("reviewer", task.requiredCapabilities, new Set([run.agentId]));
+    const executor = this.requireAgent(run.agentId);
+    const revision = task.currentRevisionId ? this.db.getTaskRevision(task.currentRevisionId) : undefined;
+    const excludedFamilies = revision?.gateProfile.review === "strict" &&
+        (project.controlPolicy?.strictReviewMinRuntimeFamilies ?? 1) > 1
+      ? new Set([executor.runtimeFamily ?? executor.adapter])
+      : new Set<string>();
+    const priorReviewerId = run.review?.reviewerAgentId;
+    const retainedCandidate = run.review?.completed === false && priorReviewerId
+      ? this.db.getAgent(priorReviewerId)
+      : undefined;
+    const retainedReviewer = retainedCandidate &&
+        retainedCandidate.enabled &&
+        !["registered", "unavailable", "disabled", "offline"].includes(retainedCandidate.availability) &&
+        retainedCandidate.roles.includes("reviewer") &&
+        (retainedCandidate.adapter === "command" || retainedCandidate.runtimeCapabilities?.structuredOutput === true) &&
+        (retainedCandidate.adapter === "command" || retainedCandidate.runtimeCapabilities?.reviewMode === true) &&
+        retainedCandidate.currentLoad < retainedCandidate.maxConcurrency &&
+        !excludedFamilies.has(retainedCandidate.runtimeFamily ?? retainedCandidate.adapter) &&
+        task.requiredCapabilities.every((capability) => retainedCandidate.capabilities.includes(capability))
+      ? retainedCandidate
+      : undefined;
+    const reviewer = retainedReviewer ?? this.selectAgent("reviewer", task.requiredCapabilities, new Set([run.agentId]), undefined, excludedFamilies);
     if (!reviewer) {
       throw new Error(`No independent reviewer is available for task ${task.id}`);
+    }
+    if (!retainedReviewer) {
+      if (priorReviewerId && priorReviewerId !== reviewer.id) {
+        run.attempt = 1;
+        this.addRunMetric(run, "runtimeSwitches", 1);
+        this.db.appendEvent({
+          projectId: project.id,
+          taskId: task.id,
+          runId: run.id,
+          type: "run.reviewer_rotated",
+          payload: { fromAgentId: priorReviewerId, agentId: reviewer.id },
+        });
+      }
+      run.review = { completed: false, summary: "Review in progress", findings: [], reviewerAgentId: reviewer.id };
+      this.saveRun(run);
     }
     const reviewDir = join(this.db.paths.home, "reviews", run.id, `${run.attempt}-${run.repairCount}`);
     mkdirSync(reviewDir, { recursive: true, mode: 0o700 });
@@ -578,16 +872,33 @@ export class AecSEngine {
     if (!run.diffPath) throw new Error("Reviewer cannot run without a task diff");
     copyFileSync(run.diffPath, reviewDiff);
     const schemas = writeSchemas(reviewDir);
-    const invocation = adapterFor(reviewer).invocation({
+    const prompt = reviewer.adapter === "deepseek_harness"
+      ? [
+          reviewPrompt(path, reviewDiff),
+          "The DSH reviewer composition has no filesystem tools. The authoritative packet follows.",
+          "--- CONTEXT JSON ---",
+          readTextBounded(path, 8 * 1024 * 1024, "Review context"),
+          "--- TASK DIFF ---",
+          readTextBounded(reviewDiff, 8 * 1024 * 1024, "Review diff"),
+          "--- END PACKET ---",
+        ].join("\n")
+      : reviewPrompt(path, reviewDiff);
+    if (Buffer.byteLength(prompt, "utf8") > 8 * 1024 * 1024) {
+      throw new Error("Reviewer prompt exceeds 8 MiB");
+    }
+    const reviewerAdapter = this.adapterFactory(reviewer);
+    const invocation = reviewerAdapter.invocation({
       kind: "review",
-      prompt: reviewPrompt(path, reviewDiff),
+      prompt,
       workspacePath: workspace.path,
       runDir: reviewDir,
       schemaPath: schemas.review,
     });
     const execution = await this.executeInvocation(run, invocation, "review", reviewer.id);
+    this.addRunMetric(run, "reviewMs", this.executionDuration(execution));
     const postReviewDiff = join(reviewDir, "post-review.diff");
     await writeDiff(workspace.path, run.baseSha, postReviewDiff);
+    assertFileSize(postReviewDiff, 8 * 1024 * 1024, "Post-review diff");
     if (!readFileSync(reviewDiff).equals(readFileSync(postReviewDiff))) {
       throw new Error(`Reviewer ${reviewer.id} modified the task workspace`);
     }
@@ -595,12 +906,38 @@ export class AecSEngine {
     const resultPath = existsSync(structuredPath) ? structuredPath : execution.stdoutPath;
     const review = redactJson(parseStructuredOutput<ReviewResult>(resultPath));
     this.assertReviewResult(review);
-    run.review = { ...review, reviewerAgentId: reviewer.id };
-    if (review.verdict === "fail") {
-      this.setPhase(run, "repair", { error: this.failureEvidence(run, { type: "review_failed", review }) });
-    } else {
-      this.setPhase(run, "publish", { attempt: 1 });
+    this.db.recordAgentHealth(reviewer.id, true, reviewer.runtimeVersion);
+    this.addTokenUsage(run, reviewerAdapter.extractTokenUsage(execution.stdoutPath));
+    run.review = { ...review, completed: true, reviewerAgentId: reviewer.id };
+    const observedFindingIds = new Set<string>();
+    for (const observation of review.findings) {
+      const finding = this.db.createFinding({
+        projectId: project.id,
+        taskId: task.id,
+        runId: run.id,
+        taskRevisionId: task.currentRevisionId ?? run.taskRevisionId ?? "unknown",
+        severity: observation.severity,
+        summary: observation.summary,
+        ...(observation.category ? { rule: observation.category } : {}),
+        ...(observation.file ? { file: observation.file } : {}),
+        ...(observation.line ? { line: observation.line } : {}),
+        ...(observation.evidence ? { evidence: observation.evidence } : {}),
+        reviewerAgentId: reviewer.id,
+      });
+      observedFindingIds.add(finding.id);
+      if (finding.status === "structurally_valid") {
+        this.db.transitionFinding(finding.id, "verified", observation.evidence ?? "Authorized independent Review observation", reviewer.id);
+      }
     }
+    for (const prior of this.db.listFindings(task.id, "verified")) {
+      if (prior.taskRevisionId !== (task.currentRevisionId ?? run.taskRevisionId) || observedFindingIds.has(prior.id)) continue;
+      this.db.transitionFinding(prior.id, "resolved", `Independent reviewer ${reviewer.id} no longer reproduced the Finding after Repair`, reviewer.id);
+    }
+    if (this.db.hasVerifiedBlockingFindings(task.id, task.currentRevisionId ?? run.taskRevisionId)) {
+      this.setPhase(run, "repair", { error: this.failureEvidence(run, { type: "verified_blocking_finding", review }) });
+      return;
+    }
+    this.setPhase(run, "publish", { attempt: 1 });
   }
 
   private async phaseRepair(run: Run): Promise<void> {
@@ -610,25 +947,35 @@ export class AecSEngine {
     }
     const { task, project, workspace, agent } = this.contextFor(run);
     run.repairCount += 1;
+    this.addRunMetric(run, "repairRuns", 1);
     const feedback = run.error;
     this.saveRun(run);
     const { path } = buildContextEnvelope(this.db, project, task, run, workspace, feedback);
     const schemas = writeSchemas(run.logDir);
-    const invocation = adapterFor(agent).invocation({
+    const adapter = this.adapterFactory(agent);
+    const invocation = adapter.invocation({
       kind: "repair",
       prompt: repairPrompt(path),
       workspacePath: workspace.path,
       runDir: run.logDir,
       schemaPath: schemas.worker,
-      ...(run.codexSessionId ? { sessionId: run.codexSessionId } : {}),
+      ...(run.runtimeSessionId ?? run.codexSessionId ? { sessionId: run.runtimeSessionId ?? run.codexSessionId } : {}),
     });
     const execution = await this.executeInvocation(run, invocation, `repair-${run.repairCount}`, agent.id);
+    this.addRunMetric(run, "implementationMs", this.executionDuration(execution));
     const structuredPath = execution.structuredOutputPath ?? invocation.structuredOutputPath;
     const resultPath = existsSync(structuredPath) ? structuredPath : execution.stdoutPath;
     const result = redactJson(parseStructuredOutput<WorkerResult>(resultPath));
     this.assertWorkerResult(result);
+    this.db.recordAgentHealth(agent.id, true, agent.runtimeVersion);
     run.workerResult = result;
     run.workerResultPath = resultPath;
+    const sessionId = adapter.extractSessionId(execution.stdoutPath);
+    run.runtimeSessionId = sessionId ?? run.runtimeSessionId;
+    run.codexSessionId = sessionId ?? run.codexSessionId;
+    run.runtimeVersion = adapter.extractRuntimeVersion(execution.stdoutPath) ?? agent.runtimeVersion ?? run.runtimeVersion;
+    this.addTokenUsage(run, adapter.extractTokenUsage(execution.stdoutPath));
+    if (result.scopeExpansion && this.applyScopeExpansion(run, task, result)) return;
     if (result.status === "blocked") {
       if (result.blocker && result.blocker.kind !== "technical") {
         this.escalateWorkerDecision(run, result);
@@ -667,6 +1014,21 @@ export class AecSEngine {
     if (targetHead !== run.baseSha) {
       const targetChanges = await changedPathsBetween(project.repoPath, run.baseSha, targetHead);
       const relevant = changesAffectTask(task, targetChanges);
+      const driftCommits = await commitCountBetween(project.repoPath, run.baseSha, targetHead);
+      const driftSeconds = Math.max(0, Math.floor((Date.now() - Date.parse(run.startedAt)) / 1_000));
+      const exceedsCommitBudget = project.operationalConfig?.driftMaxCommits !== undefined &&
+        driftCommits > project.operationalConfig.driftMaxCommits;
+      const exceedsTimeBudget = project.operationalConfig?.driftMaxSeconds !== undefined &&
+        driftSeconds > project.operationalConfig.driftMaxSeconds;
+      if (exceedsCommitBudget || exceedsTimeBudget) {
+        this.db.appendEvent({
+          projectId: project.id,
+          taskId: task.id,
+          runId: run.id,
+          type: "control.drift_budget_exceeded",
+          payload: { driftCommits, driftSeconds, relevant },
+        });
+      }
       try {
         await rebaseOntoTarget(project, workspace.path);
       } catch (error) {
@@ -702,13 +1064,37 @@ export class AecSEngine {
   }
 
   private async phaseRemoteChecks(run: Run): Promise<void> {
-    const { project, workspace } = this.contextFor(run);
+    const { task, project, workspace } = this.contextFor(run);
     const prRef = run.effects.pullRequest?.externalRef;
     if (!prRef) throw new Error("PR effect has no external reference");
     const prNumber = Number(prRef.split("#").at(-1));
     if (!Number.isFinite(prNumber)) throw new Error(`Invalid PR reference: ${prRef}`);
-    await waitForRequiredChecks(project, workspace.path, prNumber, 1800, () => this.renewLease(run));
-    this.setPhase(run, "merge");
+    const state = await inspectRequiredChecks(project, workspace.path, prNumber);
+    if (state === "passed") {
+      const existing = run.error?.externalWait;
+      if (existing && typeof existing === "object" && !Array.isArray(existing)) {
+        const startedAt = Date.parse(String((existing as JsonObject).startedAt ?? ""));
+        if (Number.isFinite(startedAt)) this.addRunMetric(run, "waitMs", Date.now() - startedAt);
+      }
+      this.setPhase(run, "merge", { error: undefined });
+      return;
+    }
+    const existing = run.error?.externalWait;
+    const startedAt = existing && typeof existing === "object" && !Array.isArray(existing)
+      ? String((existing as JsonObject).startedAt ?? nowIso())
+      : nowIso();
+    const deadlineAt = existing && typeof existing === "object" && !Array.isArray(existing)
+      ? String((existing as JsonObject).deadlineAt ?? new Date(Date.now() + 1_800_000).toISOString())
+      : new Date(Date.now() + 1_800_000).toISOString();
+    if (Date.parse(deadlineAt) <= Date.now()) throw new Error(`Timed out waiting for GitHub checks on PR #${prNumber}`);
+    const intervalMs = Math.max(250, Number(process.env.AEC_S_GITHUB_CHECK_POLL_MS ?? 5_000));
+    const nextAttemptAt = new Date(Date.now() + intervalMs).toISOString();
+    run.error = this.failureEvidence(run, { externalWait: { type: "github_checks", startedAt, deadlineAt, nextAttemptAt } });
+    run.status = "interrupted";
+    run.leaseUntil = undefined;
+    run.leaseOwner = undefined;
+    this.saveRun(run);
+    this.db.updateTaskStatus(task.id, "operational_blocked", { summary: `Waiting for required checks until ${nextAttemptAt}` });
   }
 
   private async phaseMerge(run: Run): Promise<void> {
@@ -716,23 +1102,19 @@ export class AecSEngine {
     const commitSha = await branchHead(workspace.path, "HEAD");
     const operationId = this.operationId(project.id, task.id, run.id, "merge");
     if (run.effects.merge?.status === "completed" && run.effects.merge.externalRef) {
-      if (task.status !== "succeeded") {
-        this.db.updateTaskStatus(task.id, "succeeded", {
-          summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
-          mergeSha: run.effects.merge.externalRef,
-        });
-      }
-      this.setPhase(run, "cleanup");
+      if (task.status !== "observing") this.db.updateTaskStatus(task.id, "observing", {
+        summary: `Merged at ${run.effects.merge.externalRef}; post-merge convergence pending`,
+        mergeSha: run.effects.merge.externalRef,
+      });
+      this.setPhase(run, "post_merge_smoke");
       return;
     }
     if (project.deliveryMode === "local") {
       const currentTarget = await branchHead(project.repoPath, project.targetBranch);
       if (currentTarget === commitSha) {
         this.setEffect(run, "merge", { operationId, status: "completed", externalRef: currentTarget });
-        if (task.status !== "succeeded") {
-          this.db.updateTaskStatus(task.id, "succeeded", { summary: `Completed by run ${run.id}`, mergeSha: currentTarget });
-        }
-        this.setPhase(run, "cleanup");
+        this.db.updateTaskStatus(task.id, "observing", { summary: `Merged at ${currentTarget}; post-merge convergence pending`, mergeSha: currentTarget });
+        this.setPhase(run, "post_merge_smoke");
         return;
       }
     }
@@ -764,11 +1146,11 @@ export class AecSEngine {
         mergeSha = await localMerge(project, workspace.branch, commitSha);
       }
       this.setEffect(run, "merge", { operationId, status: "completed", externalRef: mergeSha });
-      this.db.updateTaskStatus(task.id, "succeeded", {
-        summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
+      this.db.updateTaskStatus(task.id, "observing", {
+        summary: `Merged at ${mergeSha}; post-merge convergence pending`,
         mergeSha,
       });
-      this.setPhase(run, "cleanup");
+      this.setPhase(run, "post_merge_smoke");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (project.deliveryMode === "local" && message.includes("fast-forward")) {
@@ -783,6 +1165,139 @@ export class AecSEngine {
       });
       throw error;
     }
+  }
+
+  private async phasePostMergeSmoke(run: Run): Promise<void> {
+    const { task, project } = this.contextFor(run);
+    const mergeSha = run.effects.merge?.externalRef;
+    if (!mergeSha) throw new Error("Post-merge smoke requires an authoritative merge SHA");
+    const operationId = this.operationId(project.id, task.id, run.id, "post_merge_smoke");
+    await verifyMergedRevision(project, this.requireWorkspace(run.workspaceId).path, mergeSha);
+    if (run.effects.postMergeSmoke?.status !== "completed") {
+      this.setEffect(run, "postMergeSmoke", { operationId, status: "started", externalRef: mergeSha });
+      const commands = project.postMergeSmoke ?? [];
+      for (let index = 0; index < commands.length; index += 1) {
+        const original = commands[index]!;
+        const smokeRoot = project.deliveryMode === "github" ? this.requireWorkspace(run.workspaceId).path : project.repoPath;
+        const command = resolveValidationCommand(original, smokeRoot);
+        const label = `post-merge-smoke-${index}`;
+        const smokePaths = validationPaths(run.logDir, index, label);
+        const execution = await this.executeCommand(run, command, label, { fixedPaths: smokePaths, allowFailure: true });
+        this.addRunMetric(run, "validationMs", this.executionDuration(execution));
+        this.addRunMetric(run, "validationRuns", 1);
+        const mutated = await workspaceHasChanges(smokeRoot);
+        if (execution.result.status !== "completed" || execution.result.exitCode !== 0 || mutated) {
+          this.setEffect(run, "postMergeSmoke", { operationId, status: "completed", externalRef: `failed:${mergeSha}` });
+          this.db.appendEvent({ projectId: project.id, taskId: task.id, runId: run.id, type: "post_merge_smoke.failed", payload: { mergeSha, index, mutated } });
+          this.setPhase(run, "revert", { error: this.failureEvidence(run, { type: "post_merge_smoke_failed", mergeSha, command: original, mutated }) });
+          return;
+        }
+      }
+      this.setEffect(run, "postMergeSmoke", { operationId, status: "completed", externalRef: mergeSha });
+      this.db.appendEvent({
+        projectId: project.id,
+        taskId: task.id,
+        runId: run.id,
+        type: "post_merge_smoke.passed",
+        payload: { mergeSha, registeredCommands: commands.length },
+      });
+    }
+    this.setPhase(run, "stability_observation");
+  }
+
+  private async phaseStabilityObservation(run: Run): Promise<void> {
+    const { task, project } = this.contextFor(run);
+    const seconds = project.operationalConfig?.stabilityObservationSeconds ?? 0;
+    const existing = run.error?.stabilityObservation;
+    if (seconds > 0 && (!existing || typeof existing !== "object" || Array.isArray(existing))) {
+      const completesAt = new Date(Date.now() + seconds * 1_000).toISOString();
+      run.error = this.failureEvidence(run, { stabilityObservation: { completesAt } });
+      run.status = "interrupted";
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatus(task.id, "observing", { summary: `Stability observation until ${completesAt}` });
+      return;
+    }
+    const mergeSha = run.effects.merge?.externalRef;
+    this.db.updateTaskStatus(task.id, "succeeded", {
+      summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
+      ...(mergeSha ? { mergeSha } : {}),
+    });
+    this.setPhase(run, "cleanup", { error: undefined });
+  }
+
+  private async phaseRevert(run: Run): Promise<void> {
+    const { task, project } = this.contextFor(run);
+    const policy = project.controlPolicy?.autoRevert ?? "observe";
+    const mergeSha = run.effects.merge?.externalRef;
+    const successors = this.db.listTasks(project.id).filter((candidate) =>
+      candidate.dependsOn.includes(task.id) && !["cancelled", "failed", "parked"].includes(candidate.status));
+    const canRevert = policy === "enforce" && task.revertSafe === true && project.deliveryMode === "local" &&
+      Boolean(mergeSha) && successors.length === 0;
+    if (canRevert) {
+      const operationId = this.operationId(project.id, task.id, run.id, "revert");
+      this.setEffect(run, "revert", { operationId, status: "started", externalRef: mergeSha });
+      try {
+        const revertSha = await revertMergedTask(project, mergeSha!, task.id);
+        this.setEffect(run, "revert", { operationId, status: "completed", externalRef: revertSha });
+      } catch (error) {
+        this.setEffect(run, "revert", { operationId, status: "uncertain", externalRef: mergeSha });
+        throw error;
+      }
+    }
+    const repairId = `repair-${task.id.slice(0, 100)}-${fingerprint({ taskId: task.id, mergeSha }).slice(0, 16)}`;
+    if (!this.db.getTask(repairId)) {
+      const repair = this.db.createTask({
+        id: repairId,
+        projectId: project.id,
+        title: `Repair post-merge smoke: ${task.title}`,
+        goal: `Diagnose and repair the post-merge smoke failure recorded by Run ${run.id}.`,
+        scope: task.scope,
+        constraints: [...task.constraints, "Preserve the failed Run evidence and do not broaden Scope without a Proposal."],
+        acceptanceCriteria: [...task.acceptanceCriteria, "Registered post-merge smoke passes"],
+        validationCommands: task.validationCommands,
+        requiredCapabilities: task.requiredCapabilities,
+        proposedRiskClass: "core",
+        environmentRequirements: task.environmentRequirements,
+        revertSafe: task.revertSafe,
+        priority: task.priority + 1,
+      });
+      this.db.updateTaskStatus(repair.id, "parked", { summary: "Created from post-merge smoke evidence; awaiting controlled admission" });
+    }
+    const existingDecision = this.db.listDecisions(project.id, "pending")
+      .find((decision) => decision.taskId === repairId && decision.kind === "failure_exhausted");
+    const decision = existingDecision ?? this.db.createDecision({
+      projectId: project.id,
+      taskId: repairId,
+      kind: "failure_exhausted",
+      title: `Post-merge smoke failed: ${task.title}`,
+      body: JSON.stringify({
+        failedTaskId: task.id,
+        repairTaskId: repairId,
+        runId: run.id,
+        deliveryMode: project.deliveryMode,
+        mergeSha,
+        reverted: canRevert,
+      }, null, 2),
+      options: ["resume_task", "cancel_task"],
+    });
+    this.db.updateTaskStatus(task.id, "parked", {
+      summary: canRevert
+        ? `Post-merge smoke failed; merge reverted and Repair Task ${repairId} awaits Decision ${decision.id}`
+        : `Post-merge smoke failed; Repair Task ${repairId} awaits Decision ${decision.id}`,
+    });
+    run.status = "interrupted";
+    run.leaseUntil = undefined;
+    run.leaseOwner = undefined;
+    this.saveRun(run);
+    this.db.appendEvent({
+      projectId: project.id,
+      taskId: task.id,
+      runId: run.id,
+      type: canRevert ? "revert.completed" : "revert.parked",
+      payload: { policy, revertSafe: task.revertSafe ?? false, mergeSha, repairTaskId: repairId, successors: successors.map((item) => item.id) },
+    });
   }
 
   private async reconcileCompletedGitHubMerge(run: Run): Promise<boolean> {
@@ -802,22 +1317,25 @@ export class AecSEngine {
     if (!merged) return false;
     const operationId = this.operationId(project.id, task.id, run.id, "merge");
     this.setEffect(run, "merge", { operationId, status: "completed", externalRef: merged.mergeSha });
-    this.db.updateTaskStatus(task.id, "succeeded", {
-      summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
+    this.db.updateTaskStatus(task.id, "observing", {
+      summary: `Merged at ${merged.mergeSha}; post-merge convergence pending`,
       mergeSha: merged.mergeSha,
     });
-    this.setPhase(run, "cleanup", { error: undefined });
+    this.setPhase(run, "post_merge_smoke", { error: undefined });
     return true;
   }
 
   private async phaseCleanup(run: Run): Promise<void> {
     const { task, project, workspace } = this.contextFor(run);
     if (task.status !== "succeeded" && run.effects.merge?.status === "completed" && run.effects.merge.externalRef) {
-      this.db.updateTaskStatus(task.id, "succeeded", {
-        summary: run.workerResult?.summary ?? `Completed by run ${run.id}`,
+      this.db.updateTaskStatus(task.id, "observing", {
+        summary: `Recovered merge ${run.effects.merge.externalRef}; post-merge convergence pending`,
         mergeSha: run.effects.merge.externalRef,
       });
+      this.setPhase(run, "post_merge_smoke");
+      return;
     }
+    if (task.status !== "succeeded") throw new Error("Cleanup cannot precede post-merge convergence");
     if (project.deliveryMode === "github") await deleteRemoteTaskBranch(project, workspace.path, workspace.branch);
     await cleanupWorktree(project, workspace.path, workspace.branch);
     this.db.updateWorkspaceStatus(workspace.id, "cleaned");
@@ -881,16 +1399,39 @@ export class AecSEngine {
   }
 
   private async executeInvocation(run: Run, invocation: AgentInvocation, label: string, agentId: string): Promise<JobExecution> {
-    return await this.executeCommand(
+    const workspace = this.db.getWorkspace(run.workspaceId);
+    if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
+    const authorityHeadSha = run.job?.authorityHeadSha ?? await branchHead(workspace.path, "HEAD");
+    const guardedInvocation: AgentInvocation = {
+      ...invocation,
+      command: {
+        ...invocation.command,
+        env: {
+          ...invocation.command.env,
+          GIT_CONFIG_COUNT: "1",
+          GIT_CONFIG_KEY_0: "remote.origin.pushurl",
+          GIT_CONFIG_VALUE_0: "aec-s-runtime-authority-disabled://origin",
+          GH_TOKEN: "",
+          GITHUB_TOKEN: "",
+        },
+      },
+    };
+    const execution = await this.executeCommand(
       run,
-      invocation.command,
+      guardedInvocation.command,
       label,
       {
-        stdin: invocation.stdin,
-        structuredOutputPath: invocation.structuredOutputPath,
+        stdin: guardedInvocation.stdin,
+        structuredOutputPath: guardedInvocation.structuredOutputPath,
         agentId,
+        authorityHeadSha,
       },
     );
+    const postHeadSha = await branchHead(workspace.path, "HEAD");
+    if (postHeadSha !== authorityHeadSha) {
+      throw new Error(`Runtime authority violation: Agent ${agentId} changed Git HEAD during ${label}`);
+    }
+    return execution;
   }
 
   private async executeCommand(
@@ -902,6 +1443,7 @@ export class AecSEngine {
       stdin?: string;
       structuredOutputPath?: string;
       agentId?: string;
+      authorityHeadSha?: string;
       allowFailure?: boolean;
     } = {},
   ): Promise<JobExecution> {
@@ -925,7 +1467,17 @@ export class AecSEngine {
       };
       if (options.agentId) await this.waitForAgentSlot(options.agentId, run.id, jobId, run);
       try {
-        job = startSupervisedJob(input, paths.input, jobId);
+        job = startSupervisedJob(input, paths.input, jobId, (pending) => {
+          run.job = {
+            ...pending,
+            label,
+            ...(options.structuredOutputPath ? { structuredOutputPath: options.structuredOutputPath } : {}),
+            ...(options.agentId ? { agentId: options.agentId } : {}),
+            ...(options.authorityHeadSha ? { authorityHeadSha: options.authorityHeadSha } : {}),
+          };
+          this.saveRun(run);
+        });
+        if (options.authorityHeadSha) job.authorityHeadSha = options.authorityHeadSha;
       } catch (error) {
         if (options.agentId) this.db.releaseAgentSlot(jobId);
         throw error;
@@ -939,6 +1491,16 @@ export class AecSEngine {
       this.saveRun(run);
     } else {
       input = readJson<JobInput>(job.inputPath);
+      if (!job.pid && !existsSync(job.resultPath)) {
+        const persisted = job;
+        const started = startSupervisedJob(input, job.inputPath, job.id, (pending) => {
+          run.job = { ...persisted, ...pending };
+          this.saveRun(run);
+        });
+        job = { ...persisted, ...started };
+        run.job = job;
+        this.saveRun(run);
+      }
     }
     let result: JobResult;
     try {
@@ -968,6 +1530,24 @@ export class AecSEngine {
 
   private async handlePhaseError(run: Run, error: unknown): Promise<void> {
     const message = redactText(error instanceof Error ? error.message : String(error));
+    const currentTask = this.requireTask(run.taskId);
+    if (currentTask.status === "cancelled") {
+      run.job = undefined;
+      run.status = "failed";
+      run.updatedAt = nowIso();
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
+      return;
+    }
+    if (currentTask.status === "paused") {
+      run.job = undefined;
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      return;
+    }
     const operationalRetry = run.error?.operationalRetry;
     run.error = this.failureEvidence(run, {
       phase: run.phase,
@@ -975,7 +1555,56 @@ export class AecSEngine {
       ...(operationalRetry !== undefined ? { operationalRetry } : {}),
     });
     run.job = undefined;
+    if (message.startsWith("Runtime authority violation:")) {
+      const task = currentTask;
+      const offenderId = run.phase === "review" ? run.review?.reviewerAgentId : run.agentId;
+      if (offenderId) this.db.updateAgent(offenderId, { availability: "unavailable" });
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
+      this.db.appendEvent({
+        projectId: task.projectId,
+        taskId: run.taskId,
+        runId: run.id,
+        type: "runtime.authority_violation",
+        payload: { phase: run.phase, agentId: offenderId ?? null, message },
+      });
+      if (run.phase === "review") {
+        run.review = undefined;
+        run.attempt = 1;
+        this.saveRun(run);
+        const executor = this.requireAgent(run.agentId);
+        const revision = task.currentRevisionId ? this.db.getTaskRevision(task.currentRevisionId) : undefined;
+        const excludedFamilies = revision?.gateProfile.review === "strict" &&
+            (this.requireProject(task.projectId).controlPolicy?.strictReviewMinRuntimeFamilies ?? 1) > 1
+          ? new Set([executor.runtimeFamily ?? executor.adapter])
+          : new Set<string>();
+        const alternate = this.selectAgent(
+          "reviewer",
+          task.requiredCapabilities,
+          new Set([run.agentId, ...(offenderId ? [offenderId] : [])]),
+          undefined,
+          excludedFamilies,
+        );
+        if (alternate) {
+          run.review = { completed: false, summary: "Review reassigned after authority violation", findings: [], reviewerAgentId: alternate.id };
+          this.addRunMetric(run, "runtimeSwitches", 1);
+          this.saveRun(run);
+          return;
+        }
+        this.escalateSecurityViolation(run, message, offenderId);
+        return;
+      }
+      await this.rotateOrEscalate(run, run.error);
+      return;
+    }
+    if (run.phase === "review" && message.includes("modified the task workspace")) {
+      const reviewerId = run.review?.reviewerAgentId;
+      if (reviewerId) this.db.updateAgent(reviewerId, { availability: "unavailable" });
+      this.scheduleOperationalRetry(run, message);
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
+      return;
+    }
     if (["execute", "repair"].includes(run.phase)) {
+      this.db.recordAgentHealth(run.agentId, false);
       if (run.attempt < 3) {
         run.attempt += 1;
         run.phase = "execute";
@@ -984,6 +1613,10 @@ export class AecSEngine {
       }
       await this.rotateOrEscalate(run, run.error);
       return;
+    }
+    if (run.phase === "review") {
+      const reviewerId = run.review?.reviewerAgentId;
+      if (reviewerId) this.db.recordAgentHealth(reviewerId, false);
     }
     if (run.phase === "review" && run.attempt < 3) {
       run.attempt += 1;
@@ -996,11 +1629,7 @@ export class AecSEngine {
     }
     const task = this.requireTask(run.taskId);
     if (run.phase === "cleanup" && task.status === "succeeded") {
-      run.status = "interrupted";
-      run.updatedAt = nowIso();
-      run.leaseUntil = undefined;
-      run.leaseOwner = undefined;
-      this.saveRun(run);
+      this.scheduleCleanupRetry(run, message);
     } else {
       this.scheduleOperationalRetry(run, message);
     }
@@ -1011,6 +1640,48 @@ export class AecSEngine {
       runId: run.id,
       type: "run.operational_blocked",
       payload: { phase: run.phase, message },
+    });
+  }
+
+  private scheduleCleanupRetry(run: Run, message: string): void {
+    const task = this.requireTask(run.taskId);
+    const project = this.requireProject(task.projectId);
+    const previous = run.error?.operationalRetry;
+    const previousCount = previous && typeof previous === "object" && !Array.isArray(previous)
+      ? Number((previous as JsonObject).count ?? 0)
+      : 0;
+    const count = previousCount + 1;
+    if (count > this.maxOperationalRetries) {
+      const decision = this.db.listDecisions(project.id, "pending")
+        .find((candidate) => candidate.taskId === task.id && candidate.title.startsWith("Workspace cleanup failed:")) ??
+        this.db.createDecision({
+          projectId: project.id,
+          taskId: task.id,
+          kind: "failure_exhausted",
+          title: `Workspace cleanup failed: ${task.title}`,
+          body: JSON.stringify({ runId: run.id, workspaceId: run.workspaceId, retries: previousCount, message }, null, 2),
+          options: ["record"],
+        });
+      run.status = "failed";
+      run.error = this.failureEvidence(run, { cleanupFailure: { decisionId: decision.id, retries: previousCount, message } });
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      return;
+    }
+    const delayMs = Math.min(this.operationalRetryBaseMs * 2 ** Math.max(0, count - 1), 5 * 60_000);
+    const nextAttemptAt = new Date(Date.now() + delayMs).toISOString();
+    run.error = this.failureEvidence(run, { operationalRetry: { count, nextAttemptAt, message } });
+    run.status = "interrupted";
+    run.leaseUntil = undefined;
+    run.leaseOwner = undefined;
+    this.saveRun(run);
+    this.db.appendEvent({
+      projectId: project.id,
+      taskId: task.id,
+      runId: run.id,
+      type: "cleanup.retry_scheduled",
+      payload: { count, nextAttemptAt, message },
     });
   }
 
@@ -1048,6 +1719,30 @@ export class AecSEngine {
     });
   }
 
+  private escalateSecurityViolation(run: Run, message: string, offenderId?: string): void {
+    const task = this.requireTask(run.taskId);
+    const project = this.requireProject(task.projectId);
+    this.db.transaction(() => {
+      const existing = this.db.listDecisions(project.id, "pending")
+        .find((decision) => decision.taskId === task.id && decision.kind === "failure_exhausted");
+      const decision = existing ?? this.db.createDecision({
+        projectId: project.id,
+        taskId: task.id,
+        kind: "failure_exhausted",
+        title: `Runtime authority violation: ${task.title}`,
+        body: JSON.stringify({ message, offenderId, runId: run.id, phase: run.phase }, null, 2),
+        options: ["resume_task", "replace_task", "cancel_task"],
+      });
+      run.status = "failed";
+      run.updatedAt = nowIso();
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatus(task.id, "awaiting_human", { summary: `Security Decision required: ${decision.id}` });
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
+    });
+  }
+
   private escalateOperationalFailure(run: Run, message: string, retries: number): void {
     const task = this.requireTask(run.taskId);
     this.db.transaction(() => {
@@ -1080,11 +1775,14 @@ export class AecSEngine {
       ? this.selectAgent("executor", task.requiredCapabilities, excluded)
       : undefined;
     if (alternate) {
+      const previousAgent = this.requireAgent(run.agentId);
       run.rotationCount += 1;
+      this.addRunMetric(run, "runtimeSwitches", 1);
       run.attempt = 1;
       run.repairCount = 0;
       run.agentId = alternate.id;
       run.codexSessionId = undefined;
+      run.runtimeSessionId = undefined;
       run.validation = [];
       run.review = undefined;
       run.phase = "execute";
@@ -1095,8 +1793,30 @@ export class AecSEngine {
         taskId: task.id,
         runId: run.id,
         type: "run.agent_rotated",
-        payload: { agentId: alternate.id, rotationCount: run.rotationCount },
+        payload: {
+          fromAgentId: previousAgent.id,
+          fromRuntimeFamily: previousAgent.runtimeFamily ?? previousAgent.adapter,
+          agentId: alternate.id,
+          runtimeFamily: alternate.runtimeFamily ?? alternate.adapter,
+          rotationCount: run.rotationCount,
+        },
       });
+      return;
+    }
+    this.db.appendEvent({
+      projectId: project.id,
+      taskId: task.id,
+      runId: run.id,
+      type: "controller.overhead",
+      payload: { repairCount: run.repairCount, rotationCount: run.rotationCount, evidence },
+    });
+    if (project.controlPolicy?.circuitBreaker === "enforce") {
+      run.status = "interrupted";
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatus(task.id, "circuit_broken", { summary: "Local circuit breaker stopped a non-converging control loop" });
+      this.db.updateWorkspaceStatus(run.workspaceId, "preserved");
       return;
     }
     this.db.transaction(() => {
@@ -1121,17 +1841,37 @@ export class AecSEngine {
   }
 
   resolveDecision(decisionId: string, resolution: JsonObject): Decision {
+    resolution = redactJson(resolution);
     return this.db.transaction(() => {
       const decision = this.db.getDecision(decisionId);
       if (!decision) throw new Error(`Decision not found: ${decisionId}`);
       if (decision.status === "resolved") throw new Error(`Decision is already resolved: ${decisionId}`);
       if (decision.taskId) {
         const action = String(resolution.action ?? "");
-        if (action === "retry_with_agent" || action === "resume_task") {
+        let effectiveAction = action;
+        if (action === "approve_scope") {
+          if (decision.kind !== "policy" || !decision.title.startsWith("Scope Expansion Proposal:")) {
+            throw new Error(`Decision ${decision.id} is not a Scope Expansion decision`);
+          }
+          let proposal: unknown;
+          try {
+            proposal = (JSON.parse(decision.body) as { proposal?: unknown }).proposal;
+          } catch {
+            throw new Error(`Decision ${decision.id} has invalid Scope Expansion evidence`);
+          }
+          if (!proposal || typeof proposal !== "object" || Array.isArray(proposal)) {
+            throw new Error(`Decision ${decision.id} has no Scope Expansion Proposal`);
+          }
+          this.db.createScopeExpansionRevision(decision.taskId, proposal as {
+            addWriteGlobs: string[]; addWatchGlobs: string[]; evidence: string;
+          });
+          effectiveAction = "resume_task";
+        }
+        if (effectiveAction === "retry_with_agent" || effectiveAction === "resume_task") {
           const run = this.db.getLatestRunForTask(decision.taskId);
           if (run) {
             const task = this.requireTask(decision.taskId);
-            if (action === "retry_with_agent") {
+            if (effectiveAction === "retry_with_agent") {
               const requestedId = typeof resolution.agentId === "string" ? resolution.agentId : undefined;
               const requested = requestedId ? this.db.getAgent(requestedId) : undefined;
               if (requestedId && (!requested || !requested.enabled || requested.availability !== "available" ||
@@ -1148,9 +1888,14 @@ export class AecSEngine {
             run.repairCount = 0;
             run.rotationCount = 0;
             run.codexSessionId = undefined;
+            run.runtimeSessionId = undefined;
             run.validation = [];
             run.review = undefined;
             run.job = undefined;
+            run.taskRevisionId = task.currentRevisionId;
+            run.contextFingerprint = task.currentRevisionId
+              ? this.db.getTaskRevision(task.currentRevisionId)?.contextFingerprint
+              : undefined;
             run.error = { humanResolution: resolution };
             run.leaseUntil = undefined;
             run.leaseOwner = undefined;
@@ -1169,6 +1914,8 @@ export class AecSEngine {
             projectId: decision.projectId,
             replacesTaskId: decision.taskId,
           }]);
+        } else if (action === "record" && decision.title.startsWith("Workspace cleanup failed:")) {
+          // The main branch already converged; this Decision acknowledges preserved cleanup evidence.
         } else if (["failure_exhausted", "architecture", "product", "tradeoff"].includes(decision.kind)) {
           throw new Error(`Decision ${decision.id} requires a supported action`);
         }
@@ -1190,7 +1937,7 @@ export class AecSEngine {
       return true;
     });
     for (const task of tasks) {
-      if (task.status === "awaiting_human" && ["resume", "cancel"].includes(input.action)) {
+      if (input.action === "resume") {
         const pending = this.db.listDecisions(task.projectId, "pending").some((decision) => decision.taskId === task.id);
         if (pending) throw new Error(`Task ${task.id} has an unresolved Human Decision`);
       }
@@ -1198,9 +1945,22 @@ export class AecSEngine {
     for (const task of tasks) {
       if (input.action === "pause" && !["succeeded", "failed", "cancelled"].includes(task.status)) {
         this.db.updateTaskStatus(task.id, "paused");
-      } else if (input.action === "resume" && ["paused", "operational_blocked", "awaiting_human"].includes(task.status)) {
+      } else if (input.action === "resume" && ["paused", "operational_blocked", "awaiting_human", "parked", "circuit_broken"].includes(task.status)) {
         this.db.updateTaskStatus(task.id, "ready");
       } else if (input.action === "cancel" && !["succeeded", "failed", "cancelled"].includes(task.status)) {
+        const run = this.db.getLatestRunForTask(task.id);
+        if (run?.job?.pid) {
+          const runtime = this.db.getAgent(run.job.agentId ?? run.agentId);
+          if (runtime) this.adapterFactory(runtime).cancel(run.job.pid);
+          if (run.job.agentId) this.db.releaseAgentSlot(run.job.id);
+          this.db.appendEvent({
+            projectId: task.projectId,
+            taskId: task.id,
+            runId: run.id,
+            type: "runtime.cancel_requested",
+            payload: { runtimeFamily: runtime?.runtimeFamily ?? runtime?.adapter ?? "unknown" },
+          });
+        }
         this.db.updateTaskStatus(task.id, "cancelled");
       } else if (input.action === "reprioritize") {
         if (input.priority === undefined || input.priority < -100 || input.priority > 100) {
@@ -1217,6 +1977,7 @@ export class AecSEngine {
     capabilities: string[],
     excluded = new Set<string>(),
     loadOverride?: Map<string, number>,
+    excludedFamilies = new Set<string>(),
   ): Agent | undefined {
     return this.db
       .listAgents()
@@ -1225,14 +1986,20 @@ export class AecSEngine {
           agent.enabled &&
           agent.availability === "available" &&
           agent.roles.includes(role) &&
+          (agent.adapter === "command" || agent.runtimeCapabilities?.structuredOutput === true) &&
+          (role !== "reviewer" || agent.adapter === "command" || agent.runtimeCapabilities?.reviewMode === true) &&
           (loadOverride?.get(agent.id) ?? agent.currentLoad) < agent.maxConcurrency &&
           !excluded.has(agent.id) &&
+          !excludedFamilies.has(agent.runtimeFamily ?? agent.adapter) &&
           capabilities.every((capability) => agent.capabilities.includes(capability)),
       )
       .sort(
         (left, right) =>
-          (loadOverride?.get(left.id) ?? left.currentLoad) - (loadOverride?.get(right.id) ?? right.currentLoad) ||
-          left.id.localeCompare(right.id),
+          (loadOverride?.get(left.id) ?? left.currentLoad) / left.maxConcurrency -
+            (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency ||
+          Date.parse(left.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") -
+            Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") ||
+          left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
       )[0];
   }
 
@@ -1391,6 +2158,50 @@ export class AecSEngine {
     if (!this.db.saveRun(run, this.leaseOwner)) throw new Error(`Run lease lost: ${run.id}`);
   }
 
+  private executionDuration(execution: JobExecution): number {
+    return Math.max(0, Date.parse(execution.result.finishedAt) - Date.parse(execution.result.startedAt));
+  }
+
+  private addRunMetric(
+    run: Run,
+    key: Exclude<keyof NonNullable<Run["metrics"]>, "tokenUsage">,
+    value: number,
+  ): void {
+    run.metrics ??= {
+      implementationMs: 0,
+      controlMs: 0,
+      validationMs: 0,
+      reviewMs: 0,
+      waitMs: 0,
+      validationRuns: 0,
+      repairRuns: 0,
+      runtimeSwitches: 0,
+    };
+    run.metrics[key] += value;
+    this.saveRun(run);
+  }
+
+  private addTokenUsage(run: Run, usage: { input?: number; output?: number; total?: number } | undefined): void {
+    if (!usage) return;
+    run.metrics ??= {
+      implementationMs: 0,
+      controlMs: 0,
+      validationMs: 0,
+      reviewMs: 0,
+      waitMs: 0,
+      validationRuns: 0,
+      repairRuns: 0,
+      runtimeSwitches: 0,
+    };
+    const previous = run.metrics.tokenUsage ?? {};
+    run.metrics.tokenUsage = {
+      input: (previous.input ?? 0) + (usage.input ?? 0),
+      output: (previous.output ?? 0) + (usage.output ?? 0),
+      total: (previous.total ?? 0) + (usage.total ?? 0),
+    };
+    this.saveRun(run);
+  }
+
   private operationId(projectId: string, taskId: string, runId: string, effect: string): string {
     return `${projectId}:${taskId}:${runId}:${effect}`;
   }
@@ -1399,6 +2210,12 @@ export class AecSEngine {
     if (!result || !["complete", "blocked"].includes(result.status) || typeof result.summary !== "string" || !Array.isArray(result.notes)) {
       throw new Error("Worker returned an invalid structured result");
     }
+    const workerKeys = new Set(["status", "summary", "notes", "blocker", "scopeExpansion"]);
+    if (!Object.hasOwn(result, "blocker") || !Object.hasOwn(result, "scopeExpansion") ||
+        Object.keys(result).some((key) => !workerKeys.has(key)) ||
+        !result.notes.every((note) => typeof note === "string")) {
+      throw new Error("Worker result does not conform to the AEC-S output Schema");
+    }
     if (result.blocker && (
       !["technical", "architecture", "product", "tradeoff"].includes(result.blocker.kind) ||
       typeof result.blocker.question !== "string" ||
@@ -1406,11 +2223,106 @@ export class AecSEngine {
     )) {
       throw new Error("Worker returned an invalid blocker");
     }
+    if (result.scopeExpansion && (
+      !Array.isArray(result.scopeExpansion.addWriteGlobs) ||
+      !Array.isArray(result.scopeExpansion.addWatchGlobs) ||
+      !result.scopeExpansion.addWriteGlobs.every((value) => typeof value === "string") ||
+      !result.scopeExpansion.addWatchGlobs.every((value) => typeof value === "string") ||
+      typeof result.scopeExpansion.evidence !== "string" ||
+      result.scopeExpansion.evidence.trim().length === 0
+    )) throw new Error("Worker returned an invalid Scope Expansion Proposal");
+  }
+
+  private applyScopeExpansion(run: Run, task: Task, result: WorkerResult): boolean {
+    const proposal = result.scopeExpansion;
+    if (!proposal) return false;
+    const candidateScope = {
+      writeGlobs: [...new Set([...task.scope.writeGlobs, ...proposal.addWriteGlobs])],
+      watchGlobs: [...new Set([...(task.scope.watchGlobs ?? []), ...proposal.addWatchGlobs])],
+      tags: task.scope.tags,
+    };
+    taskInputSchema.parse({
+      projectId: task.projectId,
+      title: task.title,
+      goal: task.goal,
+      scope: candidateScope,
+      acceptanceCriteria: task.acceptanceCriteria,
+    });
+    const project = this.requireProject(task.projectId);
+    const mode = project.controlPolicy?.scopeCalibration ?? "observe";
+    this.db.appendEvent({
+      projectId: project.id,
+      taskId: task.id,
+      runId: run.id,
+      type: "policy.scope_calibration",
+      payload: { mode, proposal },
+    });
+    if (mode === "observe") {
+      const existing = this.db.listDecisions(project.id, "pending")
+        .find((decision) => decision.taskId === task.id && decision.kind === "policy" && decision.title.startsWith("Scope Expansion Proposal:"));
+      const decision = existing ?? this.db.createDecision({
+        projectId: project.id,
+        taskId: task.id,
+        kind: "policy",
+        title: `Scope Expansion Proposal: ${task.title}`,
+        body: JSON.stringify({ runId: run.id, proposal }, null, 2),
+        options: ["approve_scope", "resume_task", "cancel_task"],
+      });
+      run.workerResult = result;
+      run.status = "interrupted";
+      run.error = this.failureEvidence(run, { type: "scope_expansion_observed", decisionId: decision.id });
+      run.leaseUntil = undefined;
+      run.leaseOwner = undefined;
+      this.saveRun(run);
+      this.db.updateTaskStatus(task.id, "awaiting_human", { summary: `Scope Expansion requires Decision ${decision.id}` });
+      return true;
+    }
+    const revision = this.db.createScopeExpansionRevision(task.id, proposal);
+    run.taskRevisionId = revision.id;
+    run.contextFingerprint = revision.contextFingerprint;
+    run.workerResult = result;
+    run.error = this.failureEvidence(run, {
+      type: "scope_expansion_accepted",
+      evidence: proposal.evidence,
+      revisionId: revision.id,
+    });
+    run.phase = "execute";
+    run.attempt = 1;
+    run.validation = [];
+    run.review = undefined;
+    this.saveRun(run);
+    return true;
   }
 
   private assertReviewResult(result: ReviewResult): void {
-    if (!result || !["pass", "fail"].includes(result.verdict) || typeof result.summary !== "string" || !Array.isArray(result.findings)) {
+    const reviewKeys = new Set(["verdict", "completed", "summary", "findings"]);
+    if (!result || !Object.hasOwn(result, "verdict") || result.completed !== true ||
+      (result.verdict !== null && result.verdict !== undefined && !["pass", "fail"].includes(result.verdict)) ||
+      typeof result.summary !== "string" || !Array.isArray(result.findings) ||
+      Object.keys(result).some((key) => !reviewKeys.has(key))) {
       throw new Error("Reviewer returned an invalid structured result");
+    }
+    const findingKeys = new Set(["severity", "summary", "file", "line", "requiredChange", "evidence", "category"]);
+    for (const finding of result.findings) {
+      if (!finding || !["blocking", "warning"].includes(finding.severity) || typeof finding.summary !== "string" ||
+          Object.keys(finding).some((key) => !findingKeys.has(key)) ||
+          [...findingKeys].some((key) => !Object.hasOwn(finding, key)) ||
+          (finding.file !== null && finding.file !== undefined && typeof finding.file !== "string") ||
+          (finding.line !== null && finding.line !== undefined && (!Number.isInteger(finding.line) || finding.line < 1)) ||
+          (finding.evidence !== null && finding.evidence !== undefined && typeof finding.evidence !== "string") ||
+          (finding.category !== null && finding.category !== undefined && typeof finding.category !== "string")) {
+        throw new Error("Review Finding does not conform to the AEC-S output Schema");
+      }
+    }
+    const hasBlocking = result.findings.some((finding) => finding.severity === "blocking");
+    if (result.verdict === "fail" && !hasBlocking) {
+      throw new Error("A failed Review must include at least one blocking Finding");
+    }
+    if (result.verdict === "pass" && hasBlocking) {
+      throw new Error("A passing Review cannot include a blocking Finding");
+    }
+    if (result.verdict !== "pass" && result.verdict !== "fail") {
+      throw new Error("A completed Review must provide a pass or fail verdict");
     }
   }
 

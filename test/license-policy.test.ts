@@ -35,10 +35,11 @@ test("license policy accepts reviewed permissive licenses", () => {
     "": { name: "fixture" },
     "node_modules/mit-package": { version: "1.0.0", license: "MIT" },
     "node_modules/apache-package": { version: "2.0.0", license: "Apache-2.0" },
+    "node_modules/python-package": { version: "2.0.0", license: "Python-2.0" },
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /License policy passed for 2 packages/);
+  assert.match(result.stdout, /License policy passed for 3 packages/);
 });
 
 test("license policy rejects copyleft, unknown, and missing licenses", () => {

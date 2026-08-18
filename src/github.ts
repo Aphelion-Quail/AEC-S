@@ -109,38 +109,39 @@ export async function waitForRequiredChecks(
   const deadline = Date.now() + timeoutSeconds * 1_000;
   while (Date.now() < deadline) {
     heartbeat?.();
-    const result = await execCommand(
-      gh(workspacePath, ["pr", "checks", String(prNumber), "--json", "name,state,bucket"], 120),
-    );
-    // gh exits 8 while checks are pending, and exits 1 during the normal gap
-    // between PR creation/push and registration of the first check run.
-    const diagnostic = `${result.stderr}\n${result.stdout}`.trim();
-    const noChecksYet = result.exitCode === 8 || (
-      result.exitCode === 1 && /no checks reported|no checks found|checks? (?:have|has) not been reported/i.test(diagnostic)
-    );
-    const transientFailure = result.timedOut || (
-      result.exitCode !== 0 && /HTTP\s+(?:408|429|5\d\d)|timed?\s*out|connection\s+reset|temporary|unexpected\s+EOF|network|failed\s+to\s+connect|TLS\s+handshake/i.test(diagnostic)
-    );
-    if (noChecksYet || transientFailure) {
-      await sleepWithinDeadline(deadline, pollIntervalMs);
-      continue;
-    }
-    if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Unable to inspect GitHub checks for PR #${prNumber}`);
-    const checks = parseJson<Array<{ name: string; state: string; bucket: string }>>(result.stdout || "[]", "gh pr checks");
-    const selected = project.requiredChecks.length > 0
-      ? checks.filter((check) => project.requiredChecks.includes(check.name))
-      : checks;
-    if (project.requiredChecks.some((name) => !checks.some((check) => check.name === name))) {
-      await sleepWithinDeadline(deadline, pollIntervalMs);
-      continue;
-    }
-    if (selected.some((check) => check.bucket === "fail" || check.bucket === "cancel")) {
-      throw new Error(`GitHub checks failed: ${selected.filter((check) => check.bucket === "fail" || check.bucket === "cancel").map((check) => check.name).join(", ")}`);
-    }
-    if (selected.every((check) => check.bucket === "pass" || check.bucket === "skipping")) return;
+    if (await inspectRequiredChecks(project, workspacePath, prNumber) === "passed") return;
     await sleepWithinDeadline(deadline, pollIntervalMs);
   }
   throw new Error(`Timed out waiting for GitHub checks on PR #${prNumber}`);
+}
+
+export async function inspectRequiredChecks(
+  project: Project,
+  workspacePath: string,
+  prNumber: number,
+): Promise<"pending" | "passed"> {
+  if (project.requiredChecks.length === 0) {
+    throw new Error("GitHub delivery requires at least one explicitly configured required check");
+  }
+  const result = await execCommand(
+    gh(workspacePath, ["pr", "checks", String(prNumber), "--json", "name,state,bucket"], 120),
+  );
+  const diagnostic = `${result.stderr}\n${result.stdout}`.trim();
+  const noChecksYet = result.exitCode === 8 || (
+    result.exitCode === 1 && /no checks reported|no checks found|checks? (?:have|has) not been reported/i.test(diagnostic)
+  );
+  const transientFailure = result.timedOut || (
+    result.exitCode !== 0 && /HTTP\s+(?:408|429|5\d\d)|timed?\s*out|connection\s+reset|temporary|unexpected\s+EOF|network|failed\s+to\s+connect|TLS\s+handshake/i.test(diagnostic)
+  );
+  if (noChecksYet || transientFailure) return "pending";
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || `Unable to inspect GitHub checks for PR #${prNumber}`);
+  const checks = parseJson<Array<{ name: string; state: string; bucket: string }>>(result.stdout || "[]", "gh pr checks");
+  const selected = checks.filter((check) => project.requiredChecks.includes(check.name));
+  if (project.requiredChecks.some((name) => !checks.some((check) => check.name === name))) return "pending";
+  if (selected.some((check) => check.bucket === "fail" || check.bucket === "cancel")) {
+    throw new Error(`GitHub checks failed: ${selected.filter((check) => check.bucket === "fail" || check.bucket === "cancel").map((check) => check.name).join(", ")}`);
+  }
+  return selected.every((check) => check.bucket === "pass") ? "passed" : "pending";
 }
 
 async function sleepWithinDeadline(deadline: number, intervalMs: number): Promise<void> {

@@ -10,8 +10,45 @@ export type CommandSpec = {
 
 export type TaskScope = {
   writeGlobs: string[];
-  impactGlobs: string[];
+  watchGlobs?: string[];
   tags: string[];
+  /** Pre-1.0 input compatibility only. New output never emits this field. */
+  impactGlobs?: string[];
+};
+
+export type RiskClass = "docs" | "normal" | "core";
+export type ReviewMode = "none" | "standard" | "strict";
+export type AdaptiveMode = "observe" | "enforce";
+
+export type EnvironmentComponent = {
+  id: string;
+  version?: string;
+  command?: CommandSpec;
+  requiredCapabilities?: string[];
+};
+
+export type EnvironmentContract = {
+  version: number;
+  components: EnvironmentComponent[];
+};
+
+export type OperationalConfiguration = {
+  healthFailureThreshold: number;
+  healthRecoveryThreshold: number;
+  healthProbeIntervalSeconds: number;
+  driftMaxCommits?: number;
+  driftMaxSeconds?: number;
+  stabilityObservationSeconds: number;
+};
+
+export type ControlPolicy = {
+  version: number;
+  scopeCalibration: AdaptiveMode;
+  temporaryRiskElevation: AdaptiveMode;
+  progressiveDagParking: AdaptiveMode;
+  autoRevert: AdaptiveMode;
+  circuitBreaker: AdaptiveMode;
+  strictReviewMinRuntimeFamilies: number;
 };
 
 export type DeliveryMode = "local" | "github";
@@ -24,16 +61,28 @@ export type ProjectInput = {
   remoteName?: string;
   deliveryMode?: DeliveryMode;
   intent?: string;
+  intentVersion?: number;
+  environmentContract?: EnvironmentContract;
+  operationalConfig?: Partial<OperationalConfiguration>;
+  controlPolicy?: Partial<ControlPolicy>;
   defaultValidation?: CommandSpec[];
   fullValidation?: CommandSpec[];
+  postMergeSmoke?: CommandSpec[];
   requiredChecks?: string[];
   highRiskGlobs?: string[];
   maxConcurrency?: number;
 };
 
-export type Project = Required<Omit<ProjectInput, "id">> & {
+export type Project = Required<Omit<ProjectInput,
+  "id" | "intentVersion" | "environmentContract" | "operationalConfig" | "controlPolicy" | "postMergeSmoke"
+>> & {
   id: string;
   createdAt: string;
+  intentVersion?: number;
+  environmentContract?: EnvironmentContract;
+  operationalConfig?: OperationalConfiguration;
+  controlPolicy?: ControlPolicy;
+  postMergeSmoke?: CommandSpec[];
 };
 
 export type ProjectUpdate = Partial<Omit<ProjectInput, "id" | "repoPath" | "name">>;
@@ -45,6 +94,9 @@ export type TaskStatus =
   | "paused"
   | "operational_blocked"
   | "awaiting_human"
+  | "parked"
+  | "observing"
+  | "circuit_broken"
   | "succeeded"
   | "failed"
   | "cancelled";
@@ -60,13 +112,18 @@ export type TaskInput = {
   acceptanceCriteria: string[];
   validationCommands?: CommandSpec[];
   requiredCapabilities?: string[];
+  proposedRiskClass?: RiskClass;
+  environmentRequirements?: string[];
+  revertSafe?: boolean;
   requiresFullValidation?: boolean;
   priority?: number;
   replacesTaskId?: string;
   decisionIds?: string[];
 };
 
-export type Task = Required<Omit<TaskInput, "id" | "replacesTaskId">> & {
+export type Task = Required<Omit<TaskInput,
+  "id" | "replacesTaskId" | "proposedRiskClass" | "environmentRequirements" | "revertSafe"
+>> & {
   id: string;
   replacesTaskId?: string;
   status: TaskStatus;
@@ -74,26 +131,78 @@ export type Task = Required<Omit<TaskInput, "id" | "replacesTaskId">> & {
   updatedAt: string;
   terminalSummary?: string;
   mergeSha?: string;
+  currentRevisionId?: string;
+  proposedRiskClass?: RiskClass;
+  environmentRequirements?: string[];
+  revertSafe?: boolean;
+};
+
+export type TaskRevision = {
+  id: string;
+  taskId: string;
+  revision: number;
+  scope: TaskScope;
+  proposedRiskClass: RiskClass;
+  effectiveRiskClass: RiskClass;
+  gateProfile: {
+    review: ReviewMode;
+    validation: "minimal" | "applicable";
+  };
+  environmentRequirements: string[];
+  contextFingerprint: string;
+  reason: "initial" | "scope_expansion" | "calibration";
+  createdAt: string;
+};
+
+export type ScopeExpansionProposal = {
+  addWriteGlobs: string[];
+  addWatchGlobs: string[];
+  evidence: string;
 };
 
 export type AgentRole = "executor" | "reviewer";
-export type AgentAvailability = "available" | "offline" | "degraded";
+export type AgentAdapterKind = "codex" | "kimi" | "deepseek_harness" | "command";
+export type AgentAvailability =
+  | "registered"
+  | "healthy"
+  | "available"
+  | "busy"
+  | "degraded"
+  | "unavailable"
+  | "disabled"
+  | "offline";
+
+export type RuntimeCapabilities = {
+  resume: boolean;
+  cancel: boolean;
+  stream: boolean;
+  reviewMode: boolean;
+  structuredOutput: boolean;
+};
 
 export type AgentInput = {
   id?: string;
   name: string;
-  adapter: "codex" | "command";
+  adapter: AgentAdapterKind;
+  runtimeFamily?: string;
   roles: AgentRole[];
   capabilities?: string[];
   enabled?: boolean;
   availability?: AgentAvailability;
   maxConcurrency?: number;
   config?: JsonObject;
+  runtimeCapabilities?: Partial<RuntimeCapabilities>;
 };
 
-export type Agent = Required<Omit<AgentInput, "id">> & {
+export type Agent = Required<Omit<AgentInput, "id" | "runtimeFamily" | "runtimeCapabilities">> & {
   id: string;
   currentLoad: number;
+  runtimeFamily?: string;
+  runtimeCapabilities?: RuntimeCapabilities;
+  healthSuccesses?: number;
+  healthFailures?: number;
+  lastAssignedAt?: string;
+  runtimeVersion?: string;
 };
 
 export type AgentUpdate = Partial<Omit<AgentInput, "id" | "name" | "adapter">>;
@@ -107,6 +216,10 @@ export type RunPhase =
   | "publish"
   | "remote_checks"
   | "merge"
+  | "post_merge_smoke"
+  | "stability_observation"
+  | "revert"
+  | "diagnose"
   | "cleanup"
   | "done";
 
@@ -124,6 +237,8 @@ export type RunEffects = {
   push?: EffectState;
   pullRequest?: EffectState;
   merge?: EffectState;
+  postMergeSmoke?: EffectState;
+  revert?: EffectState;
 };
 
 export type ValidationResult = {
@@ -143,13 +258,17 @@ export type ReviewFinding = {
   file?: string | null;
   line?: number | null;
   requiredChange?: string | null;
+  evidence?: string | null;
+  category?: string | null;
 };
 
 export type ReviewResult = {
-  verdict: "pass" | "fail";
+  /** Compatibility signal only; merge authority is derived from verified Findings. */
+  verdict?: "pass" | "fail";
   summary: string;
   findings: ReviewFinding[];
   reviewerAgentId?: string;
+  completed: boolean;
 };
 
 export type WorkerResult = {
@@ -160,6 +279,7 @@ export type WorkerResult = {
     kind: "technical" | "architecture" | "product" | "tradeoff";
     question: string;
   } | null;
+  scopeExpansion?: ScopeExpansionProposal | null;
 };
 
 export type JobState = {
@@ -171,6 +291,7 @@ export type JobState = {
   label?: string;
   structuredOutputPath?: string;
   agentId?: string;
+  authorityHeadSha?: string;
 };
 
 export type Run = {
@@ -185,6 +306,21 @@ export type Run = {
   rotationCount: number;
   baseSha: string;
   codexSessionId?: string;
+  runtimeSessionId?: string;
+  runtimeVersion?: string;
+  taskRevisionId?: string;
+  contextFingerprint?: string;
+  metrics?: {
+    implementationMs: number;
+    controlMs: number;
+    validationMs: number;
+    reviewMs: number;
+    waitMs: number;
+    validationRuns: number;
+    repairRuns: number;
+    runtimeSwitches: number;
+    tokenUsage?: { input?: number; output?: number; total?: number };
+  };
   workerResult?: WorkerResult;
   workerResultPath?: string;
   validation: ValidationResult[];
@@ -219,7 +355,7 @@ export type DecisionInput = {
   id?: string;
   projectId: string;
   taskId?: string;
-  kind: "architecture" | "product" | "tradeoff" | "failure_exhausted" | "record";
+  kind: "architecture" | "product" | "tradeoff" | "failure_exhausted" | "policy" | "direction" | "record";
   status?: DecisionStatus;
   title: string;
   body: string;
@@ -245,6 +381,44 @@ export type EventRecord = {
   createdAt: string;
 };
 
+export type FindingStatus = "proposed" | "structurally_valid" | "verified" | "dismissed" | "resolved";
+export type Finding = {
+  id: string;
+  projectId: string;
+  taskId: string;
+  runId: string;
+  taskRevisionId: string;
+  signature: string;
+  status: FindingStatus;
+  severity: "blocking" | "warning";
+  summary: string;
+  rule?: string;
+  file?: string;
+  line?: number;
+  evidence?: string;
+  resolutionEvidence?: string;
+  reviewerAgentId?: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type OutboxStatus = "pending" | "delivering" | "delivered" | "acknowledged";
+export type OutboxMessage = {
+  id: string;
+  projectId: string;
+  decisionId?: string;
+  dedupeKey: string;
+  status: OutboxStatus;
+  channel: "mcp" | "system";
+  title: string;
+  body: string;
+  attempts: number;
+  nextAttemptAt?: string;
+  createdAt: string;
+  deliveredAt?: string;
+  acknowledgedAt?: string;
+};
+
 export type JobInput = {
   command: CommandSpec;
   stdin?: string;
@@ -254,7 +428,7 @@ export type JobInput = {
 };
 
 export type JobResult = {
-  status: "completed" | "timed_out" | "spawn_error";
+  status: "completed" | "timed_out" | "spawn_error" | "output_limit";
   exitCode: number | null;
   signal: string | null;
   error?: string;
