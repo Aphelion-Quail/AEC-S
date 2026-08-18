@@ -60,9 +60,11 @@ export async function runJobFile(inputPath: string): Promise<void> {
       detached: process.platform !== "win32",
     });
     let timedOut = false;
+    let cancellationRequested = false;
     let terminateTree: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     const forwardCancellation = (): void => {
+      cancellationRequested = true;
       // Signal the controlled Runtime entrypoint first so protocol-aware
       // adapters can issue session/cancel or close their composition cleanly.
       // A bounded process-group kill remains the deterministic backstop.
@@ -116,6 +118,13 @@ export async function runJobFile(inputPath: string): Promise<void> {
       clearTimeout(timeout);
       if (terminateTree) clearTimeout(terminateTree);
       if (forceKill) clearTimeout(forceKill);
+      // The Runtime entrypoint may exit immediately after its graceful signal
+      // while descendants remain in the detached process group. Clearing the
+      // timers without this final sweep would let those descendants outlive a
+      // completed cancellation result and continue mutating the workspace.
+      if (cancellationRequested) {
+        killProcessTree(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      }
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
