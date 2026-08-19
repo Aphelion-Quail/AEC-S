@@ -30,6 +30,13 @@ function output(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
 }
 
+function assertConfiguredRepositoryPath(repoPath: string): void {
+  const normalized = repoPath.replaceAll("\\", "/");
+  if (normalized === "__AEC_S_REPOSITORY_PATH_REQUIRED__" || normalized.startsWith("/absolute/path/to/")) {
+    throw new Error("Project repoPath is still an example placeholder; replace it with the absolute path of a trusted Git repository");
+  }
+}
+
 function usage(): never {
   process.stderr.write(`AEC-S commands:
   aec-s project <add|list|show|update> [...]
@@ -68,6 +75,7 @@ async function main(): Promise<void> {
     if (command === "project" && subcommand === "add") {
       const path = args[0] ?? usage();
       const input = projectInputSchema.parse(readInput(path));
+      assertConfiguredRepositoryPath(input.repoPath);
       input.repoPath = resolve(input.repoPath);
       await assertGitRepository(input.repoPath);
       output(db.createProject(input));

@@ -27,9 +27,38 @@ test("package policy rejects an unreviewed install script", () => {
 
 test("package policy rejects floating DSH preview dependencies", () => {
   const result = runPolicy(
-    { dependencies: { "@deepseek-ai/dsh-example": "^0.1.0-rc.6" }, allowScripts: {} },
+    { devDependencies: { "@deepseek-ai/dsh-example": "^0.1.0-rc.6" }, allowScripts: {} },
     { packages: { "": {}, "node_modules/@deepseek-ai/dsh-example": { version: "0.1.0-rc.6" } } },
   );
   assert.equal(result.status, 1);
   assert.match(result.stderr, /must use exact RC versions/);
+  assert.match(result.stderr, /devDependencies/);
+});
+
+test("package policy verifies optional and peer DSH declarations against the lockfile", () => {
+  const mismatch = runPolicy(
+    { optionalDependencies: { "@deepseek-ai/dsh-example": "0.1.0-rc.6" }, allowScripts: {} },
+    { packages: { "": {}, "node_modules/@deepseek-ai/dsh-example": { version: "0.1.0-rc.5" } } },
+  );
+  assert.equal(mismatch.status, 1);
+  assert.match(mismatch.stderr, /optionalDependencies/);
+
+  const accepted = runPolicy(
+    { peerDependencies: { "@deepseek-ai/dsh-example": "0.1.0-rc.6" }, allowScripts: {} },
+    { packages: { "": {}, "node_modules/@deepseek-ai/dsh-example": { version: "0.1.0-rc.6" } } },
+  );
+  assert.equal(accepted.status, 0, accepted.stderr);
+});
+
+test("package policy rejects ambiguous DSH declarations across dependency sections", () => {
+  const result = runPolicy(
+    {
+      dependencies: { "@deepseek-ai/dsh-example": "0.1.0-rc.6" },
+      devDependencies: { "@deepseek-ai/dsh-example": "0.1.0-rc.6" },
+      allowScripts: {},
+    },
+    { packages: { "": {}, "node_modules/@deepseek-ai/dsh-example": { version: "0.1.0-rc.6" } } },
+  );
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /exactly one dependency section/);
 });

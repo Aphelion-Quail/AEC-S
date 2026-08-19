@@ -48,11 +48,11 @@ node dist/src/cli.js doctor
 
 对于 Kimi，AEC-S 会同时搜索 `PATH` 和 `~/.kimi-code/bin/kimi`，在不读取或输出 Token 的前提下检查 Provider 元数据，然后协商 Runtime 能力。主控制通道是由锁定版本的官方 ACP TypeScript SDK 驱动的 stdio ACP。就绪探测实际执行 initialize、Session create/delete 与 load/resume，并分别记录协商得到的 cancel/stream 支持及 `plan`/`auto` 模式；真实 cancel、stream、resume 和权限行为由协议回归测试及维护者本机 live gate 验证，不再把“能力广告”表述成探测时已经执行。旧 Agent SDK wire 只能通过显式 `transport: "agent_sdk_wire"` 使用；它采用 SDK 自动执行模式，不具备 ACP 的逐工具位置授权保证。ACP 失败后绝不静默切换 Transport。`stream-json` Prompt 模式仅用于诊断，通用 command Adapter 也不计为 Kimi。
 
-对于 DSH，AEC-S 会验证所有直接锁定的 `@deepseek-ai/dsh-*` 软件包，通过 DSH 自己的 Credential seam 查询 `DEEPSEEK_API_KEY` 是否已配置，并分别对 Executor 与 Reviewer composition 执行 stdio JSON-RPC 初始化。两套 composition 均挂载 `dsh-credentials-local`，因此 DSH 已存入 `$DSH_HOME/.credentials.yaml` 的认证可直接复用，无需把 Key 复制到 AEC-S、SQLite、日志或 LaunchAgent plist。`dsh web` 是独立产品进程，既非运行前提，也不会被接管为 Run 进程；AEC-S 为每个活动 Run 启动隔离的 headless DSH 子进程，确保取消一个 Run 不影响其他 Run。
+对于 DSH，AEC-S 会验证所有直接锁定的 `@deepseek-ai/dsh-*` 软件包，通过 DSH 自己的 Credential seam 查询 `DEEPSEEK_API_KEY` 是否已配置，并分别对 Executor 与 Reviewer composition 执行 stdio JSON-RPC 初始化。两套 composition 只有在 AEC-S 提供 `DSH_CWD` 与 `DSH_SESSION_ROOT` 时才会启动，绝不回退到 Daemon 工作目录；它们均挂载 `dsh-credentials-local`，因此 DSH 已存入 `$DSH_HOME/.credentials.yaml` 的认证可直接复用，无需把 Key 复制到 AEC-S、SQLite、日志或 LaunchAgent plist。`dsh web` 是独立产品进程，既非运行前提，也不会被接管为 Run 进程；AEC-S 为每个活动 Run 启动隔离的 headless DSH 子进程，确保取消一个 Run 不影响其他 Run。
 
 ## 最短本地闭环
 
-先复制并修改 `examples/` 中的绝对仓库路径、命令和 Scope。本地交付要求 Project 的 `targetBranch` 当前正检出在主仓库中，并且主工作树保持干净；`aec-s doctor` 会在运行前报告这一条件：
+先复制 `examples/` 并替换其中的 `__AEC_S_REPOSITORY_PATH_REQUIRED__` 哨兵值、命令和 Scope。`project add` 会在创建任何 Project 前拒绝该哨兵值及旧版 `/absolute/path/to/...` 占位路径。本地交付要求 Project 的 `targetBranch` 当前正检出在主仓库中，并且主工作树保持干净；`aec-s doctor` 会在运行前报告这一条件：
 
 ```bash
 npm run build
@@ -232,7 +232,7 @@ npm run test:all
 npm run test:runtimes:live
 ```
 
-`test:all` 执行 lint、严格类型检查、许可证策略、强制包策略与覆盖率门槛。包策略会独立要求所有安装脚本包逐项匹配已审核的 `allowScripts` 名称和版本，并保证所有 DSH 预发布包维持精确锁定，因此安全性不依赖包管理器是否执行 `allowScripts`。GitHub Actions 只使用协议级替身，不使用真实凭据。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，只输出版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本。
+`test:all` 执行 lint、严格类型检查、许可证策略、强制包策略与覆盖率门槛。包策略会独立要求所有安装脚本包逐项匹配已审核的 `allowScripts` 名称和版本，并检查生产、开发、可选及 Peer 依赖中的全部 DSH 预发布包是否精确锁定，因此安全性不依赖包管理器默认行为。GitHub Actions 只使用协议级替身、不可变发布提交及无真实凭据环境。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，会脱敏边界处的意外异常，并只输出版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本。
 
 测试覆盖正式十实体投影、TaskRevision/Finding 证据、确定性调度与健康防抖、Scope 冲突、Validation/Review Repair、supervisor 恢复、合并后收敛、全部十一个 MCP 工具，以及 Git/GitHub 副作用幂等。独立的真实门禁进一步验证 Codex/Kimi/DSH 的执行、Review、Repair/Resume、Cancel 隔离和健康阈值。
 

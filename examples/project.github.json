@@ -1,7 +1,7 @@
 {
   "id": "example-project",
   "name": "Example Project",
-  "repoPath": "/absolute/path/to/trusted/repository",
+  "repoPath": "__AEC_S_REPOSITORY_PATH_REQUIRED__",
   "targetBranch": "main",
   "remoteName": "origin",
   "deliveryMode": "github",
