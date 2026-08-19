@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecSDatabase } from "../src/db.js";
@@ -130,7 +130,7 @@ async function runScheduledPair(input: {
 }): Promise<string[]> {
   const repo = createGitRepository();
   const home = tempDir("aec-scheduler-pair-");
-  const timeline = join(home, "timeline.txt");
+  const timeline = join(home, "runtime-state", "pair-executor", "timeline.txt");
   const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "scheduler-pair",
@@ -188,7 +188,9 @@ async function runScheduledPair(input: {
 test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol substitutes", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-s-three-runtime-scheduler-");
-  const timeline = join(home, "three-runtime-timeline.txt");
+  const timelineState = join(home, "runtime-state", "shared-timeline");
+  mkdirSync(timelineState, { recursive: true, mode: 0o700 });
+  const timeline = join(timelineState, "timeline.txt");
   const db = new AecSDatabase(home);
   const project = db.createProject({ name: "three-runtime-scheduler", repoPath: repo, maxConcurrency: 3 });
   const runtimes = ["codex", "kimi", "deepseek_harness"] as const;
@@ -215,17 +217,24 @@ test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol 
   }
   const engine = new AecSEngine(db, {
     globalConcurrency: 3,
-    adapterFactory: (runtimeAgent) => adapterFor({
-      ...runtimeAgent,
-      adapter: "command",
-      config: runtimeAgent.roles.includes("reviewer")
-        ? { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } }
-        : {
-            binary: process.execPath,
-            execute: { program: process.execPath, args: [fakeAgent, "timeline-triple-barrier", "{workspace}", "{output}", timeline] },
-            repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
-          },
-    }),
+    adapterFactory: (runtimeAgent) => {
+      const substitute = adapterFor({
+        ...runtimeAgent,
+        adapter: "command",
+        config: runtimeAgent.roles.includes("reviewer")
+          ? { binary: process.execPath, review: { program: process.execPath, args: [fakeAgent, "review", "{workspace}", "{output}"] } }
+          : {
+              binary: process.execPath,
+              execute: { program: process.execPath, args: [fakeAgent, "timeline-triple-barrier", "{workspace}", "{output}", timeline] },
+              repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
+            },
+      });
+      if (runtimeAgent.roles.includes("executor")) {
+        const invocation = substitute.invocation.bind(substitute);
+        substitute.invocation = (options) => ({ ...invocation(options), runtimeStatePaths: [timelineState] });
+      }
+      return substitute;
+    },
   });
   const tasks = engine.submitGraph(project.id, runtimes.map((runtime) => ({
     id: `three-runtime-${runtime}`,
@@ -256,9 +265,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
     highRiskGlobs: ["shared/**"],
     maxConcurrency: 2,
   });
-  const uiValidationCount = join(home, "ui-validation-count.txt");
-  const coreValidationCount = join(home, "core-validation-count.txt");
-  const executionTimeline = join(home, "execution-timeline.txt");
+  const executionTimeline = join(home, "runtime-state", "executor", "execution-timeline.txt");
   db.createAgent({
     id: "executor",
     name: "fake-worker",
@@ -293,7 +300,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
       acceptanceCriteria: ["UI file exists"],
       validationCommands: [{
         program: process.execPath,
-        args: ["-e", `const fs=require('node:fs');fs.accessSync('ui/result.txt');const p=${JSON.stringify(uiValidationCount)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1))`],
+        args: ["-e", "require('node:fs').accessSync('ui/result.txt')"],
       }],
     },
     {
@@ -305,7 +312,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
       acceptanceCriteria: ["Core file exists"],
       validationCommands: [{
         program: process.execPath,
-        args: ["-e", `const fs=require('node:fs');fs.accessSync('core/result.txt');const p=${JSON.stringify(coreValidationCount)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1))`],
+        args: ["-e", "require('node:fs').accessSync('core/result.txt')"],
       }],
     },
   ]);
@@ -314,8 +321,7 @@ test("runs two independent tasks without invalidating the second on HEAD change"
   assert.equal(existsSync(join(repo, "ui/result.txt")), true);
   assert.equal(existsSync(join(repo, "core/result.txt")), true);
   assert.equal(existsSync(join(repo, "FULL_RAN")), false);
-  assert.equal(readFileSync(uiValidationCount, "utf8"), "1", "unrelated HEAD changes must reuse UI validation");
-  assert.equal(readFileSync(coreValidationCount, "utf8"), "1", "unrelated HEAD changes must reuse Core validation");
+  assert.ok(db.listRuns().every((run) => run.metrics?.validationRuns === 2), "unrelated HEAD changes must reuse validation evidence");
   const timeline = readFileSync(executionTimeline, "utf8").trim().split(/\r?\n/);
   assert.ok(timeline[0]?.endsWith(":start") && timeline[1]?.endsWith(":start"), "independent executor jobs must overlap");
   const log = execFileSync("git", ["log", "--format=%B"], { cwd: repo, encoding: "utf8" });
@@ -336,7 +342,6 @@ test("runs two independent tasks without invalidating the second on HEAD change"
 test("revalidates only the current task after a related target-branch change", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-s-related-head-");
-  const validationCount = join(home, "validation-count.txt");
   const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "related-head",
@@ -372,7 +377,7 @@ test("revalidates only the current task after a related target-branch change", a
     acceptanceCriteria: ["Feature is merged after local revalidation"],
     validationCommands: [{
       program: process.execPath,
-      args: ["-e", `const fs=require('node:fs');const p=${JSON.stringify(validationCount)};fs.writeFileSync(p,String(Number(fs.existsSync(p)?fs.readFileSync(p,'utf8'):0)+1))`],
+      args: ["-e", "process.exit(0)"],
     }],
   }]);
   const running = engine.runTask(task!.id);
@@ -388,7 +393,7 @@ test("revalidates only the current task after a related target-branch change", a
   });
   await running;
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
-  assert.equal(readFileSync(validationCount, "utf8"), "2", "related target changes must trigger local revalidation");
+  assert.equal(db.getLatestRunForTask(task!.id)?.metrics?.validationRuns, 2, "related target changes must trigger local revalidation");
   assert.equal(existsSync(join(repo, "FULL_RAN")), false, "related but non-high-risk changes must not trigger full validation");
   const finalRun = db.getLatestRunForTask(task!.id)!;
   assert.equal(db.getWorkspace(finalRun.workspaceId)?.baseSha, finalRun.baseSha);
@@ -858,7 +863,6 @@ test("does not bypass the independent Review Gate when no reviewer is available"
 test("runs configured full validation for a high-risk Task path", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-s-high-risk-");
-  const fullMarker = join(home, "full-validation-ran.txt");
   const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "high-risk",
@@ -866,7 +870,7 @@ test("runs configured full validation for a high-risk Task path", async () => {
     highRiskGlobs: ["critical/**"],
     fullValidation: [{
       program: process.execPath,
-      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(fullMarker)},'yes')`],
+      args: ["-e", "process.stdout.write('full-validation')"],
     }],
   });
   registerFakeAgents(db);
@@ -880,14 +884,15 @@ test("runs configured full validation for a high-risk Task path", async () => {
   }]);
   await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
-  assert.equal(readFileSync(fullMarker, "utf8"), "yes");
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(run.validation.length, 1);
+  assert.match(readFileSync(run.validation[0]!.stdoutPath, "utf8"), /full-validation/);
   db.close();
 });
 
 test("recalculates the Risk Floor after validation generates a high-risk file", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-s-post-validation-risk-");
-  const fullMarker = join(home, "full-validation-ran.txt");
   const db = new AecSDatabase(home);
   const project = db.createProject({
     name: "post-validation-risk",
@@ -899,7 +904,7 @@ test("recalculates the Risk Floor after validation generates a high-risk file", 
     }],
     fullValidation: [{
       program: process.execPath,
-      args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(fullMarker)},'ran')`],
+      args: ["-e", "process.stdout.write('risk-floor-full-validation')"],
     }],
   });
   registerFakeAgents(db);
@@ -914,7 +919,9 @@ test("recalculates the Risk Floor after validation generates a high-risk file", 
   await new AecSEngine(db).runTask(task!.id);
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(db.getTaskRevision(db.getTask(task!.id)!.currentRevisionId!)?.effectiveRiskClass, "core");
-  assert.equal(readFileSync(fullMarker, "utf8"), "ran");
+  const finalRun = db.getLatestRunForTask(task!.id)!;
+  assert.equal(finalRun.metrics?.validationRuns, 2);
+  assert.match(readFileSync(finalRun.validation.at(-1)!.stdoutPath, "utf8"), /risk-floor-full-validation/);
   assert.ok((db.getLatestRunForTask(task!.id)?.metrics?.validationRuns ?? 0) >= 2);
   db.close();
 });

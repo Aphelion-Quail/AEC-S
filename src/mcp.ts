@@ -230,6 +230,8 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
       await session.server.close();
     }));
   };
+  const pruneTimer = setInterval(() => { void pruneSessions().catch(() => undefined); }, 60_000);
+  pruneTimer.unref();
 
   app.get("/healthz", (_request: IncomingMessage, response: ServerResponse) => {
     jsonResponse(response, 200, { status: "ok", service: "aec-s-mcp" });
@@ -290,6 +292,7 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
     const stop = () => {
       if (stopping) return;
       stopping = true;
+      clearInterval(pruneTimer);
       if (!httpServer) return resolve();
       void Promise.allSettled([...sessions.values()].map(async ({ server, transport }) => {
         await transport.close();
@@ -305,14 +308,14 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
         httpServer!.closeIdleConnections();
       });
     };
-    if (options.signal?.aborted) return resolve();
+    if (options.signal?.aborted) { clearInterval(pruneTimer); return resolve(); }
     const createdServer = app.listen(port, MCP_HTTP_HOST, () => {
       const address = createdServer.address();
       const actualPort = typeof address === "object" && address ? address.port : port;
       options.onListening?.(`http://${MCP_HTTP_HOST}:${actualPort}/mcp`);
     });
     httpServer = createdServer;
-    createdServer.on("error", reject);
+    createdServer.on("error", (error: Error) => { clearInterval(pruneTimer); reject(error); });
     options.signal?.addEventListener("abort", stop, { once: true });
   });
 }

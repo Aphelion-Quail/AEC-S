@@ -2,6 +2,15 @@ export type JsonObject = Record<string, unknown>;
 
 export type ChildEnvironmentProfile = "restricted" | "codex" | "kimi" | "deepseek_harness";
 
+export type ProcessIsolation = {
+  workspacePath: string;
+  mode: "workspace-write" | "read-only";
+  controllerPath: string;
+  runtimeStatePaths?: string[];
+  homePath: string;
+  tempPath: string;
+};
+
 export type CommandSpec = {
   program: string;
   args: string[];
@@ -423,6 +432,7 @@ export type OutboxMessage = {
 export type JobInput = {
   command: CommandSpec;
   environmentProfile?: ChildEnvironmentProfile;
+  isolation?: ProcessIsolation;
   stdin?: string;
   stdoutPath: string;
   stderrPath: string;
@@ -430,7 +440,7 @@ export type JobInput = {
 };
 
 export type JobResult = {
-  status: "completed" | "timed_out" | "spawn_error" | "output_limit";
+  status: "completed" | "timed_out" | "spawn_error" | "output_limit" | "sandbox_denied";
   exitCode: number | null;
   signal: string | null;
   error?: string;

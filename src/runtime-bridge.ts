@@ -94,7 +94,10 @@ async function runLegacyKimi(
     clientInfo: { name: "aec-s", version: "1.0-runtime" },
   });
   let turn: Turn | undefined;
-  const stop = () => { if (turn) void turn.interrupt(); void session.close(); };
+  const stop = () => {
+    if (turn) void turn.interrupt().catch(() => undefined);
+    void session.close().catch(() => undefined);
+  };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   try {
@@ -203,7 +206,7 @@ async function runDeepSeek(
     ...(config.model ? { model: config.model } : {}),
     ...(config.maxTokens ? { maxTokens: config.maxTokens } : {}),
   });
-  const stop = () => { void harness.close(); };
+  const stop = () => { void harness.close().catch(() => undefined); };
   process.once("SIGTERM", stop);
   process.once("SIGINT", stop);
   try {

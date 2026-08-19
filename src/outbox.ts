@@ -40,12 +40,18 @@ export async function deliverSystemOutboxOnce(
   return delivered;
 }
 
-export async function systemOutboxLoop(db: AecSDatabase, signal?: AbortSignal): Promise<void> {
+export async function systemOutboxLoop(db: AecSDatabase, signal?: AbortSignal, delayMs = 5_000): Promise<void> {
   while (!signal?.aborted) {
-    await deliverSystemOutboxOnce(db);
+    try {
+      await deliverSystemOutboxOnce(db);
+    } catch {
+      // Outbox delivery is auxiliary. A transient database, spawn, or macOS
+      // notification failure must not terminate the control-plane daemon.
+    }
     await new Promise<void>((resolve) => {
-      const timer = setTimeout(resolve, 5_000);
-      signal?.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+      const done = () => { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); };
+      const timer = setTimeout(done, delayMs);
+      signal?.addEventListener("abort", done, { once: true });
     });
   }
 }

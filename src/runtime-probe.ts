@@ -29,6 +29,7 @@ export type RuntimeProbeResult = {
     authentication: ProbeCheck;
     compatibility: ProbeCheck;
     backgroundAccess: ProbeCheck;
+    isolation?: ProbeCheck;
   };
 };
 

@@ -27,6 +27,12 @@ function parseJson<T>(value: string, label: string): T {
   }
 }
 
+export function githubCheckPollIntervalMs(value = process.env.AEC_S_GITHUB_CHECK_POLL_MS): number {
+  if (value === undefined || value.trim() === "") return 5_000;
+  const interval = Number(value);
+  return Number.isFinite(interval) && interval > 0 && interval <= 60_000 ? interval : 5_000;
+}
+
 export async function pushTaskBranch(project: Project, workspacePath: string, branch: string): Promise<string> {
   return await withProjectGitLock(project, async () => {
     await execChecked(git(workspacePath, ["push", "--force-with-lease", "--set-upstream", project.remoteName, branch]));
@@ -103,8 +109,11 @@ export async function waitForRequiredChecks(
   prNumber: number,
   timeoutSeconds = 1800,
   heartbeat?: () => void,
-  pollIntervalMs = Number(process.env.AEC_S_GITHUB_CHECK_POLL_MS ?? 5_000),
+  pollIntervalMs = githubCheckPollIntervalMs(),
 ): Promise<void> {
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0 || pollIntervalMs > 60_000) {
+    throw new Error(`GitHub check poll interval must be between 1 and 60000 ms: ${String(pollIntervalMs)}`);
+  }
   if (project.requiredChecks.length === 0) {
     throw new Error("GitHub delivery requires at least one explicitly configured required check");
   }

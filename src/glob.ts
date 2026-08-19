@@ -1,18 +1,16 @@
 import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 
-function escapeRegex(value: string): string {
-  return value.replace(/[|\\{}()[\]^$+?.]/g, "\\$&");
-}
+type GlobToken = { kind: "literal"; value: string } | { kind: "one" | "star" | "globstar" | "globstar-slash" };
 
-const globCache = new Map<string, RegExp>();
+const globCache = new Map<string, GlobToken[]>();
 const MAX_GLOB_CACHE_ENTRIES = 1_024;
 
-export function globToRegExp(glob: string): RegExp {
+function compileGlob(glob: string): GlobToken[] {
   const normalized = glob.replaceAll("\\", "/").replace(/^\.\//, "");
   const cached = globCache.get(normalized);
   if (cached) return cached;
-  let pattern = "";
+  const tokens: GlobToken[] = [];
   for (let index = 0; index < normalized.length; index += 1) {
     const char = normalized[index]!;
     if (char === "*") {
@@ -20,31 +18,63 @@ export function globToRegExp(glob: string): RegExp {
         index += 1;
         if (normalized[index + 1] === "/") {
           index += 1;
-          pattern += "(?:.*/)?";
+          tokens.push({ kind: "globstar-slash" });
         } else {
-          pattern += ".*";
+          tokens.push({ kind: "globstar" });
         }
       } else {
-        pattern += "[^/]*";
+        tokens.push({ kind: "star" });
       }
     } else if (char === "?") {
-      pattern += "[^/]";
+      tokens.push({ kind: "one" });
     } else {
-      pattern += escapeRegex(char);
+      tokens.push({ kind: "literal", value: char });
     }
   }
-  const compiled = new RegExp(`^${pattern}$`);
   if (globCache.size >= MAX_GLOB_CACHE_ENTRIES) {
     const oldest = globCache.keys().next().value as string | undefined;
     if (oldest !== undefined) globCache.delete(oldest);
   }
-  globCache.set(normalized, compiled);
-  return compiled;
+  globCache.set(normalized, tokens);
+  return tokens;
+}
+
+function matchesGlob(path: string, glob: string): boolean {
+  const tokens = compileGlob(glob);
+  const memo = new Map<string, boolean>();
+  const visit = (tokenIndex: number, pathIndex: number): boolean => {
+    const key = `${tokenIndex}:${pathIndex}`;
+    const known = memo.get(key);
+    if (known !== undefined) return known;
+    const token = tokens[tokenIndex];
+    let result: boolean;
+    if (!token) {
+      result = pathIndex === path.length;
+    } else if (token.kind === "literal") {
+      result = path[pathIndex] === token.value && visit(tokenIndex + 1, pathIndex + 1);
+    } else if (token.kind === "one") {
+      result = pathIndex < path.length && path[pathIndex] !== "/" && visit(tokenIndex + 1, pathIndex + 1);
+    } else if (token.kind === "star") {
+      result = visit(tokenIndex + 1, pathIndex) || (
+        pathIndex < path.length && path[pathIndex] !== "/" && visit(tokenIndex, pathIndex + 1)
+      );
+    } else if (token.kind === "globstar") {
+      result = visit(tokenIndex + 1, pathIndex) || (pathIndex < path.length && visit(tokenIndex, pathIndex + 1));
+    } else {
+      result = visit(tokenIndex + 1, pathIndex);
+      for (let index = pathIndex; !result && index < path.length; index += 1) {
+        if (path[index] === "/") result = visit(tokenIndex + 1, index + 1);
+      }
+    }
+    memo.set(key, result);
+    return result;
+  };
+  return visit(0, 0);
 }
 
 export function matchesAny(path: string, globs: string[]): boolean {
   const normalized = path.replaceAll("\\", "/").replace(/^\.\//, "");
-  return globs.some((glob) => globToRegExp(glob).test(normalized));
+  return globs.some((glob) => matchesGlob(normalized, glob));
 }
 
 export function globsMayOverlap(left: string[], right: string[]): boolean {
@@ -61,8 +91,8 @@ function globPairMayOverlap(left: string, right: string): boolean {
   const leftWildcard = /[?*]/.test(left);
   const rightWildcard = /[?*]/.test(right);
   if (!leftWildcard && !rightWildcard) return normalizeGlob(left) === normalizeGlob(right);
-  if (!leftWildcard && globToRegExp(right).test(normalizeGlob(left))) return true;
-  if (!rightWildcard && globToRegExp(left).test(normalizeGlob(right))) return true;
+  if (!leftWildcard && matchesGlob(normalizeGlob(left), right)) return true;
+  if (!rightWildcard && matchesGlob(normalizeGlob(right), left)) return true;
   const leftRoot = literalDirectoryRoot(left);
   const rightRoot = literalDirectoryRoot(right);
   if (!leftRoot || !rightRoot) return true;

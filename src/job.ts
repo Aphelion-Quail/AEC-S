@@ -9,6 +9,7 @@ import { readJson, writeJsonAtomic } from "./files.js";
 import { jobInputSchema } from "./input.js";
 import { childEnvironment } from "./child-env.js";
 import { killProcessTreeByPid } from "./process-control.js";
+import { isolatedCommand, isolationEnvironment } from "./isolation.js";
 
 export async function runJobFile(inputPath: string): Promise<void> {
   const input = jobInputSchema.parse(readJson<unknown>(inputPath)) as JobInput;
@@ -41,6 +42,7 @@ export async function runJobFile(inputPath: string): Promise<void> {
   const stderr = openSync(input.stderrPath, "a", 0o600);
   let finished = false;
   let outputLimitExceeded: string | undefined;
+  let sandboxDenied = false;
   const outputLimit = 8 * 1024 * 1024;
   let stdoutBytes = 0;
   let stderrBytes = 0;
@@ -55,9 +57,12 @@ export async function runJobFile(inputPath: string): Promise<void> {
     }
   };
   try {
-    const child = spawn(input.command.program, input.command.args, {
-      cwd: input.command.cwd,
-      env: childEnvironment(input.environmentProfile, input.command.env),
+    const environmentProfile = input.environmentProfile ?? "restricted";
+    const launch = input.isolation ? isolatedCommand(input.command, input.isolation) : input.command;
+    const isolationOverrides = input.isolation ? isolationEnvironment(input.isolation, environmentProfile) : {};
+    const child = spawn(launch.program, launch.args, {
+      cwd: launch.cwd,
+      env: childEnvironment(environmentProfile, { ...input.command.env, ...isolationOverrides }),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
@@ -90,7 +95,10 @@ export async function runJobFile(inputPath: string): Promise<void> {
       }
     };
     child.stdout!.on("data", (chunk: Buffer) => writeBounded(stdout, chunk, "stdout"));
-    child.stderr!.on("data", (chunk: Buffer) => writeBounded(stderr, chunk, "stderr"));
+    child.stderr!.on("data", (chunk: Buffer) => {
+      if (/\bEPERM\b|operation not permitted/i.test(chunk.toString("utf8"))) sandboxDenied = true;
+      writeBounded(stderr, chunk, "stderr");
+    });
     const onSignal = (): void => forwardCancellation();
     process.once("SIGTERM", onSignal);
     process.once("SIGINT", onSignal);
@@ -128,7 +136,7 @@ export async function runJobFile(inputPath: string): Promise<void> {
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
-        status: outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : "completed",
+        status: outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : sandboxDenied && exitCode !== 0 ? "sandbox_denied" : "completed",
         exitCode,
         signal,
         ...(outputLimitExceeded ? { error: outputLimitExceeded } : {}),
@@ -244,5 +252,22 @@ export async function waitForJob(
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
+  if (job.pid && processAlive(job.pid)) {
+    killProcessTreeByPid(job.pid, "SIGTERM", () => {
+      try { process.kill(job.pid!, "SIGTERM"); return true; } catch { return false; }
+    });
+    const terminationDeadline = Date.now() + 2_500;
+    while (Date.now() < terminationDeadline) {
+      if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
+      if (!processAlive(job.pid)) break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    if (processAlive(job.pid)) {
+      killProcessTreeByPid(job.pid, "SIGKILL", () => {
+        try { process.kill(job.pid!, "SIGKILL"); return true; } catch { return false; }
+      });
+    }
+  }
+  if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
   throw new Error(`Timed out waiting for supervised job ${job.id}`);
 }

@@ -5,12 +5,20 @@ import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { AecSDatabase } from "../src/db.js";
 import { AecSEngine } from "../src/engine.js";
-import { inspectRequiredChecks, mergePullRequest, waitForRequiredChecks } from "../src/github.js";
+import { githubCheckPollIntervalMs, inspectRequiredChecks, mergePullRequest, waitForRequiredChecks } from "../src/github.js";
 import { branchHead, commitTask, createWorktree } from "../src/git.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 import type { Project, Run, Workspace } from "../src/types.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
+
+test("normalizes malformed GitHub check polling configuration", () => {
+  assert.equal(githubCheckPollIntervalMs(undefined), 5_000);
+  assert.equal(githubCheckPollIntervalMs("NaN"), 5_000);
+  assert.equal(githubCheckPollIntervalMs("Infinity"), 5_000);
+  assert.equal(githubCheckPollIntervalMs("-1"), 5_000);
+  assert.equal(githubCheckPollIntervalMs("250"), 250);
+});
 
 test("publishes one idempotent PR and records the remote merge", async () => {
   const repo = createGitRepository();

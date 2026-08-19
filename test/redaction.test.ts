@@ -32,3 +32,11 @@ test("redacts JSON secrets, Google API keys, and non-HTTP credential URLs", () =
   assert.match(redacted, /"api_key": "\[REDACTED\]"/);
   assert.doesNotMatch(redactText(`DEEPSEEK_API_KEY: '${"x".repeat(32)}'`), /xxxxxxxx/);
 });
+
+test("preserves token usage metrics while covering additional provider tokens", () => {
+  const metrics = { tokenUsage: { input: 12, output: 8, total: 20 } };
+  assert.deepEqual(redactJson(metrics), metrics);
+  const secrets = [`glpat-${"a".repeat(24)}`, `xapp-${"b".repeat(24)}`, `npm_${"c".repeat(36)}`];
+  const redacted = redactText(secrets.join(" "));
+  for (const secret of secrets) assert.equal(redacted.includes(secret), false);
+});
