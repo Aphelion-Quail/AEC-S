@@ -21,7 +21,7 @@ import type {
   WorkerResult,
   Workspace,
 } from "./types.js";
-import { gitMetadataReadPaths, probeProcessIsolation, runtimeStatePaths } from "./isolation.js";
+import { gitMetadataReadPaths, probeProcessIsolation, runtimeAccessPaths } from "./isolation.js";
 import { newId, nowIso } from "./ids.js";
 import { adapterFor, type AgentAdapter, type AgentInvocation } from "./adapters/agent.js";
 import type { RuntimeProbeResult } from "./runtime-probe.js";
@@ -54,7 +54,7 @@ import {
 } from "./git.js";
 import { matchesAny, tasksConflict } from "./glob.js";
 import { assertFileSize, parseStructuredOutput, readJson, readTextBounded } from "./files.js";
-import { processAlive, startSupervisedJob, waitForJob } from "./job.js";
+import { cancelSupervisedJob, processAlive, startSupervisedJob, waitForJob } from "./job.js";
 import { authoritativeCommands, resolveValidationCommand, validationPaths } from "./validation.js";
 import { writeSchemas } from "./schemas.js";
 import { taskInputSchema } from "./input.js";
@@ -70,7 +70,6 @@ import {
 } from "./github.js";
 import { redactJson, redactText } from "./redaction.js";
 import { fingerprint } from "./fingerprint.js";
-import { execCommand } from "./exec.js";
 import { AEC_ERROR, AecError, isAecError } from "./errors.js";
 import { classifyPhaseError } from "./engine-errors.js";
 import {
@@ -107,6 +106,7 @@ export class AecSEngine {
   private readonly leaseOwner = `${process.pid}:${newId("lease")}`;
   private schedulerCycles = 0;
   private lastAgentHealthcheckAt = 0;
+  private shuttingDown = false;
 
   constructor(readonly db: AecSDatabase, options: EngineOptions = {}) {
     this.globalConcurrency = options.globalConcurrency ?? 3;
@@ -306,11 +306,50 @@ export class AecSEngine {
   }
 
   async daemon(signal?: AbortSignal): Promise<void> {
-    while (!signal?.aborted) {
-      await this.refreshAgentAvailabilityIfDue();
-      const count = await this.runOnce();
-      if (count === 0) await new Promise((resolve) => setTimeout(resolve, 1_000));
+    const cancelActive = (): void => {
+      this.shuttingDown = true;
+      this.cancelActiveJobsForShutdown();
+    };
+    signal?.addEventListener("abort", cancelActive, { once: true });
+    if (signal?.aborted) cancelActive();
+    try {
+      while (!signal?.aborted) {
+        await this.refreshAgentAvailabilityIfDue();
+        const count = await this.runOnce();
+        if (count === 0) await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+    } finally {
+      signal?.removeEventListener("abort", cancelActive);
     }
+  }
+
+  private cancelActiveJobsForShutdown(): void {
+    for (const run of this.db.listRunsWithJobs()) {
+      const job = run.job;
+      if (!job?.pid || !processAlive(job.pid)) continue;
+      const runtime = job.agentId ? this.db.getAgent(job.agentId) : undefined;
+      if (runtime) this.adapterFactory(runtime).close(job.pid);
+      else cancelSupervisedJob(job.pid);
+      const task = this.db.getTask(run.taskId);
+      this.db.appendEvent({
+        projectId: task?.projectId,
+        taskId: run.taskId,
+        runId: run.id,
+        type: "job.shutdown_requested",
+        payload: { jobId: job.id, label: job.label ?? null },
+      });
+    }
+  }
+
+  private releaseRunForShutdown(run: Run): void {
+    run.job = undefined;
+    run.error = redactJson({
+      ...run.error,
+      daemonShutdown: { requestedAt: nowIso(), phase: run.phase },
+    });
+    run.leaseUntil = undefined;
+    run.leaseOwner = undefined;
+    this.saveRun(run);
   }
 
   async refreshAgentAvailability(): Promise<Map<string, RuntimeProbeResult>> {
@@ -597,6 +636,10 @@ export class AecSEngine {
     while (true) {
       const run = this.requireRun(runId);
       if (run.status !== "active" || run.phase === "done") return;
+      if (this.shuttingDown) {
+        this.releaseRunForShutdown(run);
+        return;
+      }
       const currentTask = this.requireTask(run.taskId);
       if (currentTask.status === "paused") {
         run.leaseUntil = undefined;
@@ -673,12 +716,13 @@ export class AecSEngine {
     const task = this.requireTask(run.taskId);
     const project = this.requireProject(task.projectId);
     const workspace = this.requireWorkspace(run.workspaceId);
-    await this.verifyEnvironmentContract(project, task, run);
     const baseSha = await createWorktree(project, workspace.path, workspace.branch);
     workspace.baseSha = baseSha;
     workspace.status = "active";
     this.db.updateWorkspaceBaseline(workspace.id, baseSha, "active");
     run.baseSha = baseSha;
+    this.saveRun(run);
+    await this.verifyEnvironmentContract(project, task, run);
     this.setPhase(run, "execute", { baseSha });
   }
 
@@ -697,18 +741,38 @@ export class AecSEngine {
       }
       let observed = "";
       if (component.command) {
-        const command = resolveValidationCommand(component.command, project.repoPath);
-        const result = await execCommand(command);
-        if (result.exitCode !== 0 || result.timedOut) {
-          throw new Error(`Environment component ${requirement} failed verification: ${redactText(result.stderr || result.stdout)}`);
+        const workspace = this.requireWorkspace(run.workspaceId);
+        const command = resolveValidationCommand(component.command, workspace.path);
+        const execution = await this.executeCommand(run, command, `environment-${requirement}`, {
+          environmentProfile: "restricted",
+          isolationMode: "read-only",
+          networkAccess: "none",
+          allowFailure: true,
+        });
+        const stdout = existsSync(execution.stdoutPath) ? readFileSync(execution.stdoutPath, "utf8") : "";
+        const stderr = existsSync(execution.stderrPath) ? readFileSync(execution.stderrPath, "utf8") : "";
+        if (execution.result.status !== "completed" || execution.result.exitCode !== 0) {
+          throw new Error(`Environment component ${requirement} failed verification: ${redactText(stderr || stdout)}`);
         }
-        observed = `${result.stdout}\n${result.stderr}`.trim();
+        observed = `${stdout}\n${stderr}`.trim();
       } else if (requirement === "node") {
         observed = process.version;
       } else if (requirement === "git") {
-        const result = await execCommand({ program: "git", args: ["--version"], cwd: project.repoPath, timeoutSeconds: 15 });
-        if (result.exitCode !== 0) throw new Error(`Environment component git failed verification: ${redactText(result.stderr)}`);
-        observed = result.stdout.trim();
+        const workspace = this.requireWorkspace(run.workspaceId);
+        const execution = await this.executeCommand(run, {
+          program: "git", args: ["--version"], cwd: workspace.path, timeoutSeconds: 15,
+        }, "environment-git", {
+          environmentProfile: "restricted",
+          isolationMode: "read-only",
+          networkAccess: "none",
+          allowFailure: true,
+        });
+        const stdout = existsSync(execution.stdoutPath) ? readFileSync(execution.stdoutPath, "utf8") : "";
+        const stderr = existsSync(execution.stderrPath) ? readFileSync(execution.stderrPath, "utf8") : "";
+        if (execution.result.status !== "completed" || execution.result.exitCode !== 0) {
+          throw new Error(`Environment component git failed verification: ${redactText(stderr || stdout)}`);
+        }
+        observed = stdout.trim();
       } else {
         throw new Error(`Environment component ${requirement} requires a verification command`);
       }
@@ -1568,7 +1632,9 @@ export class AecSEngine {
           ? "restricted"
           : runtime.adapter,
         isolationMode: label === "review" ? "read-only" : "workspace-write",
-        runtimeStatePaths: commandStatePath ? [commandStatePath] : invocation.runtimeStatePaths,
+        runtimeRootPaths: invocation.runtimeRootPaths,
+        stateWritePaths: [...(invocation.stateWritePaths ?? []), ...(commandStatePath ? [commandStatePath] : [])],
+        networkAccess: runtime.adapter === "command" ? "none" : "provider",
       },
     );
     const postHeadSha = await branchHead(workspace.path, "HEAD");
@@ -1594,7 +1660,9 @@ export class AecSEngine {
       authorityHeadSha?: string;
       environmentProfile?: ChildEnvironmentProfile;
       isolationMode?: "workspace-write" | "read-only";
-      runtimeStatePaths?: string[];
+      networkAccess?: "none" | "provider";
+      runtimeRootPaths?: string[];
+      stateWritePaths?: string[];
       allowFailure?: boolean;
     } = {},
   ): Promise<JobExecution> {
@@ -1619,14 +1687,18 @@ export class AecSEngine {
           if (existsSync(path)) renameSync(path, `${path}.${previous}`);
         }
       }
+      const environmentProfile = options.environmentProfile ?? "restricted";
+      const runtimePaths = runtimeAccessPaths(environmentProfile, options.runtimeRootPaths);
       input = {
         command,
         ...(options.environmentProfile ? { environmentProfile: options.environmentProfile } : {}),
         isolation: {
           workspacePath: workspace.path,
           mode: options.isolationMode ?? "workspace-write",
+          networkAccess: options.networkAccess ?? (environmentProfile === "restricted" ? "none" : "provider"),
           controllerPath: options.structuredOutputPath ? dirname(options.structuredOutputPath) : run.logDir,
-          runtimeStatePaths: runtimeStatePaths(options.environmentProfile ?? "restricted", options.runtimeStatePaths ?? []),
+          credentialReadPaths: runtimePaths.credentialReadPaths,
+          stateWritePaths: [...runtimePaths.stateWritePaths, ...(options.stateWritePaths ?? [])],
           gitMetadataPaths: gitMetadataReadPaths(workspace.path, project.repoPath),
           homePath: join(run.logDir, "isolation", jobId, "home"),
           tempPath: join(run.logDir, "isolation", jobId, "tmp"),
@@ -1734,14 +1806,25 @@ export class AecSEngine {
       this.saveRun(run);
       return;
     }
+    if (this.shuttingDown) {
+      this.releaseRunForShutdown(run);
+      return;
+    }
     if (classified.category === "agent_capacity") {
-      const previous = run.error?.externalWait;
-      const startedAt = previous && typeof previous === "object" && !Array.isArray(previous)
-        ? String((previous as JsonObject).startedAt ?? nowIso())
+      const waitHistory = Array.isArray(run.error?.externalWaitHistory) ? run.error.externalWaitHistory : [];
+      const previous = run.error?.externalWait ?? waitHistory.at(-1);
+      const previousWait = previous && typeof previous === "object" && !Array.isArray(previous)
+        ? previous as JsonObject
+        : undefined;
+      const startedAt = previousWait
+        ? String(previousWait.startedAt ?? nowIso())
         : nowIso();
-      const nextAttemptAt = new Date(Date.now() + 1_000).toISOString();
+      const attempt = Math.max(1, Number(previousWait?.attempt ?? 0) + 1);
+      const delayMs = Math.min(60_000, 2_000 * (2 ** Math.min(attempt - 1, 5)));
+      const nextAttemptAt = new Date(Date.now() + delayMs).toISOString();
       run.error = this.failureEvidence(run, {
-        externalWait: { type: "agent_capacity", startedAt, nextAttemptAt, message },
+        ...run.error,
+        externalWait: { type: "agent_capacity", startedAt, nextAttemptAt, attempt, delayMs, message },
       });
       run.job = undefined;
       run.status = "interrupted";
@@ -1753,11 +1836,10 @@ export class AecSEngine {
       });
       return;
     }
-    const operationalRetry = run.error?.operationalRetry;
     run.error = this.failureEvidence(run, {
+      ...run.error,
       phase: run.phase,
       message,
-      ...(operationalRetry !== undefined ? { operationalRetry } : {}),
     });
     run.job = undefined;
     if (classified.category === "runtime_authority") {
@@ -2212,16 +2294,22 @@ export class AecSEngine {
   }
 
   private async waitForAgentSlot(agentId: string, runId: string, jobId: string, run: Run): Promise<void> {
-    const deadline = Date.now() + 1_000;
-    let nextHeartbeat = Date.now();
-    while (Date.now() < deadline) {
-      if (this.db.reserveAgentSlot(agentId, runId, jobId)) return;
-      if (Date.now() >= nextHeartbeat) {
-        this.renewLease(run);
-        nextHeartbeat = Date.now() + 10_000;
+    if (this.db.reserveAgentSlot(agentId, runId, jobId)) {
+      const activeWait = run.error?.externalWait;
+      if (activeWait && typeof activeWait === "object" && !Array.isArray(activeWait) &&
+          (activeWait as JsonObject).type === "agent_capacity") {
+        const remaining = { ...run.error };
+        delete remaining.externalWait;
+        const history = Array.isArray(run.error?.externalWaitHistory) ? run.error.externalWaitHistory : [];
+        run.error = redactJson({
+          ...remaining,
+          externalWaitHistory: [...history.slice(-9), { ...(activeWait as JsonObject), completedAt: nowIso() }],
+        });
+        this.saveRun(run);
       }
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      return;
     }
+    this.renewLease(run);
     throw new AecError(
       AEC_ERROR.agentCapacityUnavailable,
       `Agent capacity unavailable: ${agentId}`,
@@ -2239,7 +2327,8 @@ export class AecSEngine {
     const blocker = result.blocker!;
     if (blocker.kind === "technical") throw new Error("Technical blockers must use the Repair flow");
     this.db.transaction(() => {
-      const existing = this.db.listDecisions(task.projectId, "pending").find((item) => item.taskId === task.id);
+      const existing = this.db.listDecisions(task.projectId, "pending")
+        .find((item) => item.taskId === task.id && item.kind === blocker.kind);
       const decision = existing ?? this.db.createDecision({
         projectId: task.projectId,
         taskId: task.id,

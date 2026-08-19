@@ -215,9 +215,11 @@ AEC-S 不使用 admin merge，也不绕过 branch protection。真实回归仓�
 
 只注册用户信任的仓库和命令。Codex 使用显式 workspace-write/read-only。Kimi Executor Session 使用 ACP `auto` 模式，只对位置完整且经 realpath 确认位于 worktree 内的请求签发单次 Permission；位置缺失、为空、在外部或通过符号链接逃逸时一律拒绝，并持久化 Session ID 供 Repair 恢复。Kimi Review 使用 `plan` 模式且拒绝全部 Permission。DSH Executor 使用 `workspace-write`，Reviewer 不挂载文件工具。Secret 配置会被拒绝，Decision Resolution、Finding/Scope 证据、Outbox、Event 与返回状态中的已知凭据格式会在持久化前脱敏；这种模式匹配防线不能替代“不要把凭据写入 Task 输入”。监督日志、结构化结果、Diff、Runtime 响应和内嵌 Reviewer Prompt 均有硬大小上限。
 
-每个受监督 Runtime 与 Validation 进程树还会进入由 AEC-S 持有的 macOS Seatbelt 策略。进程获得隔离的 `HOME`/XDG/临时目录，不继承 SSH Agent Socket、GitHub Token、用户/系统 Git 配置或 macOS Keychain 服务。除精确声明的 worktree、控制器输出目录、AEC-S 安装目录和所选 Runtime 自身状态外，用户主目录和用户临时数据均不可读；Executor 只能写入 worktree、控制器输出、隔离的临时目录/Home 与 Runtime 状态，Reviewer 不获得 worktree 写权限。AEC-S 会对该内核强制边界进行功能探测；一旦无法执行，所有 Runtime 都会标记为不可用，绝不退回仅靠环境变量的建议性限制。Apple 已弃用 `sandbox-exec` 启动器但仍随 macOS 提供，因此其移除或协议漂移会成为明确的 fail-closed 兼容事件。Runtime 必然需要访问自身的模型服务认证状态；该边界阻止的是无关宿主与 Git 权威的继承，而不是阻止 Runtime 使用使其自身可运行的凭据。
+每个受监督 Runtime 与 Validation 进程树还会进入由 AEC-S 持有的 macOS Seatbelt 策略。进程获得隔离的 `HOME`/XDG/临时目录，不继承 SSH Agent Socket、GitHub Token、用户/系统 Git 配置或 macOS Keychain 服务。除精确声明的 worktree、控制器输出目录、AEC-S 安装目录和所选 Runtime 根目录外，用户主目录和用户临时数据均不可读。Runtime 的凭据/配置根目录可读但不可写，只有逐项列出的 Session、Cache、Index、Log 与 Telemetry 路径可写；Executor 获得 worktree 写权限，Reviewer 不获得。除标准安装位置外，AEC-S 还会拒绝执行当前 `PATH` 中发现的 `gh`、`ssh` 与 Keychain Helper 等凭据程序。AEC-S 会对该内核强制边界进行功能探测；一旦无法执行，所有 Runtime 都会标记为不可用，绝不退回仅靠环境变量的建议性限制。Apple 已弃用 `sandbox-exec` 启动器但仍随 macOS 提供，因此其移除或协议漂移会成为明确的 fail-closed 兼容事件。
 
-Task 要求的 Environment Contract 组件会在 `prepare` 阶段校验注册命令、版本和 Agent 能力。Scope Calibration 与 Progressive DAG Parking 会记录明确的 `observe|enforce` 策略证据；`observe` 下的 Scope Expansion 必须经 Human Decision 才能准入新 Revision。Drift Budget 触发有界同步事件，Validation 生成文件后还会再次检查 Risk Floor。两种模式下，确定性安全不变量始终执行。
+普通受限命令、Validation 和 Environment Contract 探测均禁止入站与出站网络。Codex、Kimi、DSH 的控制进程必须访问模型服务，因此获得显式的 `provider` 网络例外；该例外作用于整个 Runtime 进程树。AEC-S 当前不声称对一等 Runtime 实现了域名级出站控制，锁定版本的 Runtime 实现仍属于可信计算基。Runtime 自身的工具策略、worktree realpath 校验、只读 Review 与 DSH Sandbox 继续生效，但它们不能替代未来由代理承载的模型传输或受控出站代理。
+
+Task 要求的 Environment Contract 组件会在 `prepare` 阶段校验注册命令、版本和 Agent 能力。注册的探测命令会在已创建的 worktree 内通过持久化 Job Supervisor 运行，并强制只读文件系统与断网，而不是直接继承 Daemon 的非隔离进程上下文。Scope Calibration 与 Progressive DAG Parking 会记录明确的 `observe|enforce` 策略证据；`observe` 下的 Scope Expansion 必须经 Human Decision 才能准入新 Revision。Drift Budget 触发有界同步事件，Validation 生成文件后还会再次检查 Risk Floor。两种模式下，确定性安全不变量始终执行。
 
 Task 只有在 Merge、注册的 post-merge smoke 及稳定性观察窗口全部完成后才进入 `succeeded`。Smoke 失败默认只 Park 局部工作，除非自动回退的全部安全条件已被证明且策略明确为 `enforce`。
 

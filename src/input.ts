@@ -190,8 +190,10 @@ export const jobInputSchema = z.object({
   isolation: z.object({
     workspacePath: z.string().min(1),
     mode: z.enum(["workspace-write", "read-only"]),
+    networkAccess: z.enum(["none", "provider"]),
     controllerPath: z.string().min(1),
-    runtimeStatePaths: z.array(z.string().min(1)).optional(),
+    credentialReadPaths: z.array(z.string().min(1)).optional(),
+    stateWritePaths: z.array(z.string().min(1)).optional(),
     gitMetadataPaths: z.array(z.string().min(1)).optional(),
     homePath: z.string().min(1),
     tempPath: z.string().min(1),

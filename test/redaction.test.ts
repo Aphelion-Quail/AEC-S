@@ -40,3 +40,21 @@ test("preserves token usage metrics while covering additional provider tokens", 
   const redacted = redactText(secrets.join(" "));
   for (const secret of secrets) assert.equal(redacted.includes(secret), false);
 });
+
+test("uses one secret-key vocabulary for camelCase JSON and quoted assignments", () => {
+  assert.deepEqual(redactJson({
+    clientSecret: "client-value",
+    sessionToken: "session-value",
+    authToken: "auth-value",
+    apiKey: "api-value",
+    tokenUsage: { input: 1, output: 2, total: 3 },
+  }), {
+    clientSecret: "[REDACTED]",
+    sessionToken: "[REDACTED]",
+    authToken: "[REDACTED]",
+    apiKey: "[REDACTED]",
+    tokenUsage: { input: 1, output: 2, total: 3 },
+  });
+  const redacted = redactText(`PASSWORD="hunter2 extra words" AUTH_TOKEN='one two three'`);
+  assert.equal(redacted, "PASSWORD=[REDACTED] AUTH_TOKEN=[REDACTED]");
+});

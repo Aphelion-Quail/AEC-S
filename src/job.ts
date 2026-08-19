@@ -206,6 +206,12 @@ export function processAlive(pid: number, inspector: ProcessInspector = inspectP
   return alive;
 }
 
+export function cancelSupervisedJob(pid: number): void {
+  killProcessTreeByPid(pid, "SIGTERM", () => {
+    try { process.kill(pid, "SIGTERM"); return true; } catch { return false; }
+  });
+}
+
 export function startSupervisedJob(
   input: JobInput,
   inputPath: string,

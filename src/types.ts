@@ -5,8 +5,10 @@ export type ChildEnvironmentProfile = "restricted" | "codex" | "kimi" | "deepsee
 export type ProcessIsolation = {
   workspacePath: string;
   mode: "workspace-write" | "read-only";
+  networkAccess: "none" | "provider";
   controllerPath: string;
-  runtimeStatePaths?: string[];
+  credentialReadPaths?: string[];
+  stateWritePaths?: string[];
   gitMetadataPaths?: string[];
   homePath: string;
   tempPath: string;

@@ -9,6 +9,7 @@ import { adapterFor } from "../src/adapters/agent.js";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 import type { Run } from "../src/types.js";
 import { branchHead, revertMergedTask } from "../src/git.js";
+import { AEC_ERROR, AecError } from "../src/errors.js";
 
 const fakeAgent = fixturePath("fake-agent.js");
 
@@ -231,7 +232,7 @@ test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol 
       });
       if (runtimeAgent.roles.includes("executor")) {
         const invocation = substitute.invocation.bind(substitute);
-        substitute.invocation = (options) => ({ ...invocation(options), runtimeStatePaths: [timelineState] });
+        substitute.invocation = (options) => ({ ...invocation(options), stateWritePaths: [timelineState] });
       }
       return substitute;
     },
@@ -958,6 +959,42 @@ test("verifies required Environment Contract commands before Runtime execution",
   db.close();
 });
 
+test("runs Environment Contract commands in the read-only, network-denied supervisor", async () => {
+  const home = tempDir("aec-s-environment-contract-isolation-");
+  const escaped = join(home, "escaped.txt");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({
+    name: "environment-contract-isolation",
+    repoPath: createGitRepository(),
+    environmentContract: {
+      version: 1,
+      components: [{
+        id: "unsafe-probe",
+        command: {
+          program: process.execPath,
+          args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(escaped)},'escaped')`],
+        },
+      }],
+    },
+  });
+  registerFakeAgents(db);
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-environment-contract-isolation",
+    projectId: project.id,
+    title: "Confine environment probe",
+    goal: "Reject an environment probe that writes outside its worktree",
+    scope: { writeGlobs: ["environment.txt"], watchGlobs: [], tags: [] },
+    environmentRequirements: ["unsafe-probe"],
+    acceptanceCriteria: ["The probe is confined"],
+  }]);
+  await engine.runTask(task!.id);
+  assert.equal(existsSync(escaped), false);
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.equal(db.getLatestRunForTask(task!.id)?.phase, "prepare");
+  db.close();
+});
+
 test("keeps Scope Calibration observational until a Human approves the Revision", async () => {
   const db = new AecSDatabase(tempDir("aec-s-scope-calibration-"));
   const project = db.createProject({ name: "scope-calibration", repoPath: createGitRepository() });
@@ -1201,6 +1238,50 @@ test("keeps cancellation terminal when a supervised validation job is interrupte
   db.close();
 });
 
+test("cancels an in-flight Runtime and releases its Run lease during daemon shutdown", async () => {
+  const home = tempDir("aec-s-daemon-shutdown-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "daemon-shutdown", repoPath: createGitRepository() });
+  registerFakeAgents(db, "daemon-hang");
+  const engine = new AecSEngine(db, { agentHealthcheckIntervalMs: 60_000 });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-daemon-shutdown",
+    projectId: project.id,
+    title: "Shutdown safely",
+    goal: "Cancel the active Runtime without losing resumable state",
+    scope: { writeGlobs: ["shutdown.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["The daemon releases the Run lease"],
+  }]);
+  const controller = new AbortController();
+  const running = engine.daemon(controller.signal);
+  const deadline = Date.now() + 10_000;
+  while (!db.getLatestRunForTask(task!.id)?.job?.pid && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.ok(db.getLatestRunForTask(task!.id)?.job?.pid);
+  controller.abort();
+  await Promise.race([
+    running,
+    new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error("daemon shutdown did not converge")), 10_000)),
+  ]);
+  const run = db.getLatestRunForTask(task!.id)!;
+  assert.equal(run.status, "active");
+  assert.equal(run.job, undefined);
+  assert.equal(run.leaseOwner, undefined);
+  assert.ok(run.error?.daemonShutdown);
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "job.shutdown_requested"));
+  db.updateAgent("executor", {
+    config: {
+      binary: process.execPath,
+      execute: { program: process.execPath, args: [fakeAgent, "execute", "{workspace}", "{output}"] },
+      repair: { program: process.execPath, args: [fakeAgent, "repair", "{workspace}", "{output}"] },
+    },
+  });
+  await new AecSEngine(db).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  db.close();
+});
+
 test("does not publish a failed Review that provides no blocking Finding", async () => {
   const repo = createGitRepository();
   const db = new AecSDatabase(tempDir("aec-s-empty-failed-review-"));
@@ -1319,6 +1400,121 @@ test("automatically retries an operationally blocked Run after the dependency re
   assert.equal(db.getTask(task!.id)?.status, "succeeded");
   assert.equal(db.listRuns(task!.id).length, 1);
   assert.ok(db.listEvents(project.id).some((event) => event.type === "run.retry_ready"));
+  db.close();
+});
+
+test("preserves durable control evidence when a phase becomes operationally blocked", async () => {
+  const home = tempDir("aec-s-control-evidence-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "control-evidence", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "evidence-executor", name: "evidence executor", adapter: "command", roles: ["executor"] });
+  const task = db.createTask({
+    id: "evidence-task", projectId: project.id, title: "Keep evidence", goal: "Preserve control facts",
+    scope: { writeGlobs: ["evidence.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["Evidence remains durable"],
+  });
+  db.updateTaskStatus(task.id, "running");
+  const timestamp = new Date().toISOString();
+  const run: Run = {
+    id: "evidence-run", taskId: task.id, agentId: agent.id, workspaceId: "evidence-workspace",
+    phase: "validate", status: "active", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+    error: {
+      externalWait: { type: "github_checks", startedAt: timestamp, nextAttemptAt: timestamp },
+      stabilityObservation: { completesAt: timestamp },
+      postMergeRepair: { repairTaskId: "repair-task" },
+    },
+  };
+  db.createRun(run);
+  const engine = new AecSEngine(db, { operationalRetryBaseMs: 1 });
+  const internal = engine as unknown as {
+    claimRun(candidate: Run): boolean;
+    handlePhaseError(candidate: Run, error: unknown): Promise<void>;
+  };
+  assert.equal(internal.claimRun(run), true);
+  await internal.handlePhaseError(run, new Error("transient validation failure"));
+  const stored = db.getRun(run.id)!;
+  assert.ok(stored.error?.externalWait);
+  assert.ok(stored.error?.stabilityObservation);
+  assert.ok(stored.error?.postMergeRepair);
+  assert.ok(stored.error?.operationalRetry);
+  db.close();
+});
+
+test("backs off repeated Runtime capacity waits instead of hot-looping", async () => {
+  const home = tempDir("aec-s-capacity-backoff-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "capacity-backoff", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "capacity-executor", name: "capacity executor", adapter: "command", roles: ["executor"] });
+  const task = db.createTask({
+    id: "capacity-task", projectId: project.id, title: "Back off", goal: "Avoid capacity churn",
+    scope: { writeGlobs: ["capacity.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["Waits are bounded"],
+  });
+  db.updateTaskStatus(task.id, "running");
+  const timestamp = new Date().toISOString();
+  const run: Run = {
+    id: "capacity-run", taskId: task.id, agentId: agent.id, workspaceId: "capacity-workspace",
+    phase: "execute", status: "active", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+    error: { externalWait: { type: "agent_capacity", startedAt: timestamp, nextAttemptAt: timestamp, attempt: 1, delayMs: 2_000 } },
+  };
+  db.createRun(run);
+  const engine = new AecSEngine(db);
+  const internal = engine as unknown as {
+    claimRun(candidate: Run): boolean;
+    handlePhaseError(candidate: Run, error: unknown): Promise<void>;
+  };
+  assert.equal(internal.claimRun(run), true);
+  await internal.handlePhaseError(run, new AecError(
+    AEC_ERROR.agentCapacityUnavailable,
+    `Agent capacity unavailable: ${agent.id}`,
+    { agentId: agent.id },
+  ));
+  const wait = db.getRun(run.id)?.error?.externalWait as Record<string, unknown>;
+  assert.equal(wait.attempt, 2);
+  assert.equal(wait.delayMs, 4_000);
+  assert.equal(db.getTask(task.id)?.status, "operational_blocked");
+  db.close();
+});
+
+test("deduplicates Human Decisions by Task and blocker kind", () => {
+  const home = tempDir("aec-s-decision-signature-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "decision-signature", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "decision-executor", name: "decision executor", adapter: "command", roles: ["executor"] });
+  const task = db.createTask({
+    id: "decision-task", projectId: project.id, title: "Separate decisions", goal: "Do not merge unlike blockers",
+    scope: { writeGlobs: ["decision.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["Kinds remain distinct"],
+  });
+  db.updateTaskStatus(task.id, "running");
+  db.createDecision({
+    projectId: project.id, taskId: task.id, kind: "architecture", title: "Architecture choice", body: "Existing architecture blocker",
+  });
+  const timestamp = new Date().toISOString();
+  const run: Run = {
+    id: "decision-run", taskId: task.id, agentId: agent.id, workspaceId: "decision-workspace",
+    phase: "execute", status: "active", attempt: 1, repairCount: 0, rotationCount: 0, baseSha: "base",
+    validation: [], effects: {}, logDir: home, startedAt: timestamp, updatedAt: timestamp,
+  };
+  db.createRun(run);
+  const engine = new AecSEngine(db);
+  const internal = engine as unknown as {
+    claimRun(candidate: Run): boolean;
+    escalateWorkerDecision(candidate: Run, result: {
+      status: "blocked";
+      summary: string;
+      notes: string[];
+      blocker: { kind: "product"; question: string };
+    }): void;
+  };
+  assert.equal(internal.claimRun(run), true);
+  internal.escalateWorkerDecision(run, {
+    status: "blocked", summary: "Product direction required", notes: [],
+    blocker: { kind: "product", question: "Which user-visible behavior is intended?" },
+  });
+  assert.deepEqual(
+    db.listDecisions(project.id, "pending").filter((decision) => decision.taskId === task.id).map((decision) => decision.kind).sort(),
+    ["architecture", "product"],
+  );
   db.close();
 });
 
