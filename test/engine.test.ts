@@ -186,15 +186,25 @@ async function runScheduledPair(input: {
   return entries;
 }
 
-test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol substitutes", async () => {
+test("schedules three Runtimes concurrently and enforces the heterogeneous strict Review matrix", async () => {
   const repo = createGitRepository();
   const home = tempDir("aec-s-three-runtime-scheduler-");
   const timelineState = join(home, "runtime-state", "shared-timeline");
   mkdirSync(timelineState, { recursive: true, mode: 0o700 });
   const timeline = join(timelineState, "timeline.txt");
   const db = new AecSDatabase(home);
-  const project = db.createProject({ name: "three-runtime-scheduler", repoPath: repo, maxConcurrency: 3 });
+  const project = db.createProject({
+    name: "three-runtime-scheduler",
+    repoPath: repo,
+    maxConcurrency: 3,
+    controlPolicy: { strictReviewMinRuntimeFamilies: 2 },
+  });
   const runtimes = ["codex", "kimi", "deepseek_harness"] as const;
+  const matrix = {
+    codex: { capability: "fixture-typescript", reviewer: "kimi" },
+    kimi: { capability: "fixture-node", reviewer: "deepseek_harness" },
+    deepseek_harness: { capability: "fixture-git", reviewer: "codex" },
+  } as const;
   for (const runtime of runtimes) {
     const runtimeCapabilities = { resume: true, cancel: true, stream: true, reviewMode: true, structuredOutput: true };
     db.createAgent({
@@ -203,7 +213,7 @@ test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol 
       adapter: runtime,
       runtimeFamily: runtime,
       roles: ["executor"],
-      capabilities: [runtime],
+      capabilities: [matrix[runtime].capability],
       runtimeCapabilities,
     });
     db.createAgent({
@@ -212,7 +222,9 @@ test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol 
       adapter: runtime,
       runtimeFamily: runtime,
       roles: ["reviewer"],
-      capabilities: [runtime],
+      capabilities: runtimes
+        .filter((executor) => matrix[executor].reviewer === runtime)
+        .map((executor) => matrix[executor].capability),
       runtimeCapabilities,
     });
   }
@@ -244,11 +256,18 @@ test("schedules Codex, Kimi, and DeepSeek Harness concurrently through protocol 
     goal: `Create ${runtime}.txt`,
     scope: { writeGlobs: [`${runtime}.txt`], watchGlobs: [], tags: ["three-runtime"] },
     acceptanceCriteria: [`${runtime} protocol substitute completes`],
-    requiredCapabilities: [runtime],
+    requiredCapabilities: [matrix[runtime].capability],
+    proposedRiskClass: "core" as const,
   })));
   await engine.runUntilIdle();
   assert.equal(tasks.every((task) => db.getTask(task.id)?.status === "succeeded"), true);
   assert.deepEqual(new Set(tasks.map((task) => db.getLatestRunForTask(task.id)?.agentId)), new Set(runtimes.map((runtime) => `${runtime}-executor`)));
+  for (const runtime of runtimes) {
+    assert.equal(
+      db.getLatestRunForTask(`three-runtime-${runtime}`)?.review?.reviewerAgentId,
+      `${matrix[runtime].reviewer}-reviewer`,
+    );
+  }
   const starts = readFileSync(timeline, "utf8").trim().split(/\r?\n/).filter((entry) => entry.endsWith(":start"));
   assert.equal(new Set(starts).size, 3);
   db.close();
@@ -518,7 +537,7 @@ test("a paused active run does not occupy a scheduler slot", async () => {
   engine.applyDirective({ action: "pause", taskIds: [pausedTask!.id] });
   await running;
   assert.equal(db.getTask(pausedTask!.id)?.status, "paused");
-  assert.equal(db.getLatestRunForTask(pausedTask!.id)?.status, "active");
+  assert.equal(db.getLatestRunForTask(pausedTask!.id)?.status, "interrupted");
   await engine.runTask(nextTask!.id);
   assert.equal(db.getTask(nextTask!.id)?.status, "succeeded");
   db.close();
@@ -1073,6 +1092,39 @@ test("provides authoritative validation evidence to the independent reviewer", a
   db.close();
 });
 
+test("refuses same-scope workspace mutation after the final Review gate", async () => {
+  const repo = createGitRepository();
+  const db = new AecSDatabase(tempDir("aec-s-post-gate-mutation-"));
+  const project = db.createProject({ name: "post-gate-mutation", repoPath: repo });
+  registerFakeAgents(db);
+  const engine = new AecSEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "task-post-gate-mutation",
+    projectId: project.id,
+    title: "Post-gate mutation",
+    goal: "Create evidence.txt",
+    scope: { writeGlobs: ["evidence.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Only gated content may publish"],
+  }]);
+  const running = engine.runTask(task!.id);
+  const deadline = Date.now() + 15_000;
+  let workspacePath: string | undefined;
+  while (Date.now() < deadline) {
+    const run = db.getLatestRunForTask(task!.id);
+    if (run?.phase === "publish" && run.review?.evidenceDiffDigest) {
+      workspacePath = db.getWorkspace(run.workspaceId)?.path;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 2));
+  }
+  assert.ok(workspacePath, "test must observe the persisted publish boundary");
+  writeFileSync(join(workspacePath, "evidence.txt"), "same scope, different ungated content\n");
+  await running;
+  assert.notEqual(db.getTask(task!.id)?.status, "succeeded");
+  assert.ok(db.listEvents(project.id).some((event) => event.type === "runtime.authority_violation"));
+  db.close();
+});
+
 test("switches to another eligible Reviewer only after the retained Reviewer reaches its failure threshold", async () => {
   const repo = createGitRepository();
   const db = new AecSDatabase(tempDir("aec-s-reviewer-failover-"));
@@ -1515,6 +1567,72 @@ test("deduplicates Human Decisions by Task and blocker kind", () => {
     db.listDecisions(project.id, "pending").filter((decision) => decision.taskId === task.id).map((decision) => decision.kind).sort(),
     ["architecture", "product"],
   );
+  db.close();
+});
+
+test("emits Controller Overhead evidence and breaks only the non-converging Task", async () => {
+  const home = tempDir("aec-s-controller-overhead-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({
+    name: "controller-overhead",
+    repoPath: createGitRepository(),
+    controlPolicy: { circuitBreaker: "enforce" },
+  });
+  const agent = db.createAgent({
+    id: "overhead-executor",
+    name: "overhead executor",
+    adapter: "command",
+    roles: ["executor"],
+  });
+  const failing = db.createTask({
+    id: "overhead-failing",
+    projectId: project.id,
+    title: "Stop local churn",
+    goal: "Bound repeated control actions",
+    scope: { writeGlobs: ["failing.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Only this Task is circuit broken"],
+  });
+  const sibling = db.createTask({
+    id: "overhead-sibling",
+    projectId: project.id,
+    title: "Remain schedulable",
+    goal: "Preserve unrelated progress",
+    scope: { writeGlobs: ["sibling.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Sibling remains ready"],
+  });
+  const siblingStatus = sibling.status;
+  db.updateTaskStatus(failing.id, "running");
+  const timestamp = new Date().toISOString();
+  const run: Run = {
+    id: "overhead-run",
+    taskId: failing.id,
+    agentId: agent.id,
+    workspaceId: "overhead-workspace",
+    phase: "repair",
+    status: "active",
+    attempt: 3,
+    repairCount: 3,
+    rotationCount: 2,
+    baseSha: "base",
+    validation: [],
+    effects: {},
+    logDir: home,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+  };
+  db.createRun(run);
+  const engine = new AecSEngine(db);
+  const internal = engine as unknown as {
+    claimRun(candidate: Run): boolean;
+    rotateOrEscalate(candidate: Run, evidence: Record<string, unknown>): Promise<void>;
+  };
+  assert.equal(internal.claimRun(run), true);
+  await internal.rotateOrEscalate(run, { reason: "repeated repair and Runtime switches" });
+  assert.equal(db.getTask(failing.id)?.status, "circuit_broken");
+  assert.equal(db.getTask(sibling.id)?.status, siblingStatus);
+  assert.equal(db.listDecisions(project.id, "pending").length, 0);
+  assert.equal(db.listEvents(project.id).some((event) =>
+    event.taskId === failing.id && event.type === "controller.overhead"), true);
   db.close();
 });
 

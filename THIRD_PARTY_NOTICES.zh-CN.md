@@ -19,7 +19,7 @@ AEC-S 使用了一些仍受其各自许可证约束的第三方软件。PolyForm
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-锁定的生产依赖图共包含 192 个软件包：176 个 MIT、1 个 Apache-2.0、5 个 BSD-3-Clause、8 个 ISC、1 个 BSD-2-Clause 和 1 个 Python-2.0。DSH 软件包统一锁定在 `0.1.0-rc.6` 软件包/Runtime 版本线；AEC-S 还会通过初始化握手验证 JSON-RPC Server 身份。版本不匹配时 Runtime 必须不可用，不得回退为 command Adapter。
+锁定的生产依赖图共包含 193 个软件包：177 个 MIT、1 个 Apache-2.0、5 个 BSD-3-Clause、8 个 ISC、1 个 BSD-2-Clause 和 1 个 Python-2.0。DSH 软件包统一锁定在 `0.1.0-rc.6` 软件包/Runtime 版本线；AEC-S 还会通过初始化握手验证 JSON-RPC Server 身份。版本不匹配时 Runtime 必须不可用，不得回退为 command Adapter。
 
 非 MIT 的生产依赖如下：
 

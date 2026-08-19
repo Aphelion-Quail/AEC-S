@@ -1,18 +1,44 @@
 import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { dirname } from "node:path";
+import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkdirSync } from "node:fs";
 import type { JobInput, JobResult, JobState } from "./types.js";
 import { newId, nowIso } from "./ids.js";
 import { readJson, writeJsonAtomic } from "./files.js";
-import { jobInputSchema } from "./input.js";
+import { jobInputSchema, jobResultSchema } from "./input.js";
+import { fingerprint } from "./fingerprint.js";
 import { childEnvironment } from "./child-env.js";
-import { killProcessTreeByPid } from "./process-control.js";
+import { descendantProcessIds, killProcessTreeByPid, killRecordedProcesses } from "./process-control.js";
 import { isolatedCommand, isolationEnvironment } from "./isolation.js";
 
-export async function runJobFile(inputPath: string): Promise<void> {
+function within(root: string, path: string): boolean {
+  const child = relative(resolve(root), resolve(path));
+  return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !child.startsWith(sep));
+}
+
+function assertJobControlPaths(input: JobInput, inputPath: string): void {
+  const controller = input.isolation.controllerPath;
+  for (const [label, path] of [
+    ["input", inputPath],
+    ["result", input.resultPath],
+    ["stdout", input.stdoutPath],
+    ["stderr", input.stderrPath],
+  ] as const) {
+    if (!within(controller, path)) throw new Error(`Supervised Job ${label} path escapes controller ownership: ${path}`);
+  }
+  if (within(input.isolation.workspacePath, controller)) {
+    throw new Error("Supervised Job controller path must not be writable through the Runtime workspace");
+  }
+}
+
+export async function runJobFile(inputPath: string, expectedDigest: string): Promise<void> {
   const input = jobInputSchema.parse(readJson<unknown>(inputPath)) as JobInput;
+  assertJobControlPaths(input, inputPath);
+  const inputDigest = fingerprint(input);
+  if (expectedDigest.length !== 64 || inputDigest !== expectedDigest) {
+    throw new Error(`Supervised JobInput integrity check failed: ${inputPath}`);
+  }
   const supervisorLock = `${input.resultPath}.supervisor.lock`;
   let ownsSupervisorLock = false;
   const lockDeadline = Date.now() + (input.command.timeoutSeconds ?? 300) * 1_000 + 10_000;
@@ -41,31 +67,39 @@ export async function runJobFile(inputPath: string): Promise<void> {
   const stdout = openSync(input.stdoutPath, "a", 0o600);
   const stderr = openSync(input.stderrPath, "a", 0o600);
   let finished = false;
-  let outputLimitExceeded: string | undefined;
-  let sandboxDenied = false;
+    let outputLimitExceeded: string | undefined;
+    let sandboxDenied = false;
+    let stdinError: string | undefined;
   const outputLimit = 8 * 1024 * 1024;
   let stdoutBytes = 0;
   let stderrBytes = 0;
-  const finish = (result: JobResult): void => {
+  const finish = (result: Omit<JobResult, "inputDigest">): void => {
     if (finished) return;
     finished = true;
     closeSync(stdout);
     closeSync(stderr);
-    writeJsonAtomic(input.resultPath, result);
+    writeJsonAtomic(input.resultPath, { ...result, inputDigest });
     if (ownsSupervisorLock) {
       try { unlinkSync(supervisorLock); } catch { /* Result is already durable. */ }
     }
   };
   try {
     const environmentProfile = input.environmentProfile ?? "restricted";
-    const launch = input.isolation ? isolatedCommand(input.command, input.isolation) : input.command;
-    const isolationOverrides = input.isolation ? isolationEnvironment(input.isolation, environmentProfile) : {};
+    const launch = isolatedCommand(input.command, input.isolation, environmentProfile);
+    const isolationOverrides = isolationEnvironment(input.isolation, environmentProfile);
     const child = spawn(launch.program, launch.args, {
       cwd: launch.cwd,
       env: childEnvironment(environmentProfile, { ...input.command.env, ...isolationOverrides }),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
+    const observedDescendants = new Map<number, string>();
+    const recordDescendants = (): void => {
+      for (const [pid, startedAt] of descendantProcessIds(child.pid)) observedDescendants.set(pid, startedAt);
+    };
+    recordDescendants();
+    const descendantCensus = setInterval(recordDescendants, 50);
+    descendantCensus.unref();
     let timedOut = false;
     let terminateTree: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
@@ -99,6 +133,12 @@ export async function runJobFile(inputPath: string): Promise<void> {
       if (/\bEPERM\b|operation not permitted/i.test(chunk.toString("utf8"))) sandboxDenied = true;
       writeBounded(stderr, chunk, "stderr");
     });
+    child.stdin!.on("error", (error: NodeJS.ErrnoException) => {
+      // A short-lived command may exit before the parent closes an otherwise
+      // empty stdin pipe. That EPIPE does not invalidate the observed command
+      // result. Failure to deliver actual Runtime input is operational.
+      if ((input.stdin?.length ?? 0) > 0 || error.code !== "EPIPE") stdinError = error.message;
+    });
     const onSignal = (): void => forwardCancellation();
     process.once("SIGTERM", onSignal);
     process.once("SIGINT", onSignal);
@@ -108,6 +148,7 @@ export async function runJobFile(inputPath: string): Promise<void> {
     }, (input.command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
     child.on("error", (error) => {
+      clearInterval(descendantCensus);
       clearTimeout(timeout);
       if (terminateTree) clearTimeout(terminateTree);
       if (forceKill) clearTimeout(forceKill);
@@ -123,6 +164,8 @@ export async function runJobFile(inputPath: string): Promise<void> {
       });
     });
     child.on("close", (exitCode, signal) => {
+      recordDescendants();
+      clearInterval(descendantCensus);
       clearTimeout(timeout);
       if (terminateTree) clearTimeout(terminateTree);
       if (forceKill) clearTimeout(forceKill);
@@ -133,13 +176,14 @@ export async function runJobFile(inputPath: string): Promise<void> {
       // A Runtime is not allowed to leave detached helpers behind after its
       // entrypoint has completed, even on the nominal success path.
       killProcessTreeByPid(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      killRecordedProcesses(observedDescendants, "SIGKILL");
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
-        status: outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : sandboxDenied && exitCode !== 0 ? "sandbox_denied" : "completed",
+        status: stdinError ? "spawn_error" : outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : sandboxDenied && exitCode !== 0 ? "sandbox_denied" : "completed",
         exitCode,
         signal,
-        ...(outputLimitExceeded ? { error: outputLimitExceeded } : {}),
+        ...(stdinError ? { error: `Failed to deliver supervised Job input: ${stdinError}` } : outputLimitExceeded ? { error: outputLimitExceeded } : {}),
         startedAt,
         finishedAt: nowIso(),
       });
@@ -218,13 +262,16 @@ export function startSupervisedJob(
   jobId = newId("job"),
   beforeSpawn?: (pending: JobState) => void,
 ): JobState {
+  input = jobInputSchema.parse(input) as JobInput;
+  assertJobControlPaths(input, inputPath);
+  const inputDigest = fingerprint(input);
   writeJsonAtomic(inputPath, input);
-  const pending: JobState = { id: jobId, inputPath, resultPath: input.resultPath, startedAt: nowIso() };
+  const pending: JobState = { id: jobId, inputPath, inputDigest, resultPath: input.resultPath, startedAt: nowIso() };
   beforeSpawn?.(pending);
   const compiledEntry = fileURLToPath(new URL("./cli.js", import.meta.url));
   const entry = process.env.AEC_S_CLI_ENTRY ?? (existsSync(compiledEntry) ? compiledEntry : process.argv[1]);
   if (!entry) throw new Error("Unable to locate AEC-S CLI entry for job supervisor");
-  const child = spawn(process.execPath, [entry, "internal-job", inputPath], {
+  const child = spawn(process.execPath, [entry, "internal-job", inputPath, inputDigest], {
     detached: true,
     stdio: "ignore",
     env: childEnvironment(input.environmentProfile),
@@ -234,6 +281,14 @@ export function startSupervisedJob(
     ...pending,
     ...(child.pid ? { pid: child.pid } : {}),
   };
+}
+
+function readVerifiedJobResult(job: JobState): JobResult {
+  const result = jobResultSchema.parse(readJson<unknown>(job.resultPath)) as JobResult;
+  if (result.inputDigest !== job.inputDigest) {
+    throw new Error(`Supervised JobResult integrity check failed: ${job.resultPath}`);
+  }
+  return result;
 }
 
 export async function waitForJob(
@@ -248,10 +303,10 @@ export async function waitForJob(
       heartbeat();
       nextHeartbeat = Date.now() + 10_000;
     }
-    if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
+    if (existsSync(job.resultPath) && (!job.pid || !processAlive(job.pid))) return readVerifiedJobResult(job);
     if (job.pid && !processAlive(job.pid)) {
       await new Promise((resolve) => setTimeout(resolve, 100));
-      if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
+      if (existsSync(job.resultPath)) return readVerifiedJobResult(job);
       const input = readJson<JobInput>(job.inputPath);
       const stderr = existsSync(input.stderrPath) ? readFileSync(input.stderrPath, "utf8") : "";
       throw new Error(`Supervised job exited without result${stderr ? `: ${stderr.trim()}` : ""}`);
@@ -264,7 +319,7 @@ export async function waitForJob(
     });
     const terminationDeadline = Date.now() + 2_500;
     while (Date.now() < terminationDeadline) {
-      if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
+      if (existsSync(job.resultPath) && !processAlive(job.pid)) return readVerifiedJobResult(job);
       if (!processAlive(job.pid)) break;
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
@@ -274,6 +329,6 @@ export async function waitForJob(
       });
     }
   }
-  if (existsSync(job.resultPath)) return readJson<JobResult>(job.resultPath);
+  if (existsSync(job.resultPath) && (!job.pid || !processAlive(job.pid))) return readVerifiedJobResult(job);
   throw new Error(`Timed out waiting for supervised job ${job.id}`);
 }

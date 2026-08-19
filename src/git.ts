@@ -114,9 +114,22 @@ function releaseProjectFileLock(lock: { databasePath: string; token: string }): 
   }
 }
 
-function git(cwd: string, args: string[], timeoutSeconds = 120) {
-  return { program: "git", args, cwd, timeoutSeconds };
+export function safeGitCommand(cwd: string, args: string[], timeoutSeconds = 120) {
+  return {
+    program: "git",
+    args: [
+      "--no-optional-locks",
+      "-c", "core.hooksPath=/dev/null",
+      "-c", "core.fsmonitor=false",
+      "-c", "protocol.ext.allow=never",
+      ...args,
+    ],
+    cwd,
+    timeoutSeconds,
+  };
 }
+
+const git = safeGitCommand;
 
 export function projectBaseRef(project: Project): string {
   return project.deliveryMode === "github" ? `${project.remoteName}/${project.targetBranch}` : project.targetBranch;
@@ -125,6 +138,22 @@ export function projectBaseRef(project: Project): string {
 export async function assertGitRepository(repoPath: string): Promise<void> {
   const result = await execCommand(git(repoPath, ["rev-parse", "--git-dir"]));
   if (result.exitCode !== 0) throw new Error(`Not a Git repository: ${repoPath}`);
+  const unsafe = await execCommand(git(repoPath, [
+    "config",
+    "--local",
+    "--get-regexp",
+    "^(filter\\..*\\.(clean|smudge|process)|diff\\..*\\.(command|textconv)|credential\\..*|include(if)?\\..*|core\\.hooksPath)$",
+  ]));
+  if (unsafe.exitCode !== 0 && unsafe.exitCode !== 1) {
+    throw new Error(unsafe.stderr.trim() || `Unable to audit local Git configuration: ${repoPath}`);
+  }
+  if (unsafe.exitCode === 0 && unsafe.stdout.trim()) {
+    throw new AecError(
+      AEC_ERROR.runtimeAuthorityViolation,
+      "Repository-local Git configuration may execute external code; import refused",
+      { repoPath, keys: unsafe.stdout.trim().split(/\r?\n/).map((line) => line.split(/\s+/, 1)[0]) },
+    );
+  }
 }
 
 export async function branchHead(repoPath: string, branch: string): Promise<string> {

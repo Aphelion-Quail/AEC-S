@@ -32,9 +32,29 @@ test("DSH compositions fail closed when required workspace state is absent", () 
 
 test("live Runtime gate formats unexpected failures through the shared redactor", async () => {
   const script = pathToFileURL(join(root, "scripts", "test-runtimes-live.mjs")).href;
-  const module = await import(script) as { formatLiveGateError(error: unknown): string };
+  const module = await import(script) as {
+    formatLiveGateError(error: unknown): string;
+    assertSanitizedReport(report: unknown): void;
+  };
   const secret = `sk-${"a".repeat(24)}`;
   const formatted = module.formatLiveGateError(new Error(`Runtime failed with ${secret}`));
   assert.equal(formatted.includes(secret), false);
   assert.match(formatted, /\[REDACTED\]/);
+  assert.doesNotThrow(() => module.assertSanitizedReport({
+    schemaVersion: 2,
+    aecSVersion: "0.9.0-rc.3",
+    runtimeVersions: { codex: "1", kimi: "1", deepseek_harness: "1" },
+    scenarios: [{ id: "LIVE-FIXTURE", status: "PASS" }],
+    result: "PASS",
+    completedAt: "2026-08-19T00:00:00.000Z",
+  }));
+  assert.throws(() => module.assertSanitizedReport({
+    schemaVersion: 2,
+    aecSVersion: "0.9.0-rc.3",
+    runtimeVersions: {},
+    scenarios: [],
+    result: "PASS",
+    completedAt: "2026-08-19T00:00:00.000Z",
+    sessionId: "must-not-appear",
+  }), /unsupported field|forbidden field/);
 });

@@ -4,9 +4,14 @@ export type ChildEnvironmentProfile = "restricted" | "codex" | "kimi" | "deepsee
 
 export type ProcessIsolation = {
   workspacePath: string;
+  workspaceAccess?: "full" | "metadata";
   mode: "workspace-write" | "read-only";
   networkAccess: "none" | "provider";
+  /** Controller-owned evidence is readable but never writable by a Runtime. */
   controllerPath: string;
+  /** The sole controller-adjacent directory a Runtime may write. */
+  runtimeOutputPath: string;
+  evidenceReadPaths?: string[];
   credentialReadPaths?: string[];
   stateWritePaths?: string[];
   gitMetadataPaths?: string[];
@@ -281,6 +286,8 @@ export type ReviewResult = {
   summary: string;
   findings: ReviewFinding[];
   reviewerAgentId?: string;
+  /** Controller-generated digest of the exact diff accepted by the Gate. */
+  evidenceDiffDigest?: string;
   completed: boolean;
 };
 
@@ -298,6 +305,7 @@ export type WorkerResult = {
 export type JobState = {
   id: string;
   inputPath: string;
+  inputDigest: string;
   resultPath: string;
   pid?: number;
   startedAt: string;
@@ -435,7 +443,7 @@ export type OutboxMessage = {
 export type JobInput = {
   command: CommandSpec;
   environmentProfile?: ChildEnvironmentProfile;
-  isolation?: ProcessIsolation;
+  isolation: ProcessIsolation;
   stdin?: string;
   stdoutPath: string;
   stderrPath: string;
@@ -447,6 +455,7 @@ export type JobResult = {
   exitCode: number | null;
   signal: string | null;
   error?: string;
+  inputDigest: string;
   startedAt: string;
   finishedAt: string;
 };

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { childEnvironment } from "../src/child-env.js";
 import { execCommand } from "../src/exec.js";
@@ -55,12 +55,25 @@ test("runtime jobs receive only approved credentials without persisting their va
   process.env.DEEPSEEK_API_KEY = value;
   process.env.UNRELATED_RUNTIME_SECRET = "not-visible";
   try {
+    const runtimeOutputPath = join(directory, "runtime-output");
+    const workspacePath = join(directory, "workspace");
+    mkdirSync(runtimeOutputPath, { recursive: true, mode: 0o700 });
+    mkdirSync(workspacePath, { recursive: true, mode: 0o700 });
     const job = startSupervisedJob({
       command: {
         program: process.execPath,
         args: ["-e", "process.stdout.write(`${process.env.DEEPSEEK_API_KEY ?? 'missing'}:${process.env.UNRELATED_RUNTIME_SECRET ?? 'absent'}`)"],
       },
       environmentProfile: "deepseek_harness",
+      isolation: {
+        workspacePath,
+        mode: "read-only",
+        networkAccess: "none",
+        controllerPath: directory,
+        runtimeOutputPath,
+        homePath: join(directory, "isolated-home"),
+        tempPath: join(directory, "isolated-tmp"),
+      },
       stdoutPath: outputPath,
       stderrPath: join(directory, "stderr.log"),
       resultPath: join(directory, "result.json"),

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { branchHead, changedPaths, cleanupWorktree, createWorktree } from "../src/git.js";
+import { assertGitRepository, branchHead, changedPaths, cleanupWorktree, createWorktree } from "../src/git.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 import type { Project } from "../src/types.js";
 
@@ -54,4 +54,18 @@ test("reuses an existing worktree with its actual historical base", async () => 
   assert.notEqual(await branchHead(repo, "main"), initial);
   assert.equal(await createWorktree(project, workspace, "aec-s/worktree-base"), initial);
   await cleanupWorktree(project, workspace, "aec-s/worktree-base");
+});
+
+test("refuses repository-local Git hooks, filters, and external diff commands", async () => {
+  const unsafeConfiguration: Array<[string, string]> = [
+    ["filter.attack.clean", "touch /tmp/aec-s-filter-executed"],
+    ["diff.attack.textconv", "touch /tmp/aec-s-diff-executed"],
+    ["credential.helper", "!touch /tmp/aec-s-credential-helper-executed"],
+    ["core.hooksPath", "/tmp/attacker-hooks"],
+  ];
+  for (const [key, value] of unsafeConfiguration) {
+    const repo = createGitRepository();
+    execFileSync("git", ["config", "--local", key, value], { cwd: repo });
+    await assert.rejects(assertGitRepository(repo), /may execute external code/);
+  }
 });

@@ -1,9 +1,10 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 
 export function writeJsonAtomic(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temp = `${path}.${process.pid}.tmp`;
+  const temp = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
   const descriptor = openSync(temp, "w", 0o600);
   try {
     writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
@@ -27,6 +28,11 @@ export function assertFileSize(path: string, maxBytes = 8 * 1024 * 1024, label =
 export function readTextBounded(path: string, maxBytes = 8 * 1024 * 1024, label = "File"): string {
   assertFileSize(path, maxBytes, label);
   return readFileSync(path, "utf8");
+}
+
+export function sha256File(path: string, maxBytes = 8 * 1024 * 1024, label = "File"): string {
+  assertFileSize(path, maxBytes, label);
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
 export function parseStructuredOutput<T>(path: string): T {

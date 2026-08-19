@@ -15,6 +15,11 @@ export function executableCandidates(name: string): string[] {
       ? [join(homedir(), ".kimi-code", "bin", "kimi")]
     : name === "dsh-jsonrpc-agent"
       ? [join(homedir(), ".local", "bin", name)]
+      : name === "codebuddy"
+        ? [
+            "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+            join(homedir(), "Applications", "WorkBuddy.app", "Contents", "Resources", "app.asar.unpacked", "cli", "bin", "codebuddy"),
+          ]
       : [];
   return [...new Set([...fromPath, ...known])];
 }

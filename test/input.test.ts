@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { directiveSchema, jobInputSchema, projectInputSchema } from "../src/input.js";
+import { directiveSchema, idSchema, jobInputSchema, projectInputSchema, taskGraphSchema } from "../src/input.js";
 
 test("requires an explicit directive selector and reprioritize value", () => {
   assert.throws(() => directiveSchema.parse({ action: "cancel" }), /requires projectId, taskIds, or tags/);
@@ -17,4 +17,19 @@ test("rejects option-like Git names and malformed internal Job input", () => {
     ...base,
     defaultValidation: [{ program: "node", args: [], env: { SECRET: "not-a-public-command-field" } }],
   }));
+});
+
+test("rejects Git-ref-invalid identifiers and oversized public input", () => {
+  assert.throws(() => idSchema.parse("task..branch"), /consecutive dots/);
+  assert.throws(() => idSchema.parse("task.lock"), /\.lock/);
+  assert.throws(() => taskGraphSchema.parse({
+    projectId: "project",
+    tasks: [{
+      projectId: "project",
+      title: "x".repeat(513),
+      goal: "goal",
+      scope: { writeGlobs: ["file.txt"], watchGlobs: [], tags: [] },
+      acceptanceCriteria: ["done"],
+    }],
+  }), /too_big|512|at most/i);
 });

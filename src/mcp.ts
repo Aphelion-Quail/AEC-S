@@ -163,6 +163,8 @@ export async function serveMcp(db: AecSDatabase): Promise<void> {
 
 export type McpHttpOptions = {
   port?: number;
+  /** Test-only: ask the kernel for an ephemeral loopback port. */
+  allowEphemeralPort?: boolean;
   token?: string;
   actorAgentId?: string;
   signal?: AbortSignal;
@@ -180,7 +182,7 @@ export function mcpHttpPort(value = process.env.AEC_S_MCP_HTTP_PORT): number {
 
 export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {}): Promise<void> {
   const port = options.port ?? mcpHttpPort();
-  if (!Number.isInteger(port) || port < 0 || port > 65_535) {
+  if (!Number.isInteger(port) || port < (options.allowEphemeralPort ? 0 : 1) || port > 65_535) {
     throw new Error(`Invalid MCP HTTP port: ${port}`);
   }
   process.env.NODE_ENV ??= "production";
