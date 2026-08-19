@@ -7,6 +7,7 @@ export type ProcessIsolation = {
   mode: "workspace-write" | "read-only";
   controllerPath: string;
   runtimeStatePaths?: string[];
+  gitMetadataPaths?: string[];
   homePath: string;
   tempPath: string;
 };

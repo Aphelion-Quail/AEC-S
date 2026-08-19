@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -21,6 +21,34 @@ function seatbeltString(value: string): string {
 
 function subpaths(paths: string[]): string {
   return [...new Set(paths.map(canonical))].map((path) => `(subpath ${seatbeltString(path)})`).join(" ");
+}
+
+type GitMetadata = { gitDir: string; commonDir: string };
+
+function resolveGitMetadata(worktreePath: string): GitMetadata {
+  const dotGit = join(canonical(worktreePath), ".git");
+  if (!existsSync(dotGit)) throw new Error(`Git metadata is missing for isolated worktree: ${worktreePath}`);
+  const gitDir = statSync(dotGit).isDirectory()
+    ? canonical(dotGit)
+    : (() => {
+        const match = /^gitdir:\s*(.+)\s*$/i.exec(readFileSync(dotGit, "utf8"));
+        if (!match?.[1]) throw new Error(`Git metadata pointer is malformed for isolated worktree: ${worktreePath}`);
+        return canonical(isAbsolute(match[1]) ? match[1] : resolve(dirname(dotGit), match[1]));
+      })();
+  const commonPointer = join(gitDir, "commondir");
+  const commonDir = existsSync(commonPointer)
+    ? canonical(resolve(gitDir, readFileSync(commonPointer, "utf8").trim()))
+    : gitDir;
+  return { gitDir, commonDir };
+}
+
+export function gitMetadataReadPaths(workspacePath: string, projectRepoPath: string): string[] {
+  const workspace = resolveGitMetadata(workspacePath);
+  const project = resolveGitMetadata(projectRepoPath);
+  if (workspace.commonDir !== project.commonDir) {
+    throw new Error(`Isolated worktree Git metadata does not belong to its registered Project: ${workspacePath}`);
+  }
+  return [...new Set([workspace.gitDir, workspace.commonDir])];
 }
 
 function executablePath(program: string, path = process.env.PATH ?? ""): string | undefined {
@@ -100,6 +128,7 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
     isolation.homePath,
     isolation.tempPath,
     ...(isolation.runtimeStatePaths ?? []),
+    ...(isolation.gitMetadataPaths ?? []),
   ];
   const coverageDirectory = nodeCoverageDirectory();
   if (coverageDirectory) readPaths.push(coverageDirectory);
@@ -126,6 +155,7 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
     `(allow file-read-data ${subpaths(readPaths)})`,
     "(deny file-write*)",
     `(allow file-write* ${subpaths(writePaths)} (literal "/dev/null"))`,
+    `(deny file-write* (literal ${seatbeltString(join(canonical(isolation.workspacePath), ".git"))}) ${subpaths(isolation.gitMetadataPaths ?? [])})`,
     "(deny signal)",
     "(allow signal (target self))",
     "(allow signal (target children))",

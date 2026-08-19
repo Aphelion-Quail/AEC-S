@@ -192,6 +192,7 @@ export const jobInputSchema = z.object({
     mode: z.enum(["workspace-write", "read-only"]),
     controllerPath: z.string().min(1),
     runtimeStatePaths: z.array(z.string().min(1)).optional(),
+    gitMetadataPaths: z.array(z.string().min(1)).optional(),
     homePath: z.string().min(1),
     tempPath: z.string().min(1),
   }).strict().optional(),

@@ -2,10 +2,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { spawn } from "node:child_process";
-import { probeProcessIsolation } from "../src/isolation.js";
+import { execFileSync, spawn } from "node:child_process";
+import { gitMetadataReadPaths, probeProcessIsolation } from "../src/isolation.js";
 import { startSupervisedJob, waitForJob } from "../src/job.js";
-import { tempDir } from "./helpers.js";
+import { createGitRepository, tempDir } from "./helpers.js";
 
 const macOnly = { skip: process.platform !== "darwin" };
 
@@ -95,4 +95,44 @@ test("adds an outer read-only boundary around Reviewer worktrees", macOnly, asyn
   }, join(controller, "input.json"));
   assert.equal((await waitForJob(job, 15)).exitCode, 0);
   assert.equal(readFileSync(stdoutPath, "utf8"), "EPERM");
+});
+
+test("allows Git evidence reads while denying Runtime writes to Project metadata", macOnly, async () => {
+  const repo = createGitRepository();
+  const root = tempDir("aec-s-git-isolation-");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  mkdirSync(controller, { recursive: true, mode: 0o700 });
+  execFileSync("git", ["worktree", "add", "-b", "isolation-test", workspace], { cwd: repo, stdio: "ignore" });
+  const metadata = gitMetadataReadPaths(workspace, repo);
+  const unrelated = createGitRepository();
+  assert.throws(() => gitMetadataReadPaths(workspace, unrelated), /does not belong/);
+  const stdoutPath = join(controller, "stdout.log");
+  const program = `
+    const {spawnSync}=require('node:child_process');
+    const fs=require('node:fs');
+    fs.writeFileSync('allowed.txt','ok');
+    const status=spawnSync('git',['status','--porcelain'],{encoding:'utf8'});
+    const add=spawnSync('git',['add','--','allowed.txt'],{encoding:'utf8'});
+    process.stdout.write(JSON.stringify({status:status.status,add:add.status,stderr:add.stderr}));
+  `;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", program], cwd: workspace, timeoutSeconds: 10 },
+    isolation: {
+      workspacePath: workspace,
+      mode: "workspace-write",
+      controllerPath: controller,
+      gitMetadataPaths: metadata,
+      homePath: join(controller, "home"),
+      tempPath: join(controller, "tmp"),
+    },
+    stdoutPath,
+    stderrPath: join(controller, "stderr.log"),
+    resultPath: join(controller, "result.json"),
+  }, join(controller, "input.json"));
+  assert.equal((await waitForJob(job, 15)).exitCode, 0);
+  const result = JSON.parse(readFileSync(stdoutPath, "utf8")) as { status: number; add: number; stderr: string };
+  assert.equal(result.status, 0);
+  assert.notEqual(result.add, 0);
+  assert.match(result.stderr, /operation not permitted/i);
 });

@@ -21,7 +21,7 @@ import type {
   WorkerResult,
   Workspace,
 } from "./types.js";
-import { probeProcessIsolation, runtimeStatePaths } from "./isolation.js";
+import { gitMetadataReadPaths, probeProcessIsolation, runtimeStatePaths } from "./isolation.js";
 import { newId, nowIso } from "./ids.js";
 import { adapterFor, type AgentAdapter, type AgentInvocation } from "./adapters/agent.js";
 import type { RuntimeProbeResult } from "./runtime-probe.js";
@@ -1600,6 +1600,8 @@ export class AecSEngine {
   ): Promise<JobExecution> {
     const workspace = this.db.getWorkspace(run.workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
+    const task = this.requireTask(run.taskId);
+    const project = this.requireProject(task.projectId);
     let job = run.job;
     let input: JobInput;
     if (!job) {
@@ -1625,6 +1627,7 @@ export class AecSEngine {
           mode: options.isolationMode ?? "workspace-write",
           controllerPath: options.structuredOutputPath ? dirname(options.structuredOutputPath) : run.logDir,
           runtimeStatePaths: runtimeStatePaths(options.environmentProfile ?? "restricted", options.runtimeStatePaths ?? []),
+          gitMetadataPaths: gitMetadataReadPaths(workspace.path, project.repoPath),
           homePath: join(run.logDir, "isolation", jobId, "home"),
           tempPath: join(run.logDir, "isolation", jobId, "tmp"),
         },
