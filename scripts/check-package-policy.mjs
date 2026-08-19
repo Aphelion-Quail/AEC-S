@@ -38,12 +38,23 @@ if (manifest && lock?.packages && typeof lock.packages === "object") {
   if (missingApprovals.length > 0) fail(`install scripts lack explicit approval: ${missingApprovals.sort().join(", ")}`);
   if (staleApprovals.length > 0) fail(`allowScripts contains stale or mismatched approvals: ${staleApprovals.sort().join(", ")}`);
 
-  const dshDependencies = Object.entries(manifest.dependencies ?? {})
-    .filter(([name]) => name.startsWith("@deepseek-ai/dsh-"));
-  const floatingDsh = dshDependencies.filter(([, version]) => !/^\d+\.\d+\.\d+-rc\.\d+$/.test(String(version)));
-  if (floatingDsh.length > 0) fail(`DSH preview dependencies must use exact RC versions: ${floatingDsh.map(([name]) => name).join(", ")}`);
-  const lockMismatches = dshDependencies.filter(([name, version]) => lock.packages[`node_modules/${name}`]?.version !== version);
-  if (lockMismatches.length > 0) fail(`DSH manifest/lock versions differ: ${lockMismatches.map(([name]) => name).join(", ")}`);
+  const dependencySections = ["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"];
+  const dshDependencies = dependencySections.flatMap((section) =>
+    Object.entries(manifest[section] ?? {})
+      .filter(([name]) => name.startsWith("@deepseek-ai/dsh-"))
+      .map(([name, version]) => ({ name, version, section })),
+  );
+  const duplicateDsh = [...new Set(dshDependencies.map(({ name }) => name))]
+    .filter((name) => dshDependencies.filter((dependency) => dependency.name === name).length > 1);
+  if (duplicateDsh.length > 0) fail(`DSH dependencies must be declared in exactly one dependency section: ${duplicateDsh.sort().join(", ")}`);
+  const floatingDsh = dshDependencies.filter(({ version }) => !/^\d+\.\d+\.\d+-rc\.\d+$/.test(String(version)));
+  if (floatingDsh.length > 0) {
+    fail(`DSH preview dependencies must use exact RC versions: ${floatingDsh.map(({ name, section }) => `${section}.${name}`).join(", ")}`);
+  }
+  const lockMismatches = dshDependencies.filter(({ name, version }) => lock.packages[`node_modules/${name}`]?.version !== version);
+  if (lockMismatches.length > 0) {
+    fail(`DSH manifest/lock versions differ: ${lockMismatches.map(({ name, section }) => `${section}.${name}`).join(", ")}`);
+  }
 
   if (process.exitCode !== 1) {
     console.log(`Package policy passed: ${installScripts.size} approved install scripts; ${dshDependencies.length} exact DSH RC pins`);

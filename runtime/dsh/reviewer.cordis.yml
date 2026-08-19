@@ -2,6 +2,7 @@
 # AEC-S embeds the bounded review packet in the prompt and verifies the diff again.
 - id: sdk-jsonrpc-server
   name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+  disabled: !!js "(() => { for (const key of ['DSH_CWD', 'DSH_SESSION_ROOT']) if (!process.env[key]) throw new Error(`${key} is required`); return false })()"
   config:
     maxTokensAsSuccess: false
 
@@ -31,5 +32,5 @@
 - id: sessions
   name: '@deepseek-ai/dsh-session-persistence-jsonl'
   config:
-    root: !!js process.env.DSH_SESSION_ROOT
+    root: !!js "(() => { const value = process.env.DSH_SESSION_ROOT; if (!value) throw new Error('DSH_SESSION_ROOT is required'); return value })()"
     compression: none

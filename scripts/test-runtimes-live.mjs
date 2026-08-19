@@ -4,10 +4,13 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 import { AecSDatabase } from "../dist/src/db.js";
 import { AecSEngine } from "../dist/src/engine.js";
+import { redactText } from "../dist/src/redaction.js";
 import { aecSVersion } from "../dist/src/version.js";
 
+async function main() {
 if (process.env.AEC_S_LIVE_RUNTIME_CONFIRM !== "1") {
   throw new Error("Set AEC_S_LIVE_RUNTIME_CONFIRM=1 after confirming that local Runtime credentials may be used for this live gate");
 }
@@ -177,4 +180,16 @@ try {
 } finally {
   db?.close();
   rmSync(root, { recursive: true, force: true });
+}
+}
+
+export function formatLiveGateError(error) {
+  return redactText(error instanceof Error ? error.message : String(error), 2_000);
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    process.stderr.write(`${formatLiveGateError(error)}\n`);
+    process.exitCode = 1;
+  });
 }

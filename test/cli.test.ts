@@ -26,6 +26,24 @@ test("advertises the AEC-S command name", () => {
   assert.doesNotMatch(result.stderr, /^  aec doctor$/m);
 });
 
+test("rejects example repository path placeholders before project creation", () => {
+  const home = tempDir("aec-s-cli-placeholder-home-");
+  const inputs = tempDir("aec-s-cli-placeholder-input-");
+  for (const [index, repoPath] of [
+    "__AEC_S_REPOSITORY_PATH_REQUIRED__",
+    "/absolute/path/to/trusted/repository",
+  ].entries()) {
+    const projectPath = join(inputs, `project-${index}.json`);
+    writeFileSync(projectPath, JSON.stringify({ name: "Placeholder", repoPath }));
+    const result = spawnSync(process.execPath, [cli, "project", "add", projectPath], {
+      env: { ...process.env, AEC_S_HOME: home },
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /repoPath is still an example placeholder/);
+  }
+});
+
 test("manages Project and Agent configuration through the CLI and reports doctor state", () => {
   const home = tempDir("aec-s-cli-home-");
   const inputs = tempDir("aec-s-cli-input-");
