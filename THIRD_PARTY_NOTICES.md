@@ -19,7 +19,7 @@ The current source and npm package do not bundle `node_modules`, third-party nat
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-The locked production dependency graph contains 192 packages: 176 MIT, 1 Apache-2.0, 5 BSD-3-Clause, 8 ISC, 1 BSD-2-Clause, and 1 Python-2.0. DSH packages are pinned to one `0.1.0-rc.6` package/runtime line; AEC-S additionally verifies the JSON-RPC server identity through an initialization handshake. A mismatch is an unavailable Runtime, not a command-adapter fallback.
+The locked production dependency graph contains 193 packages: 177 MIT, 1 Apache-2.0, 5 BSD-3-Clause, 8 ISC, 1 BSD-2-Clause, and 1 Python-2.0. DSH packages are pinned to one `0.1.0-rc.6` package/runtime line; AEC-S additionally verifies the JSON-RPC server identity through an initialization handshake. A mismatch is an unavailable Runtime, not a command-adapter fallback.
 
 The non-MIT production dependencies are:
 

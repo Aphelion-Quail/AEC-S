@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { AecSDatabase } from "./db.js";
 import { AecSEngine } from "./engine.js";
@@ -9,8 +8,17 @@ import { serveMcp, serveMcpHttp } from "./mcp.js";
 import { doctor } from "./doctor.js";
 import { serviceAction } from "./service.js";
 import { systemOutboxLoop } from "./outbox.js";
-import { initializeAecS, inspectProject } from "./onboarding.js";
-import { redactText } from "./redaction.js";
+import {
+  formatInitialization,
+  formatProjectInspection,
+  initializeAecS,
+  inspectProject,
+  type OnboardingLanguage,
+} from "./onboarding.js";
+import { redactJson, redactText } from "./redaction.js";
+import { onboardingComplete } from "./onboarding-state.js";
+import { getAecSPaths } from "./paths.js";
+import { formatDailyControl, languageFromState, runSetupWizard } from "./setup-wizard.js";
 import {
   agentInputSchema,
   agentUpdateSchema,
@@ -21,13 +29,49 @@ import {
   resolutionSchema,
   taskGraphSchema,
 } from "./input.js";
+import { readTextBounded } from "./files.js";
 
 function readInput(path: string): unknown {
-  return JSON.parse(readFileSync(resolve(path), "utf8")) as unknown;
+  return JSON.parse(readTextBounded(resolve(path), 8 * 1024 * 1024, "CLI JSON input")) as unknown;
 }
 
 function output(value: unknown): void {
-  process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+  process.stdout.write(`${JSON.stringify(redactJson(value), null, 2)}\n`);
+}
+
+function optionValues(args: string[], name: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (value === name && args[index + 1] && !args[index + 1]!.startsWith("--")) {
+      values.push(args[index + 1]!);
+      index += 1;
+    } else if (value.startsWith(`${name}=`)) {
+      values.push(value.slice(name.length + 1));
+    }
+  }
+  return values;
+}
+
+function positionalValues(args: string[], valueOptions: Set<string>): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    const value = args[index]!;
+    if (valueOptions.has(value)) {
+      index += 1;
+      continue;
+    }
+    if (!value.startsWith("--")) values.push(value);
+  }
+  return values;
+}
+
+function onboardingLanguage(args: string[]): OnboardingLanguage {
+  const requested = optionValues(args, "--lang").at(-1);
+  if (requested && !["en", "zh-CN"].includes(requested)) throw new Error("--lang must be en or zh-CN");
+  if (requested) return requested as OnboardingLanguage;
+  const locale = process.env.LC_ALL ?? process.env.LC_MESSAGES ?? process.env.LANG ?? Intl.DateTimeFormat().resolvedOptions().locale;
+  return locale.toLowerCase().startsWith("zh") ? "zh-CN" : "en";
 }
 
 function assertConfiguredRepositoryPath(repoPath: string): void {
@@ -39,8 +83,11 @@ function assertConfiguredRepositoryPath(repoPath: string): void {
 
 function usage(): never {
   process.stderr.write(`AEC-S commands:
+  aec-s                         First-run installer or daily control view
   aec-s project <add|list|show|update> [...]
-  aec-s project import <path> [--apply]
+  aec-s project import <path> [--json] [--lang en|zh-CN]
+    [--apply --intent <text> --accept-detected-gates]
+    [--delivery local|github] [--required-check <name> ...]
   aec-s agent <add|list|show|update> [...]
   aec-s graph submit <graph.json>
   aec-s run [task-id]
@@ -51,7 +98,7 @@ function usage(): never {
   aec-s decision <list|show|resolve|record> [...]
   aec-s service <install|start|stop|restart|status|uninstall>
   aec-s doctor
-  aec-s init [--no-service]
+  aec-s init [--no-service] [--json] [--lang en|zh-CN]
   aec-s mcp
   aec-s mcp-http
 `);
@@ -60,13 +107,34 @@ function usage(): never {
 
 async function main(): Promise<void> {
   const [command, subcommand, ...args] = process.argv.slice(2);
+  if (!command) {
+    if (onboardingComplete(getAecSPaths())) {
+      process.stdout.write(await formatDailyControl(languageFromState() ?? onboardingLanguage([])));
+      return;
+    }
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+      process.stderr.write("AEC-S first run requires an interactive terminal. Run `aec-s` in a terminal, or use `aec-s init --json` for automation.\n");
+      process.exitCode = 2;
+      return;
+    }
+    await runSetupWizard();
+    return;
+  }
   if (command === "internal-job") {
-    if (!subcommand) usage();
-    await runJobFile(subcommand);
+    const expectedDigest = args[0];
+    if (!subcommand || !expectedDigest) usage();
+    await runJobFile(subcommand, expectedDigest);
     return;
   }
   if (command === "init") {
-    output(await initializeAecS({ installService: !process.argv.slice(2).includes("--no-service") }));
+    const options = process.argv.slice(3);
+    if (!options.includes("--json") && !options.includes("--no-service") && process.stdin.isTTY && process.stdout.isTTY) {
+      await runSetupWizard();
+      return;
+    }
+    const initialized = await initializeAecS({ installService: !options.includes("--no-service") });
+    if (options.includes("--json")) output(initialized);
+    else process.stdout.write(formatInitialization(initialized, onboardingLanguage(options)));
     return;
   }
   const db = new AecSDatabase();
@@ -88,13 +156,33 @@ async function main(): Promise<void> {
     } else if (command === "project" && subcommand === "update") {
       output(db.updateProject(args[0] ?? usage(), projectUpdateSchema.parse(readInput(args[1] ?? usage()))));
     } else if (command === "project" && subcommand === "import") {
-      const inspected = await inspectProject(args[0] ?? usage());
+      const repoPath = positionalValues(args, new Set(["--lang", "--intent", "--delivery", "--required-check"]))[0] ?? usage();
+      const inspected = await inspectProject(repoPath);
+      let applied;
       if (args.includes("--apply")) {
+        const intent = optionValues(args, "--intent").at(-1)?.trim();
+        if (!intent) throw new Error("--apply requires a nonempty --intent confirmed by the Human maintainer");
+        if (!args.includes("--accept-detected-gates")) {
+          throw new Error("--apply requires --accept-detected-gates so detected validation commands are explicitly authoritative");
+        }
+        const delivery = optionValues(args, "--delivery").at(-1) ?? "local";
+        if (!["local", "github"].includes(delivery)) throw new Error("--delivery must be local or github");
+        const configuredChecks = optionValues(args, "--required-check");
+        const requiredChecks = configuredChecks.length > 0 ? configuredChecks : inspected.detected.requiredCheckCandidates;
+        if (delivery === "github" && requiredChecks.length === 0) {
+          throw new Error("GitHub delivery requires at least one detected or explicit --required-check");
+        }
         await assertGitRepository(inspected.project.repoPath);
-        output({ ...inspected, project: db.createProject(projectInputSchema.parse(inspected.project)) });
-      } else {
-        output(inspected);
+        inspected.project = {
+          ...inspected.project,
+          intent,
+          deliveryMode: delivery as "local" | "github",
+          ...(delivery === "github" ? { requiredChecks } : {}),
+        };
+        applied = db.createProject(projectInputSchema.parse(inspected.project));
       }
+      if (args.includes("--json")) output({ ...inspected, ...(applied ? { project: applied } : {}) });
+      else process.stdout.write(formatProjectInspection(inspected, onboardingLanguage(args), applied));
     } else if (command === "agent" && subcommand === "add") {
       output(db.createAgent(agentInputSchema.parse(readInput(args[0] ?? usage()))));
     } else if (command === "agent" && subcommand === "list") {

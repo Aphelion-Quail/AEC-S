@@ -25,7 +25,7 @@ const agent: Agent = {
   config: { binary: "codex", ignoreUserConfig: true },
 };
 
-test("applies the same explicit Codex workspace boundary to fresh and resumed writes", () => {
+test("delegates fresh and resumed Codex isolation to the outer AEC-S boundary", () => {
   const workspace = tempDir("aec-s-codex-workspace-");
   const runDir = tempDir("aec-s-codex-run-");
   const adapter = adapterFor(agent);
@@ -51,12 +51,12 @@ test("applies the same explicit Codex workspace boundary to fresh and resumed wr
   for (const [index, invocation] of [started, fresh, repaired, resumed].entries()) {
     assert.equal(invocation.command.cwd, workspace);
     assert.deepEqual(invocation.command.args.slice(0, 8), [
-      "--ask-for-approval", "never", "--sandbox", "workspace-write", "--cd", workspace, "exec", index >= 2 ? "resume" : "--json",
+      "--ask-for-approval", "never", "--sandbox", "danger-full-access", "--cd", workspace, "exec", index >= 2 ? "resume" : "--json",
     ]);
   }
 });
 
-test("forces independent Codex review into a read-only workspace", () => {
+test("delegates independent Codex review isolation to the outer AEC-S boundary", () => {
   const workspace = tempDir("aec-s-codex-review-");
   const runDir = tempDir("aec-s-codex-review-run-");
   const invocation = adapterFor(agent).invocation({
@@ -67,7 +67,7 @@ test("forces independent Codex review into a read-only workspace", () => {
     schemaPath: `${runDir}/review.json`,
   });
   assert.deepEqual(invocation.command.args.slice(0, 7), [
-    "--ask-for-approval", "never", "--sandbox", "read-only", "--cd", workspace, "exec",
+    "--ask-for-approval", "never", "--sandbox", "danger-full-access", "--cd", workspace, "exec",
   ]);
 });
 

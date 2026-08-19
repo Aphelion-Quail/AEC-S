@@ -21,7 +21,7 @@ import type {
   WorkerResult,
   Workspace,
 } from "./types.js";
-import { gitMetadataReadPaths, probeProcessIsolation, runtimeAccessPaths } from "./isolation.js";
+import { gitMetadataReadPaths, probeProcessIsolation, requireProcessIsolation, runtimeAccessPaths } from "./isolation.js";
 import { newId, nowIso } from "./ids.js";
 import { adapterFor, type AgentAdapter, type AgentInvocation } from "./adapters/agent.js";
 import type { RuntimeProbeResult } from "./runtime-probe.js";
@@ -53,7 +53,7 @@ import {
   withProjectGitLock,
 } from "./git.js";
 import { matchesAny, tasksConflict } from "./glob.js";
-import { assertFileSize, parseStructuredOutput, readJson, readTextBounded } from "./files.js";
+import { assertFileSize, parseStructuredOutput, readJson, readTextBounded, sha256File } from "./files.js";
 import { cancelSupervisedJob, processAlive, startSupervisedJob, waitForJob } from "./job.js";
 import { authoritativeCommands, resolveValidationCommand, validationPaths } from "./validation.js";
 import { writeSchemas } from "./schemas.js";
@@ -642,6 +642,10 @@ export class AecSEngine {
       }
       const currentTask = this.requireTask(run.taskId);
       if (currentTask.status === "paused") {
+        if (run.job?.agentId) this.db.releaseAgentSlot(run.job.id);
+        if (run.job?.pid) cancelSupervisedJob(run.job.pid);
+        run.job = undefined;
+        run.status = "interrupted";
         run.leaseUntil = undefined;
         run.leaseOwner = undefined;
         this.saveRun(run);
@@ -967,7 +971,15 @@ export class AecSEngine {
     await writeDiff(workspace.path, run.baseSha, diffPath);
     assertFileSize(diffPath, 8 * 1024 * 1024, "Post-validation diff");
     if (revision?.gateProfile.review === "none") {
-      this.setPhase(run, "publish", { attempt: 1, review: { completed: true, summary: "Review not required by Gate Profile", findings: [] } });
+      this.setPhase(run, "publish", {
+        attempt: 1,
+        review: {
+          completed: true,
+          summary: "Review not required by Gate Profile",
+          findings: [],
+          evidenceDiffDigest: sha256File(diffPath, 8 * 1024 * 1024, "Post-validation diff"),
+        },
+      });
       return;
     }
     const executor = this.requireAgent(run.agentId);
@@ -1077,7 +1089,12 @@ export class AecSEngine {
     this.assertReviewResult(review);
     this.db.recordAgentHealth(reviewer.id, true, reviewer.runtimeVersion);
     this.addTokenUsage(run, reviewerAdapter.extractTokenUsage(execution.stdoutPath));
-    run.review = { ...review, completed: true, reviewerAgentId: reviewer.id };
+    run.review = {
+      ...review,
+      completed: true,
+      reviewerAgentId: reviewer.id,
+      evidenceDiffDigest: sha256File(postReviewDiff, 8 * 1024 * 1024, "Post-review diff"),
+    };
     const observedFindingIds = new Set<string>();
     for (const observation of review.findings) {
       const finding = this.db.createFinding({
@@ -1181,6 +1198,24 @@ export class AecSEngine {
       return;
     }
     await this.ensureCommit(run, project, task, workspace);
+    const evidenceDigest = run.review?.evidenceDiffDigest;
+    if (!evidenceDigest) {
+      throw new AecError(
+        AEC_ERROR.runtimeAuthorityViolation,
+        "Publish refused because no controller-generated gate evidence digest is present",
+        { runId: run.id },
+      );
+    }
+    const publishEvidencePath = join(run.logDir, "publish-evidence.diff");
+    await writeDiff(workspace.path, run.baseSha, publishEvidencePath);
+    const publishDigest = sha256File(publishEvidencePath, 8 * 1024 * 1024, "Publish evidence diff");
+    if (publishDigest !== evidenceDigest) {
+      throw new AecError(
+        AEC_ERROR.runtimeAuthorityViolation,
+        "Runtime authority violation: workspace content changed after the final gate",
+        { runId: run.id },
+      );
+    }
     if (project.deliveryMode === "github") await fetchRemote(project);
     const targetHead = await branchHead(project.repoPath, projectBaseRef(project));
     if (targetHead !== run.baseSha) {
@@ -1632,7 +1667,9 @@ export class AecSEngine {
           ? "restricted"
           : runtime.adapter,
         isolationMode: label === "review" ? "read-only" : "workspace-write",
+        workspaceAccess: label === "review" && runtime.adapter === "deepseek_harness" ? "metadata" : "full",
         runtimeRootPaths: invocation.runtimeRootPaths,
+        evidenceReadPaths: [invocation.evidenceReadPath],
         stateWritePaths: [...(invocation.stateWritePaths ?? []), ...(commandStatePath ? [commandStatePath] : [])],
         networkAccess: runtime.adapter === "command" ? "none" : "provider",
       },
@@ -1660,12 +1697,15 @@ export class AecSEngine {
       authorityHeadSha?: string;
       environmentProfile?: ChildEnvironmentProfile;
       isolationMode?: "workspace-write" | "read-only";
+      workspaceAccess?: "full" | "metadata";
       networkAccess?: "none" | "provider";
       runtimeRootPaths?: string[];
+      evidenceReadPaths?: string[];
       stateWritePaths?: string[];
       allowFailure?: boolean;
     } = {},
   ): Promise<JobExecution> {
+    requireProcessIsolation();
     const workspace = this.db.getWorkspace(run.workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
     const task = this.requireTask(run.taskId);
@@ -1676,10 +1716,10 @@ export class AecSEngine {
       const suffix = newId("job");
       const jobId = newId("job");
       const paths = options.fixedPaths ?? {
-        stdout: join(run.logDir, `${label}-${suffix}.stdout.log`),
-        stderr: join(run.logDir, `${label}-${suffix}.stderr.log`),
-        result: join(run.logDir, `${label}-${suffix}.result.json`),
-        input: join(run.logDir, `${label}-${suffix}.input.json`),
+        stdout: join(run.logDir, "control", jobId, `${label}-${suffix}.stdout.log`),
+        stderr: join(run.logDir, "control", jobId, `${label}-${suffix}.stderr.log`),
+        result: join(run.logDir, "control", jobId, `${label}-${suffix}.result.json`),
+        input: join(run.logDir, "control", jobId, `${label}-${suffix}.input.json`),
       };
       if (options.fixedPaths && [paths.stdout, paths.stderr, paths.result, paths.input].some((path) => existsSync(path))) {
         const previous = newId("previous");
@@ -1689,17 +1729,25 @@ export class AecSEngine {
       }
       const environmentProfile = options.environmentProfile ?? "restricted";
       const runtimePaths = runtimeAccessPaths(environmentProfile, options.runtimeRootPaths);
+      const runtimeOutputPath = options.structuredOutputPath
+        ? dirname(options.structuredOutputPath)
+        : join(run.logDir, "runtime-output", jobId);
       input = {
         command,
         ...(options.environmentProfile ? { environmentProfile: options.environmentProfile } : {}),
         isolation: {
           workspacePath: workspace.path,
+          workspaceAccess: options.workspaceAccess ?? "full",
           mode: options.isolationMode ?? "workspace-write",
           networkAccess: options.networkAccess ?? (environmentProfile === "restricted" ? "none" : "provider"),
-          controllerPath: options.structuredOutputPath ? dirname(options.structuredOutputPath) : run.logDir,
+          controllerPath: run.logDir,
+          runtimeOutputPath,
+          evidenceReadPaths: options.evidenceReadPaths,
           credentialReadPaths: runtimePaths.credentialReadPaths,
           stateWritePaths: [...runtimePaths.stateWritePaths, ...(options.stateWritePaths ?? [])],
-          gitMetadataPaths: gitMetadataReadPaths(workspace.path, project.repoPath),
+          gitMetadataPaths: options.workspaceAccess === "metadata"
+            ? []
+            : gitMetadataReadPaths(workspace.path, project.repoPath),
           homePath: join(run.logDir, "isolation", jobId, "home"),
           tempPath: join(run.logDir, "isolation", jobId, "tmp"),
         },
@@ -1734,6 +1782,13 @@ export class AecSEngine {
       this.saveRun(run);
     } else {
       input = readJson<JobInput>(job.inputPath);
+      if (fingerprint(input) !== job.inputDigest) {
+        throw new AecError(
+          AEC_ERROR.runtimeAuthorityViolation,
+          "Supervised JobInput changed after controller persistence",
+          { jobId: job.id },
+        );
+      }
       if (!job.pid && !existsSync(job.resultPath)) {
         const persisted = job;
         const started = startSupervisedJob(input, job.inputPath, job.id, (pending) => {
@@ -1801,6 +1856,7 @@ export class AecSEngine {
     }
     if (currentTask.status === "paused") {
       run.job = undefined;
+      run.status = "interrupted";
       run.leaseUntil = undefined;
       run.leaseOwner = undefined;
       this.saveRun(run);
@@ -2231,6 +2287,20 @@ export class AecSEngine {
     }
     for (const task of tasks) {
       if (input.action === "pause" && !["succeeded", "failed", "cancelled"].includes(task.status)) {
+        const run = this.db.getLatestRunForTask(task.id);
+        if (run?.status === "active") {
+          if (run.job?.pid) cancelSupervisedJob(run.job.pid);
+          if (run.job?.agentId) this.db.releaseAgentSlot(run.job.id);
+          // A claimed Run transitions itself after cancellation so its
+          // lease-CAS cannot be overwritten by a concurrent directive. A
+          // dormant unclaimed Run can be interrupted here immediately.
+          if (!run.leaseOwner) {
+            run.job = undefined;
+            run.status = "interrupted";
+            run.leaseUntil = undefined;
+            this.db.saveRun(run, undefined);
+          }
+        }
         this.db.updateTaskStatus(task.id, "paused");
       } else if (input.action === "resume" && ["paused", "operational_blocked", "awaiting_human", "parked", "circuit_broken"].includes(task.status)) {
         this.db.updateTaskStatus(task.id, "ready");

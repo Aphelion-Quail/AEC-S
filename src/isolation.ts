@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ChildEnvironmentProfile, CommandSpec, ProcessIsolation } from "./types.js";
@@ -81,16 +81,45 @@ export function runtimeAccessPaths(
     if (protectedRoots.has(path)) throw new Error(`Runtime state grant is too broad for process isolation: ${path}`);
   }
   const mutableNames = profile === "codex"
-    ? ["sessions", "shell_snapshots", ".tmp", "tmp", "session_index.jsonl", "history.jsonl", "models_cache.json"]
+    ? [
+        "sessions", "shell_snapshots", "thread-writer-locks", "sqlite", "cache", ".tmp", "tmp",
+        "session_index.jsonl", "history.jsonl", "models_cache.json",
+        "state_5.sqlite", "state_5.sqlite-wal", "state_5.sqlite-shm",
+        "logs_2.sqlite", "logs_2.sqlite-wal", "logs_2.sqlite-shm",
+        "queue_1.sqlite", "queue_1.sqlite-wal", "queue_1.sqlite-shm",
+        "memories_1.sqlite", "memories_1.sqlite-wal", "memories_1.sqlite-shm",
+        "goals_1.sqlite", "goals_1.sqlite-wal", "goals_1.sqlite-shm",
+        ".codex-global-state.json", ".codex-global-state.json.bak",
+      ]
     : profile === "kimi"
-      ? ["cache", "search-index", "server", "updates", "sessions", "logs", "user-history", "telemetry", "workspace-trust", "workspaces.json", "session_index.jsonl", "migrations-effort.json"]
+      ? ["cache", "search-index", "server", "updates", "sessions", "logs", "user-history", "telemetry", "workspace-trust", "oauth", "workspaces.json", "session_index.jsonl", "migrations-effort.json"]
       : profile === "deepseek_harness"
         ? ["storages", "sessions", ".anonymous-user-id"]
         : [];
   return {
     credentialReadPaths: roots,
-    stateWritePaths: roots.flatMap((root) => mutableNames.map((name) => join(root, name))),
+    stateWritePaths: [
+      ...(["codex", "kimi"].includes(profile) ? roots : []),
+      ...roots.flatMap((root) => mutableNames.map((name) => join(root, name))),
+    ],
   };
+}
+
+function credentialWriteDenials(profile: ChildEnvironmentProfile, paths: string[]): string[] {
+  return paths.flatMap((root) => {
+    if (profile === "codex") {
+      return ["auth.json", "config.toml", "AGENTS.md", "plugins", "skills"]
+        .map((name) => join(root, name));
+    }
+    if (profile === "kimi") {
+      return ["bin", "config.toml", "tui.toml", "server.token", "device_id"]
+        .map((name) => join(root, name));
+    }
+    if (profile === "deepseek_harness") {
+      return [".credentials.yaml", "credentials.yaml"].map((name) => join(root, name));
+    }
+    return [];
+  });
 }
 
 export function nodeCoverageDirectory(source: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -110,6 +139,7 @@ export function isolationEnvironment(
 ): Record<string, string> {
   mkdirSync(isolation.homePath, { recursive: true, mode: 0o700 });
   mkdirSync(isolation.tempPath, { recursive: true, mode: 0o700 });
+  mkdirSync(isolation.runtimeOutputPath, { recursive: true, mode: 0o700 });
   const environment: Record<string, string> = {
     HOME: isolation.homePath,
     XDG_CACHE_HOME: join(isolation.homePath, ".cache"),
@@ -127,10 +157,28 @@ export function isolationEnvironment(
     GCM_INTERACTIVE: "never",
   };
   if (profile === "codex") environment.CODEX_HOME = process.env.CODEX_HOME ?? join(homedir(), ".codex");
+  if (profile === "kimi") {
+    const shareDirectory = isolation.credentialReadPaths?.find((path) => basename(path) === ".kimi-code")
+      ?? isolation.credentialReadPaths?.[0];
+    if (shareDirectory) {
+      const homeLink = join(isolation.homePath, ".kimi-code");
+      if (!existsSync(homeLink)) symlinkSync(shareDirectory, homeLink, "dir");
+      environment.KIMI_SHARE_DIR = shareDirectory;
+    }
+  }
+  if (profile === "deepseek_harness") {
+    const dshHome = isolation.credentialReadPaths?.find((path) =>
+      [".dsh", ".deepseek-harness"].includes(basename(path)));
+    if (dshHome) environment.DSH_HOME = dshHome;
+  }
   return environment;
 }
 
-export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolation): CommandSpec {
+export function isolatedCommand(
+  command: CommandSpec,
+  isolation: ProcessIsolation,
+  environmentProfile: ChildEnvironmentProfile = "restricted",
+): CommandSpec {
   if (process.platform !== "darwin" || !existsSync(SANDBOX_EXEC)) {
     throw new Error("AEC-S Runtime isolation requires macOS sandbox-exec; execution cannot safely continue");
   }
@@ -138,8 +186,10 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
   const userTemp = process.env.TMPDIR ? canonical(process.env.TMPDIR) : undefined;
   const readPaths = [
     PACKAGE_ROOT,
-    isolation.workspacePath,
+    ...(isolation.workspaceAccess === "metadata" ? [] : [isolation.workspacePath]),
     isolation.controllerPath,
+    isolation.runtimeOutputPath,
+    ...(isolation.evidenceReadPaths ?? []),
     isolation.homePath,
     isolation.tempPath,
     ...(isolation.credentialReadPaths ?? []),
@@ -151,7 +201,10 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
   const executable = executablePath(command.program);
   if (!executable) throw new Error(`Isolated command is not executable: ${command.program}`);
   readPaths.push(dirname(executable));
-  const writePaths = [isolation.controllerPath, isolation.homePath, isolation.tempPath, ...(isolation.stateWritePaths ?? [])];
+  // Runtime output is the only controller-adjacent writable tree. Job input,
+  // result, logs, and evidence under controllerPath remain controller-owned.
+  const writePaths = [isolation.runtimeOutputPath, isolation.homePath, isolation.tempPath, ...(isolation.stateWritePaths ?? [])];
+  const protectedCredentialWrites = credentialWriteDenials(environmentProfile, isolation.credentialReadPaths ?? []);
   if (coverageDirectory) writePaths.push(coverageDirectory);
   if (isolation.mode === "workspace-write") writePaths.push(isolation.workspacePath);
   const protectedReadRoots = [userHome, "/Users", "/Volumes", ...(userTemp ? [userTemp] : [])];
@@ -168,17 +221,28 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
   ].filter(existsSync).map(canonical);
   const profile = [
     "(version 1)",
-    "(allow default)",
-    ...(isolation.networkAccess === "none" ? ["(deny network*)"] : []),
+    "(deny default)",
+    "(allow process*)",
+    "(allow sysctl-read)",
+    "(allow mach-lookup)",
+    "(allow ipc-posix-shm)",
+    "(allow file-read*)",
+    ...(isolation.networkAccess === "provider" ? ["(allow network*)"] : []),
     `(deny file-read-data ${subpaths(protectedReadRoots)})`,
     `(allow file-read-data ${subpaths(readPaths)})`,
+    ...(isolation.workspaceAccess === "metadata"
+      ? [`(allow file-read-metadata (literal ${seatbeltString(canonical(isolation.workspacePath))}))`]
+      : []),
     "(deny file-write*)",
     `(allow file-write* ${subpaths(writePaths)} (literal "/dev/null"))`,
+    ...protectedCredentialWrites.map((path) => `(deny file-write* ${subpaths([path])})`),
     `(deny file-write* (literal ${seatbeltString(join(canonical(isolation.workspacePath), ".git"))}) ${subpaths(isolation.gitMetadataPaths ?? [])})`,
     "(deny signal)",
     "(allow signal (target self))",
     "(allow signal (target children))",
     '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc") (global-name "com.apple.securityd.general"))',
+    '(deny mach-lookup (global-name "com.apple.tccd") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.systemevents"))',
+    "(deny appleevent-send)",
     ...deniedExecutables.map((path) => `(deny process-exec (literal ${seatbeltString(path)}))`),
   ].join("\n");
   return {
@@ -195,10 +259,12 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
   const directory = mkdtempSync(join(tmpdir(), "aec-s-isolation-probe-"));
   const workspace = join(directory, "workspace");
   const controller = join(directory, "controller");
+  const runtimeOutput = join(directory, "runtime-output");
   const protectedPath = join(directory, "sentinel");
   const escapedWrite = join(directory, "escaped");
   mkdirSync(workspace, { mode: 0o700 });
   mkdirSync(controller, { mode: 0o700 });
+  mkdirSync(runtimeOutput, { mode: 0o700 });
   writeFileSync(protectedPath, "must-not-be-readable", { mode: 0o600 });
   try {
     const isolation = {
@@ -206,6 +272,7 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
       mode: "workspace-write" as const,
       networkAccess: "none" as const,
       controllerPath: controller,
+      runtimeOutputPath: runtimeOutput,
       homePath: join(controller, "home"),
       tempPath: join(controller, "tmp"),
     };
@@ -216,8 +283,10 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
         const denied=(operation)=>{try{operation();return false}catch(error){return error.code==='EPERM'}};
         const readDenied=denied(()=>fs.readFileSync(${JSON.stringify(protectedPath)}));
         const writeDenied=denied(()=>fs.writeFileSync(${JSON.stringify(escapedWrite)},'x'));
+        const controllerWriteDenied=denied(()=>fs.writeFileSync(${JSON.stringify(join(controller, "forged-result.json"))},'x'));
         fs.writeFileSync(${JSON.stringify(join(workspace, "allowed"))},'ok');
-        process.exit(readDenied&&writeDenied?0:1);
+        fs.writeFileSync(${JSON.stringify(join(runtimeOutput, "allowed.json"))},'{}');
+        process.exit(readDenied&&writeDenied&&controllerWriteDenied?0:1);
       `],
       cwd: workspace,
       timeoutSeconds: 5,
@@ -228,10 +297,19 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
       cwd: workspace,
       env: { ...process.env, ...isolationEnvironment(isolation, "restricted") },
     });
-    return result.status === 0 && !existsSync(escapedWrite) && existsSync(join(workspace, "allowed"))
+    return result.status === 0 && !existsSync(escapedWrite) && existsSync(join(workspace, "allowed")) && existsSync(join(runtimeOutput, "allowed.json"))
       ? { ok: true, detail: "macOS Seatbelt process-tree and file-access enforcement is available" }
       : { ok: false, detail: "macOS Seatbelt probe did not enforce the required read/write boundary" };
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+let cachedIsolationProbe: ReturnType<typeof probeProcessIsolation> | undefined;
+
+export function requireProcessIsolation(): void {
+  cachedIsolationProbe ??= probeProcessIsolation();
+  if (!cachedIsolationProbe.ok) {
+    throw new Error(`AEC-S refuses Runtime execution without kernel process isolation: ${cachedIsolationProbe.detail}`);
   }
 }

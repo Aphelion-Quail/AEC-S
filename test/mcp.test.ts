@@ -177,6 +177,7 @@ test("exposes AEC-S MCP over loopback Streamable HTTP", async () => {
   const listening = new Promise<string>((resolve) => { resolveUrl = resolve; });
   const serving = serveMcpHttp(db, {
     port: 0,
+    allowEphemeralPort: true,
     token: httpToken,
     signal: controller.signal,
     onListening: resolveUrl,

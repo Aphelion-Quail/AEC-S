@@ -5,6 +5,7 @@ import { writeJsonAtomic } from "./files.js";
 import { dirname, join } from "node:path";
 import { KimiAcpTransportError, runKimiAcp } from "./kimi-acp.js";
 import { childEnvironment } from "./child-env.js";
+import { parseRuntimeJsonObject } from "./structured-json.js";
 
 type BridgeConfig = {
   binary?: string;
@@ -28,10 +29,6 @@ type BridgeConfig = {
 type TokenUsage = { input?: number; output?: number; total?: number };
 const MAX_RUNTIME_PAYLOAD_BYTES = 8 * 1024 * 1024;
 
-function assertBoundedText(value: string, label: string): void {
-  if (Buffer.byteLength(value) > MAX_RUNTIME_PAYLOAD_BYTES) throw new Error(`${label} exceeds 8 MiB`);
-}
-
 function tokenUsage(value: unknown): TokenUsage | undefined {
   if (!value || typeof value !== "object") return undefined;
   const record = value as Record<string, unknown>;
@@ -52,25 +49,6 @@ function tokenUsage(value: unknown): TokenUsage | undefined {
 function decodeConfig(value: string | undefined): BridgeConfig {
   if (!value) return {};
   return JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as BridgeConfig;
-}
-
-function structured(text: string): unknown {
-  assertBoundedText(text, "Runtime structured result");
-  const trimmed = text.trim();
-  const candidates = [trimmed];
-  for (const match of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(match[1]?.trim() ?? "");
-  const first = trimmed.indexOf("{");
-  const last = trimmed.lastIndexOf("}");
-  if (first >= 0 && last > first) candidates.push(trimmed.slice(first, last + 1));
-  for (const candidate of candidates) {
-    try {
-      const value = JSON.parse(candidate) as unknown;
-      if (value && typeof value === "object" && !Array.isArray(value)) return value;
-    } catch {
-      // Try the next bounded representation of the final response.
-    }
-  }
-  throw new Error("Runtime final response did not contain one JSON object");
 }
 
 async function runLegacyKimi(
@@ -119,7 +97,7 @@ async function runLegacyKimi(
     }
     const result = await turn.result;
     if (result.status !== "finished") throw new Error(`Kimi turn ended with ${result.status}`);
-    return { value: structured(text), sessionId: session.sessionId, ...(usage ? { usage } : {}) };
+    return { value: parseRuntimeJsonObject(text), sessionId: session.sessionId, ...(usage ? { usage } : {}) };
   } finally {
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);
@@ -164,7 +142,7 @@ async function runKimi(
         signal: cancellation.signal,
       });
       return {
-        value: structured(result.text),
+        value: parseRuntimeJsonObject(result.text),
         sessionId: result.sessionId,
         ...(result.usage ? { usage: result.usage } : {}),
         transport: "acp",
@@ -217,7 +195,7 @@ async function runDeepSeek(
       output: (sum.output ?? 0) + (value.output ?? 0),
       total: (sum.total ?? 0) + (value.total ?? 0),
     }), {}) : undefined;
-    return { value: structured(result.finalResponse), sessionId: result.sessionId, ...(usage ? { usage } : {}) };
+    return { value: parseRuntimeJsonObject(result.finalResponse), sessionId: result.sessionId, ...(usage ? { usage } : {}) };
   } finally {
     process.off("SIGTERM", stop);
     process.off("SIGINT", stop);

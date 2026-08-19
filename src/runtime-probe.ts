@@ -41,14 +41,16 @@ export const DSH_COMPATIBILITY = Object.freeze({
 
 const require = createRequire(import.meta.url);
 const KIMI_SDK_VERSION = packageVersion("@moonshot-ai/kimi-agent-sdk");
-const DSH_PACKAGE_NAMES = [
+export const DSH_PACKAGE_NAMES = [
   "@deepseek-ai/dsh-atomic-write",
   "@deepseek-ai/dsh-agent-spine-demo",
   "@deepseek-ai/dsh-app-boot",
   "@deepseek-ai/dsh-brand",
   "@deepseek-ai/dsh-credentials",
   "@deepseek-ai/dsh-credentials-local",
+  "@deepseek-ai/dsh-fs",
   "@deepseek-ai/dsh-fs-local",
+  "@deepseek-ai/dsh-fs-sandbox",
   "@deepseek-ai/dsh-home-paths",
   "@deepseek-ai/dsh-invariants",
   "@deepseek-ai/dsh-launch-environment",
@@ -56,6 +58,7 @@ const DSH_PACKAGE_NAMES = [
   "@deepseek-ai/dsh-llm-deepseek",
   "@deepseek-ai/dsh-sandbox-local",
   "@deepseek-ai/dsh-sandbox-policy",
+  "@deepseek-ai/dsh-sandbox",
   "@deepseek-ai/dsh-sdk-client",
   "@deepseek-ai/dsh-sdk-jsonrpc-demo",
   "@deepseek-ai/dsh-sdk-jsonrpc-server",
@@ -201,7 +204,7 @@ async function kimiLegacyCompatibility(
       workDir: workspace,
       executablePath: binary,
       ...(shareDirectory ? { environmentVariables: { KIMI_SHARE_DIR: shareDirectory } } : {}),
-      clientInfo: { name: "aec-s-probe", version: "0.9.0-rc.1" },
+      clientInfo: { name: "aec-s-probe", version: "0.9.0-rc.3" },
     }), 15_000, "Kimi SDK initialize");
     return {
       ok: true,

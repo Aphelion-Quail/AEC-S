@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import type { Agent, CommandSpec } from "../types.js";
 import { execCommand } from "../exec.js";
 import { discoverExecutable } from "../runtime-discovery.js";
+import { newId } from "../ids.js";
 import {
   probeDeepSeekHarness,
   probeCodex,
@@ -17,10 +18,15 @@ export type InvocationKind = "execute" | "repair" | "review";
 
 const require = createRequire(import.meta.url);
 
+function runtimeOutputPath(runDir: string, kind: InvocationKind): string {
+  return join(runDir, "runtime-output", newId(kind), "result.json");
+}
+
 export type AgentInvocation = {
   command: CommandSpec;
   stdin?: string;
   structuredOutputPath: string;
+  evidenceReadPath: string;
   runtimeRootPaths?: string[];
   stateWritePaths?: string[];
 };
@@ -106,7 +112,7 @@ class CommandAdapter extends BaseAdapter {
       | undefined;
     const program = String(config?.program ?? this.agent.config.binary ?? "");
     if (!program) throw new Error(`Agent ${this.agent.id} command config is missing a program`);
-    const output = join(options.runDir, `${options.kind}-result-${Date.now()}.json`);
+    const output = runtimeOutputPath(options.runDir, options.kind);
     const replacements = {
       workspace: options.workspacePath,
       prompt: options.prompt,
@@ -124,6 +130,7 @@ class CommandAdapter extends BaseAdapter {
       },
       stdin: options.prompt,
       structuredOutputPath: output,
+      evidenceReadPath: options.runDir,
     };
   }
 
@@ -144,13 +151,19 @@ class CodexAdapter extends BaseAdapter {
   }
 
   invocation(options: InvocationOptions): AgentInvocation {
-    const output = join(options.runDir, `${options.kind}-result-${Date.now()}.json`);
+    const output = runtimeOutputPath(options.runDir, options.kind);
     const model = typeof this.agent.config.model === "string" ? this.agent.config.model : undefined;
     const ignoreUserConfig = this.agent.config.ignoreUserConfig === true;
-    const sandbox = options.kind === "review" ? "read-only" : "workspace-write";
+    // AEC-S already launches the complete Codex process tree inside its own
+    // workspace-write/read-only Seatbelt profile. Asking Codex to install a
+    // second macOS Seatbelt profile from inside that boundary fails with
+    // `sandbox_apply: Operation not permitted`, so the inner CLI sandbox must
+    // stay disabled. This does not expand authority: the outer AEC-S profile is
+    // kernel-enforced and remains the sole filesystem/process boundary.
+    const sandbox = "danger-full-access";
     // These are Codex global options, so they must precede `exec`. In particular,
     // `exec resume` does not expose its own --sandbox/--cd flags and must receive
-    // the same explicit boundary as a fresh invocation.
+    // the same explicit inner setting as a fresh invocation.
     const common = [
       "--ask-for-approval",
       "never",
@@ -178,6 +191,7 @@ class CodexAdapter extends BaseAdapter {
         command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: 3600 },
         stdin: options.prompt,
         structuredOutputPath: output,
+        evidenceReadPath: options.runDir,
         runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
       };
     }
@@ -196,6 +210,7 @@ class CodexAdapter extends BaseAdapter {
       command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: options.kind === "review" ? 1800 : 3600 },
       stdin: options.prompt,
       structuredOutputPath: output,
+      evidenceReadPath: options.runDir,
       runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
     };
   }
@@ -269,7 +284,7 @@ class BridgeAdapter extends BaseAdapter {
   }
 
   invocation(options: InvocationOptions): AgentInvocation {
-    const output = join(options.runDir, `${options.kind}-result-${Date.now()}.json`);
+    const output = runtimeOutputPath(options.runDir, options.kind);
     const bridge = fileURLToPath(new URL("../runtime-bridge.js", import.meta.url));
     const outputSchema = readFileSync(options.schemaPath, "utf8");
     const prompt = [
@@ -319,6 +334,7 @@ class BridgeAdapter extends BaseAdapter {
       },
       stdin: prompt,
       structuredOutputPath: output,
+      evidenceReadPath: options.runDir,
       runtimeRootPaths: [
         ...(kimiShareDir ? [kimiShareDir] : []),
         ...(dshHome ? [dshHome] : []),

@@ -1,6 +1,6 @@
 import type { Project, Task } from "./types.js";
 import { execChecked, execCommand } from "./exec.js";
-import { withProjectGitLock } from "./git.js";
+import { safeGitCommand, withProjectGitLock } from "./git.js";
 import { AEC_ERROR, AecError } from "./errors.js";
 
 type PullRequest = {
@@ -16,7 +16,7 @@ function gh(cwd: string, args: string[], timeoutSeconds = 300) {
 }
 
 function git(cwd: string, args: string[], timeoutSeconds = 300) {
-  return { program: "git", args, cwd, timeoutSeconds };
+  return safeGitCommand(cwd, args, timeoutSeconds);
 }
 
 function parseJson<T>(value: string, label: string): T {

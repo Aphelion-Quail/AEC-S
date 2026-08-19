@@ -583,7 +583,7 @@ export class AecSDatabase {
       matchesAny(glob.replace(/[*?].*$/, ""), [candidate]) || matchesAny(candidate.replace(/[*?].*$/, ""), [glob])
     ));
     const docsOnly = input.scope.writeGlobs.length > 0 && input.scope.writeGlobs.every((path) =>
-      path.endsWith(".md") || path.startsWith("docs/") || path.startsWith("examples/"));
+      path.endsWith(".md") || path.startsWith("docs/"));
     const effectiveRiskClass = proposedRiskClass === "core" || pathRisk
       ? "core"
       : proposedRiskClass === "docs" && !docsOnly ? "normal" : proposedRiskClass;
@@ -844,7 +844,7 @@ export class AecSDatabase {
     const project = this.getProject(task.projectId)!;
     const hitsRiskFloor = scope.writeGlobs.some((path) => matchesAny(path, project.highRiskGlobs));
     const docsOnly = scope.writeGlobs.length > 0 && scope.writeGlobs.every((path) =>
-      path.endsWith(".md") || path.startsWith("docs/") || path.startsWith("examples/"));
+      path.endsWith(".md") || path.startsWith("docs/"));
     const effectiveRiskClass = current.effectiveRiskClass === "core" || hitsRiskFloor
       ? "core"
       : current.effectiveRiskClass === "docs" && !docsOnly ? "normal" : current.effectiveRiskClass;

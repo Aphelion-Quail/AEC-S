@@ -14,16 +14,15 @@ function invoke(home: string, args: string[]): Record<string, unknown> {
   })) as Record<string, unknown>;
 }
 
-test("advertises the AEC-S command name", () => {
-  const result = spawnSync(process.execPath, [cli], { encoding: "utf8" });
+test("routes a bare non-interactive first run to the system installer", () => {
+  const home = tempDir("aec-s-cli-first-run-");
+  const result = spawnSync(process.execPath, [cli], {
+    encoding: "utf8",
+    env: { ...process.env, AEC_S_HOME: home },
+  });
   assert.equal(result.status, 2);
-  assert.match(result.stderr, /^AEC-S commands:/);
-  assert.match(result.stderr, /aec-s doctor/);
-  assert.match(result.stderr, /aec-s run \[task-id\]/);
-  assert.match(result.stderr, /aec-s daemon/);
-  assert.match(result.stderr, /aec-s service <install\|start\|stop\|restart\|status\|uninstall>/);
-  assert.match(result.stderr, /aec-s mcp-http/);
-  assert.doesNotMatch(result.stderr, /^  aec doctor$/m);
+  assert.match(result.stderr, /first run requires an interactive terminal/);
+  assert.match(result.stderr, /aec-s init --json/);
 });
 
 test("rejects example repository path placeholders before project creation", () => {

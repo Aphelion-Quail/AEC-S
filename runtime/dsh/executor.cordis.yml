@@ -38,8 +38,8 @@
   config:
     timeoutMs: 300000
 
-- id: fs-local
-  name: '@deepseek-ai/dsh-fs-local'
+- id: fs-sandbox
+  name: '@deepseek-ai/dsh-fs-sandbox'
   config:
     cwd: !!js "(() => { const value = process.env.DSH_CWD; if (!value) throw new Error('DSH_CWD is required'); return value })()"
 
@@ -47,8 +47,8 @@
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
     includeHarnessIdentity: false
-    includeRuntimeContext: false
-    persona: 'You are an AEC-S executor. AEC-S owns scope, validation, commit, merge, and decisions.'
+    includeRuntimeContext: true
+    persona: !!js "`You are an AEC-S executor. The only project workspace is ${process.env.DSH_CWD}; never inspect or modify paths outside it. AEC-S owns scope, validation, commit, merge, and decisions.`"
     workspaceContext: false
     skills:
       enabled: false
@@ -64,6 +64,7 @@
   name: '@deepseek-ai/dsh-tool-str-replace-editor'
   config:
     maxOutputChars: 16000
+    description: !!js "`View or edit files only under the AEC-S workspace root ${process.env.DSH_CWD}. Never inspect filesystem root or another directory. Use absolute paths rooted at that workspace.`"
 
 - id: sessions
   name: '@deepseek-ai/dsh-session-persistence-jsonl'

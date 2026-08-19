@@ -1,10 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { gitMetadataReadPaths, probeProcessIsolation } from "../src/isolation.js";
+import {
+  gitMetadataReadPaths,
+  isolationEnvironment,
+  probeProcessIsolation,
+  runtimeAccessPaths,
+} from "../src/isolation.js";
 import { startSupervisedJob, waitForJob } from "../src/job.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 
@@ -12,6 +17,167 @@ const macOnly = { skip: process.platform !== "darwin" };
 
 test("proves the required macOS process isolation primitive", macOnly, () => {
   assert.equal(probeProcessIsolation().ok, true);
+});
+
+test("maps Kimi authentication into isolated HOME with explicit Runtime state grants", () => {
+  const root = tempDir("aec-s-kimi-isolated-home-");
+  const share = join(root, ".kimi-code");
+  const controller = join(root, "controller");
+  mkdirSync(share, { recursive: true });
+  const isolation = {
+    workspacePath: root,
+    mode: "read-only" as const,
+    networkAccess: "provider" as const,
+    controllerPath: controller,
+    runtimeOutputPath: join(controller, "runtime-output"),
+    credentialReadPaths: [share],
+    stateWritePaths: [join(share, "sessions")],
+    homePath: join(controller, "home"),
+    tempPath: join(controller, "tmp"),
+  };
+  const environment = isolationEnvironment(isolation, "kimi");
+  assert.equal(environment.HOME, isolation.homePath);
+  assert.equal(environment.KIMI_SHARE_DIR, share);
+  assert.equal(realpathSync(join(isolation.homePath, ".kimi-code")), realpathSync(share));
+  assert.deepEqual(isolation.stateWritePaths, [join(share, "sessions")]);
+});
+
+test("references the authorized DSH credential root from isolated HOME", () => {
+  const root = tempDir("aec-s-dsh-isolated-home-");
+  const dshHome = join(root, ".dsh");
+  const controller = join(root, "controller");
+  mkdirSync(dshHome, { recursive: true });
+  const environment = isolationEnvironment({
+    workspacePath: root,
+    mode: "read-only",
+    networkAccess: "provider",
+    controllerPath: controller,
+    runtimeOutputPath: join(controller, "runtime-output"),
+    credentialReadPaths: [dshHome],
+    stateWritePaths: [join(dshHome, "sessions")],
+    homePath: join(controller, "home"),
+    tempPath: join(controller, "tmp"),
+  }, "deepseek_harness");
+  assert.equal(environment.HOME, join(controller, "home"));
+  assert.equal(environment.DSH_HOME, dshHome);
+});
+
+test("classifies Codex mutable state separately from credential files", () => {
+  const root = tempDir("aec-s-codex-state-paths-");
+  const paths = runtimeAccessPaths("codex", [root]);
+  const canonicalRoot = realpathSync(root);
+  assert.ok(paths.stateWritePaths.includes(canonicalRoot));
+  assert.ok(paths.stateWritePaths.includes(join(canonicalRoot, "state_5.sqlite")));
+  assert.ok(paths.stateWritePaths.includes(join(canonicalRoot, "thread-writer-locks")));
+  assert.equal(paths.stateWritePaths.includes(join(canonicalRoot, "auth.json")), false);
+  assert.equal(paths.stateWritePaths.includes(join(canonicalRoot, "config.toml")), false);
+});
+
+test("allows Codex dynamic state while denying credential and policy mutation", macOnly, async () => {
+  const root = tempDir("aec-s-codex-credential-boundary-");
+  const runtimeRoot = join(root, "custom-codex-runtime-home");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  for (const path of [runtimeRoot, workspace, controller]) mkdirSync(path, { recursive: true });
+  const auth = join(runtimeRoot, "auth.json");
+  const config = join(runtimeRoot, "config.toml");
+  writeFileSync(auth, "credential");
+  writeFileSync(config, "policy");
+  const access = runtimeAccessPaths("codex", [runtimeRoot]);
+  const stdoutPath = join(controller, "stdout.log");
+  const program = `
+    const fs=require('node:fs');
+    const write=(path)=>{try{fs.writeFileSync(path,'changed');return 'allowed'}catch(error){return error.code}};
+    process.stdout.write(JSON.stringify({
+      state:write(${JSON.stringify(join(runtimeRoot, "dynamic-state.tmp"))}),
+      auth:write(${JSON.stringify(auth)}),
+      config:write(${JSON.stringify(config)})
+    }));
+  `;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", program], cwd: workspace, timeoutSeconds: 10 },
+    environmentProfile: "codex",
+    isolation: {
+      workspacePath: workspace,
+      mode: "read-only",
+      networkAccess: "none",
+      controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
+      credentialReadPaths: access.credentialReadPaths,
+      stateWritePaths: access.stateWritePaths,
+      homePath: join(controller, "home"),
+      tempPath: join(controller, "tmp"),
+    },
+    stdoutPath,
+    stderrPath: join(controller, "stderr.log"),
+    resultPath: join(controller, "result.json"),
+  }, join(controller, "input.json"));
+  assert.equal((await waitForJob(job, 15)).exitCode, 0);
+  const result = JSON.parse(readFileSync(stdoutPath, "utf8")) as { state: string; auth: string; config: string };
+  assert.equal(result.state, "allowed");
+  assert.equal(result.auth, "EPERM");
+  assert.equal(result.config, "EPERM");
+  assert.equal(readFileSync(auth, "utf8"), "credential");
+  assert.equal(readFileSync(config, "utf8"), "policy");
+});
+
+test("allows Kimi-owned credential refresh while denying policy and binary mutation", macOnly, async () => {
+  const root = tempDir("aec-s-kimi-credential-boundary-");
+  const runtimeRoot = join(root, ".kimi-code");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  const binaryDirectory = join(runtimeRoot, "bin");
+  const credentialDirectory = join(runtimeRoot, "credentials");
+  const oauthDirectory = join(runtimeRoot, "oauth");
+  for (const path of [runtimeRoot, workspace, controller, binaryDirectory, credentialDirectory, oauthDirectory]) {
+    mkdirSync(path, { recursive: true });
+  }
+  const credential = join(credentialDirectory, "kimi-code.json");
+  const config = join(runtimeRoot, "config.toml");
+  const binary = join(binaryDirectory, "kimi");
+  writeFileSync(credential, "credential");
+  writeFileSync(config, "policy");
+  writeFileSync(binary, "binary");
+  const access = runtimeAccessPaths("kimi", [runtimeRoot]);
+  const stdoutPath = join(controller, "stdout.log");
+  const program = `
+    const fs=require('node:fs');
+    const write=(path)=>{try{fs.writeFileSync(path,'changed');return 'allowed'}catch(error){return error.code}};
+    process.stdout.write(JSON.stringify({
+      state:write(${JSON.stringify(join(runtimeRoot, "dynamic-state.tmp"))}),
+      oauth:write(${JSON.stringify(join(oauthDirectory, "kimi-code"))}),
+      credential:write(${JSON.stringify(credential)}),
+      config:write(${JSON.stringify(config)}),
+      binary:write(${JSON.stringify(binary)})
+    }));
+  `;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", program], cwd: workspace, timeoutSeconds: 10 },
+    environmentProfile: "kimi",
+    isolation: {
+      workspacePath: workspace,
+      mode: "read-only",
+      networkAccess: "none",
+      controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
+      credentialReadPaths: access.credentialReadPaths,
+      stateWritePaths: access.stateWritePaths,
+      homePath: join(controller, "home"),
+      tempPath: join(controller, "tmp"),
+    },
+    stdoutPath,
+    stderrPath: join(controller, "stderr.log"),
+    resultPath: join(controller, "result.json"),
+  }, join(controller, "input.json"));
+  assert.equal((await waitForJob(job, 15)).exitCode, 0);
+  const result = JSON.parse(readFileSync(stdoutPath, "utf8")) as {
+    state: string; oauth: string; credential: string; config: string; binary: string;
+  };
+  assert.equal(result.state, "allowed");
+  assert.equal(result.oauth, "allowed");
+  assert.equal(result.credential, "allowed");
+  assert.equal(result.config, "EPERM");
+  assert.equal(result.binary, "EPERM");
 });
 
 test("confines an entire Runtime process tree to its declared filesystem paths", macOnly, async () => {
@@ -34,7 +200,7 @@ test("confines an entire Runtime process tree to its declared filesystem paths",
     const write=(path)=>{try{fs.writeFileSync(path,'x');return 'allowed'}catch(error){return error.code}};
     const child=spawnSync(process.execPath,['-e',${JSON.stringify("const fs=require('node:fs');try{fs.readFileSync(process.argv[1]);process.stdout.write('leaked')}catch(e){process.stdout.write(e.code)}")},${JSON.stringify(outside)}],{encoding:'utf8'});
     const signal=()=>{try{process.kill(${unrelated.pid},'SIGCONT');return 'allowed'}catch(error){return error.code}};
-    process.stdout.write(JSON.stringify({outside:read(${JSON.stringify(outside)}),runtime:read(${JSON.stringify(join(runtimeState, "auth-state"))}),credentialWrite:write(${JSON.stringify(join(runtimeState, "auth-state"))}),stateWrite:write(${JSON.stringify(join(runtimeSessions, "session.json"))}),escaped:write(${JSON.stringify(escapedWrite)}),workspace:write(${JSON.stringify(join(workspace, "allowed.txt"))}),child:child.stdout,signal:signal(),ssh:process.env.SSH_AUTH_SOCK,home:process.env.HOME}));
+    process.stdout.write(JSON.stringify({outside:read(${JSON.stringify(outside)}),runtime:read(${JSON.stringify(join(runtimeState, "auth-state"))}),credentialWrite:write(${JSON.stringify(join(runtimeState, "auth-state"))}),stateWrite:write(${JSON.stringify(join(runtimeSessions, "session.json"))}),controllerWrite:write(${JSON.stringify(join(controller, "forged-result.json"))}),escaped:write(${JSON.stringify(escapedWrite)}),workspace:write(${JSON.stringify(join(workspace, "allowed.txt"))}),child:child.stdout,signal:signal(),ssh:process.env.SSH_AUTH_SOCK,home:process.env.HOME}));
   `;
   const inputPath = join(controller, "job.input.json");
   const stdoutPath = join(controller, "stdout.log");
@@ -46,6 +212,7 @@ test("confines an entire Runtime process tree to its declared filesystem paths",
       mode: "workspace-write",
       networkAccess: "none",
       controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
       credentialReadPaths: [runtimeState],
       stateWritePaths: [runtimeSessions],
       homePath: join(controller, "home"),
@@ -63,6 +230,7 @@ test("confines an entire Runtime process tree to its declared filesystem paths",
     assert.equal(result.runtime, "runtime-only");
     assert.equal(result.credentialWrite, "EPERM");
     assert.equal(result.stateWrite, "allowed");
+    assert.equal(result.controllerWrite, "EPERM");
     assert.equal(result.escaped, "EPERM");
     assert.equal(result.workspace, "allowed");
     assert.equal(result.signal, "EPERM");
@@ -93,6 +261,7 @@ test("adds an outer read-only boundary around Reviewer worktrees", macOnly, asyn
       mode: "read-only",
       networkAccess: "none",
       controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
       homePath: join(controller, "home"),
       tempPath: join(controller, "tmp"),
     },
@@ -102,6 +271,46 @@ test("adds an outer read-only boundary around Reviewer worktrees", macOnly, asyn
   }, join(controller, "input.json"));
   assert.equal((await waitForJob(job, 15)).exitCode, 0);
   assert.equal(readFileSync(stdoutPath, "utf8"), "EPERM");
+});
+
+test("confines packet-only DSH Review to controller evidence", macOnly, async () => {
+  const root = tempDir("aec-s-dsh-review-packet-");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  const evidence = join(root, "review-packet");
+  for (const path of [workspace, controller, evidence]) mkdirSync(path, { recursive: true });
+  const source = join(workspace, "source.ts");
+  const packet = join(evidence, "review.json");
+  writeFileSync(source, "private workspace source");
+  writeFileSync(packet, "authorized review packet");
+  const stdoutPath = join(controller, "stdout.log");
+  const program = `
+    const fs=require('node:fs');
+    const read=(path)=>{try{return fs.readFileSync(path,'utf8')}catch(error){return error.code}};
+    process.stdout.write(JSON.stringify({source:read(${JSON.stringify(source)}),packet:read(${JSON.stringify(packet)})}));
+  `;
+  const job = startSupervisedJob({
+    command: { program: process.execPath, args: ["-e", program], cwd: workspace, timeoutSeconds: 10 },
+    environmentProfile: "deepseek_harness",
+    isolation: {
+      workspacePath: workspace,
+      workspaceAccess: "metadata",
+      mode: "read-only",
+      networkAccess: "none",
+      controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
+      evidenceReadPaths: [evidence],
+      homePath: join(controller, "home"),
+      tempPath: join(controller, "tmp"),
+    },
+    stdoutPath,
+    stderrPath: join(controller, "stderr.log"),
+    resultPath: join(controller, "result.json"),
+  }, join(controller, "input.json"));
+  assert.equal((await waitForJob(job, 15)).exitCode, 0);
+  const result = JSON.parse(readFileSync(stdoutPath, "utf8")) as { source: string; packet: string };
+  assert.equal(result.source, "EPERM");
+  assert.equal(result.packet, "authorized review packet");
 });
 
 test("denies network access unless a first-class Runtime receives the explicit provider exception", macOnly, async () => {
@@ -135,6 +344,7 @@ test("denies network access unless a first-class Runtime receives the explicit p
       mode: "read-only",
       networkAccess: "none",
       controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
       homePath: join(controller, "home"),
       tempPath: join(controller, "tmp"),
     },
@@ -153,6 +363,7 @@ test("denies network access unless a first-class Runtime receives the explicit p
         mode: "read-only",
         networkAccess: "provider",
         controllerPath: controller,
+        runtimeOutputPath: join(controller, "provider-runtime-output"),
         homePath: join(controller, "provider-home"),
         tempPath: join(controller, "provider-tmp"),
       },
@@ -193,6 +404,7 @@ test("allows Git evidence reads while denying Runtime writes to Project metadata
       mode: "workspace-write",
       networkAccess: "none",
       controllerPath: controller,
+      runtimeOutputPath: join(controller, "runtime-output"),
       gitMetadataPaths: metadata,
       homePath: join(controller, "home"),
       tempPath: join(controller, "tmp"),
