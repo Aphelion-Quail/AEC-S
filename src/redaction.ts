@@ -14,7 +14,11 @@ const SECRET_PATTERNS: SecretPattern[] = [
   [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, "[REDACTED]"],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "[REDACTED]"],
   [
-    /\b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API_KEY|PRIVATE_KEY))\s*=\s*([^\s,;]+)/gi,
+    /\b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY))\s*=\s*(["'])(.*?)\2/gi,
+    (_match: string, key: string) => `${key}=[REDACTED]`,
+  ],
+  [
+    /\b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API[_-]?KEY|PRIVATE[_-]?KEY))\s*=\s*([^\s,;"']+)/gi,
     (_match: string, key: string) => `${key}=[REDACTED]`,
   ],
   [
@@ -24,12 +28,15 @@ const SECRET_PATTERNS: SecretPattern[] = [
   [/[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi, "[REDACTED]"],
 ];
 
-const SECRET_KEY_PATTERN = /(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|secret|api[_-]?key|private[_-]?key|credential|token)(?:$|[_-])/i;
+const SECRET_KEY_PATTERN = /(?:^|_)(?:access_token|refresh_token|session_token|auth_token|auth|authorization|password|secret|api_key|private_key|credential|token)(?:$|_)/i;
 
-function secretKey(key: string): boolean {
+export function isSecretKey(key: string): boolean {
   if (/^(?:tokenUsage|inputTokens|outputTokens|totalTokens)$/i.test(key)) return false;
-  if (SECRET_KEY_PATTERN.test(key)) return true;
-  return /(?:AccessToken|RefreshToken|ApiKey|PrivateKey|Password|Credential|Authorization)$/.test(key);
+  const normalized = key
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .replace(/[^a-zA-Z0-9]+/g, "_")
+    .toLowerCase();
+  return SECRET_KEY_PATTERN.test(normalized);
 }
 
 export function redactText(value: string, maxLength = 4_000): string {
@@ -46,7 +53,7 @@ export function redactJson<T>(value: T): T {
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([key, child]) => [
       key,
-      secretKey(key) ? "[REDACTED]" : redactJson(child),
+      isSecretKey(key) ? "[REDACTED]" : redactJson(child),
     ])) as T;
   }
   return value;

@@ -97,6 +97,11 @@ if (mode === "scope-expansion") {
   process.exit(0);
 }
 
+if (mode === "daemon-hang") {
+  await new Promise((resolve) => setTimeout(resolve, 30_000));
+  throw new Error("daemon-hang was not cancelled");
+}
+
 if (mode === "malformed-result") {
   writeFileSync(outputPath, JSON.stringify({ status: "complete", summary: "Missing required fields" }));
   process.exit(0);

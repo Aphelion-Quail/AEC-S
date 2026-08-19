@@ -111,6 +111,9 @@ test("keeps Human-on-Exception delivery durable and rejects persisted credential
   assert.throws(() => db.createAgent({
     name: "unsafe", adapter: "kimi", roles: ["executor"], config: { apiKey: fakeApiKey },
   }), /cannot be persisted/);
+  assert.throws(() => db.createAgent({
+    name: "unsafe-camel-case", adapter: "kimi", roles: ["executor"], config: { clientSecret: "opaque" },
+  }), /cannot be persisted/);
   const decision = db.createDecision({
     projectId: project.id, kind: "direction", title: "Direction needed", body: "No legal path remains",
   });

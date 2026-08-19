@@ -27,7 +27,7 @@ import { newId, nowIso } from "./ids.js";
 import { fingerprint } from "./fingerprint.js";
 import { matchesAny } from "./glob.js";
 import { ensureAecSPaths, getAecSPaths, type AecSPaths } from "./paths.js";
-import { redactJson, redactText } from "./redaction.js";
+import { isSecretKey, redactJson, redactText } from "./redaction.js";
 
 type Row = Record<string, unknown>;
 type SqlValue = string | number | bigint | Uint8Array | null;
@@ -52,7 +52,7 @@ function assertNoPersistedSecrets(value: unknown, location: string, rejectEnviro
   }
   if (!value || typeof value !== "object") return;
   for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    if (/(?:token|password|secret|api[_-]?key|private[_-]?key|credential|authorization)/i.test(key) ||
+    if (isSecretKey(key) ||
         (rejectEnvironmentMaps && /^(?:env|environment)$/i.test(key))) {
       throw new Error(`${location}.${key} is secret-bearing configuration and cannot be persisted`);
     }
@@ -1326,6 +1326,10 @@ export class AecSDatabase {
   getWorkspace(id: string): Workspace | undefined {
     const row = this.db.prepare("SELECT * FROM workspaces WHERE id = ?").get(id) as Row | undefined;
     if (!row) return undefined;
+    return this.workspaceFromRow(row);
+  }
+
+  private workspaceFromRow(row: Row): Workspace {
     return {
       id: String(row.id),
       projectId: String(row.project_id),
@@ -1342,9 +1346,9 @@ export class AecSDatabase {
 
   listWorkspaces(projectId?: string): Workspace[] {
     const rows = projectId
-      ? (this.db.prepare("SELECT id FROM workspaces WHERE project_id = ? ORDER BY created_at").all(projectId) as Row[])
-      : (this.db.prepare("SELECT id FROM workspaces ORDER BY created_at").all() as Row[]);
-    return rows.map((row) => this.getWorkspace(String(row.id))!);
+      ? (this.db.prepare("SELECT * FROM workspaces WHERE project_id = ? ORDER BY created_at").all(projectId) as Row[])
+      : (this.db.prepare("SELECT * FROM workspaces ORDER BY created_at").all() as Row[]);
+    return rows.map((row) => this.workspaceFromRow(row));
   }
 
   updateWorkspaceStatus(id: string, status: WorkspaceStatus): void {

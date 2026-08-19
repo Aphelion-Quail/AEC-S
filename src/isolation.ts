@@ -60,7 +60,10 @@ function executablePath(program: string, path = process.env.PATH ?? ""): string 
   return undefined;
 }
 
-export function runtimeStatePaths(profile: ChildEnvironmentProfile, extra: string[] = []): string[] {
+export function runtimeAccessPaths(
+  profile: ChildEnvironmentProfile,
+  runtimeRoots: string[] = [],
+): { credentialReadPaths: string[]; stateWritePaths: string[] } {
   const home = homedir();
   const configured = profile === "codex"
     ? process.env.CODEX_HOME
@@ -71,11 +74,23 @@ export function runtimeStatePaths(profile: ChildEnvironmentProfile, extra: strin
       ? [join(home, ".kimi-code"), join(home, ".kimi"), join(home, "Library", "Caches", "kimi-code")]
       : profile === "deepseek_harness" ? [join(home, ".deepseek-harness"), join(home, ".dsh")] : [];
   const protectedRoots = new Set([canonical("/"), canonical(homedir()), canonical("/Users"), canonical("/Volumes")]);
-  const paths = [...new Set([...(configured ? [configured] : []), ...defaults, ...extra].filter(existsSync).map(canonical))];
-  for (const path of paths) {
+  const roots = [...new Set((runtimeRoots.length > 0
+    ? runtimeRoots
+    : [...(configured ? [configured] : []), ...defaults]).filter(existsSync).map(canonical))];
+  for (const path of roots) {
     if (protectedRoots.has(path)) throw new Error(`Runtime state grant is too broad for process isolation: ${path}`);
   }
-  return paths;
+  const mutableNames = profile === "codex"
+    ? ["sessions", "shell_snapshots", ".tmp", "tmp", "session_index.jsonl", "history.jsonl", "models_cache.json"]
+    : profile === "kimi"
+      ? ["cache", "search-index", "server", "updates", "sessions", "logs", "user-history", "telemetry", "workspace-trust", "workspaces.json", "session_index.jsonl", "migrations-effort.json"]
+      : profile === "deepseek_harness"
+        ? ["storages", "sessions", ".anonymous-user-id"]
+        : [];
+  return {
+    credentialReadPaths: roots,
+    stateWritePaths: roots.flatMap((root) => mutableNames.map((name) => join(root, name))),
+  };
 }
 
 export function nodeCoverageDirectory(source: NodeJS.ProcessEnv = process.env): string | undefined {
@@ -127,7 +142,8 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
     isolation.controllerPath,
     isolation.homePath,
     isolation.tempPath,
-    ...(isolation.runtimeStatePaths ?? []),
+    ...(isolation.credentialReadPaths ?? []),
+    ...(isolation.stateWritePaths ?? []),
     ...(isolation.gitMetadataPaths ?? []),
   ];
   const coverageDirectory = nodeCoverageDirectory();
@@ -135,10 +151,11 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
   const executable = executablePath(command.program);
   if (!executable) throw new Error(`Isolated command is not executable: ${command.program}`);
   readPaths.push(dirname(executable));
-  const writePaths = [isolation.controllerPath, isolation.homePath, isolation.tempPath, ...(isolation.runtimeStatePaths ?? [])];
+  const writePaths = [isolation.controllerPath, isolation.homePath, isolation.tempPath, ...(isolation.stateWritePaths ?? [])];
   if (coverageDirectory) writePaths.push(coverageDirectory);
   if (isolation.mode === "workspace-write") writePaths.push(isolation.workspacePath);
   const protectedReadRoots = [userHome, "/Users", "/Volumes", ...(userTemp ? [userTemp] : [])];
+  const deniedPrograms = ["security", "ssh", "scp", "sftp", "gh", "git-credential-osxkeychain"];
   const deniedExecutables = [
     "/usr/bin/security",
     "/usr/bin/ssh",
@@ -147,10 +164,12 @@ export function isolatedCommand(command: CommandSpec, isolation: ProcessIsolatio
     "/usr/libexec/git-core/git-credential-osxkeychain",
     "/opt/homebrew/bin/gh",
     "/usr/local/bin/gh",
+    ...deniedPrograms.flatMap((program) => (process.env.PATH ?? "").split(delimiter).map((entry) => join(entry, program))),
   ].filter(existsSync).map(canonical);
   const profile = [
     "(version 1)",
     "(allow default)",
+    ...(isolation.networkAccess === "none" ? ["(deny network*)"] : []),
     `(deny file-read-data ${subpaths(protectedReadRoots)})`,
     `(allow file-read-data ${subpaths(readPaths)})`,
     "(deny file-write*)",
@@ -185,6 +204,7 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
     const isolation = {
       workspacePath: workspace,
       mode: "workspace-write" as const,
+      networkAccess: "none" as const,
       controllerPath: controller,
       homePath: join(controller, "home"),
       tempPath: join(controller, "tmp"),

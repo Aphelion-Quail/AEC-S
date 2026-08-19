@@ -21,7 +21,8 @@ export type AgentInvocation = {
   command: CommandSpec;
   stdin?: string;
   structuredOutputPath: string;
-  runtimeStatePaths?: string[];
+  runtimeRootPaths?: string[];
+  stateWritePaths?: string[];
 };
 
 export type InvocationOptions = {
@@ -177,7 +178,7 @@ class CodexAdapter extends BaseAdapter {
         command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: 3600 },
         stdin: options.prompt,
         structuredOutputPath: output,
-        runtimeStatePaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
+        runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
       };
     }
     const args = [
@@ -195,7 +196,7 @@ class CodexAdapter extends BaseAdapter {
       command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: options.kind === "review" ? 1800 : 3600 },
       stdin: options.prompt,
       structuredOutputPath: output,
-      runtimeStatePaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
+      runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
     };
   }
 
@@ -318,7 +319,7 @@ class BridgeAdapter extends BaseAdapter {
       },
       stdin: prompt,
       structuredOutputPath: output,
-      runtimeStatePaths: [
+      runtimeRootPaths: [
         ...(kimiShareDir ? [kimiShareDir] : []),
         ...(dshHome ? [dshHome] : []),
       ],
