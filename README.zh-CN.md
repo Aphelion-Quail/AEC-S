@@ -197,13 +197,13 @@ WorkBuddy 桌面版可通过其内置 CLI 添加同一个 stdio server（确保�
 http://127.0.0.1:7337/mcp
 ```
 
-该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。该令牌属于控制面能力：持有者可以提交由 AEC-S 宿主用户权限执行的 Validation 命令。应把它视为一个已认证的本地 Shell Session，绝不能交给不可信客户端；如怀疑泄露，应立即撤销对应客户端的访问。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 最多保留 64 个标准 Streamable HTTP Session，空闲 30 分钟后过期，并支持 POST、GET/SSE 和 DELETE 终止；关闭服务时会终止空闲 keep-alive 连接，并为其余连接设置强制收敛边界。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`，且不会暴露版本。AEC-S 不通过 npm 包分发，因此不要在 GUI 中选择 npx。
+该端点只监听回环地址，并要求每个 MCP 请求携带 `Authorization: Bearer <token>`。该令牌属于控制面能力：持有者可以提交 Validation 命令，并在 AEC-S Seatbelt 边界内修改已注册项目的 worktree。它不再意味着不受限的宿主 Shell 权限，但仍可改变项目状态并消耗本机资源，因此绝不能交给不可信客户端；如怀疑泄露，应立即撤销对应客户端的访问。`aec-s init` 会在 `$AEC_S_HOME/mcp-http.token` 创建权限为 `0600` 的令牌；只应将其配置到客户端的 Secret/Header 字段，绝不能写入仓库、日志或 Task 输入。无法设置 HTTP Header 的客户端必须使用上方 stdio 配置。Server 最多保留 64 个标准 Streamable HTTP Session，空闲 30 分钟后过期，并支持 POST、GET/SSE 和 DELETE 终止；关闭服务时会终止空闲 keep-alive 连接，并为其余连接设置强制收敛边界。可通过 `AEC_S_MCP_HTTP_PORT` 修改端口，随后重新执行 `aec-s service install`。无需认证的健康检查地址为 `http://127.0.0.1:7337/healthz`，且不会暴露版本。AEC-S 不通过 npm 包分发，因此不要在 GUI 中选择 npx。
 
 Finding 状态迁移不再接受调用者自报身份。专用 Reviewer MCP 进程必须用 `AEC_S_MCP_ACTOR_AGENT_ID` 绑定一个已启用 Reviewer；共享 daemon 未绑定 Reviewer 时，该工具默认拒绝。Human 方向仍通过 Decision 工具进入，不冒充 Reviewer。
 
 WorkBuddy 负责把自然语言转换为结构化 Task DAG、Directive 或 Resolution。最小 Escalation 集成可定期调用 `aec_s_list_decisions(status="pending")`，按 Decision ID 去重通知 Human，再通过 `aec_s_resolve_decision` 返回决定；AEC-S 不需要聊天记录作为工程记忆。
 
-## GitHub delivery
+## GitHub 交付
 
 完成 `gh auth login` 并确保目标仓库已配置 branch protection 后，把 Project 的 `deliveryMode` 改为 `github`，同时显式配置非空 `requiredChecks`。流程为：fetch → worktree → validation/review → idempotent commit → force-with-lease push → 创建或复用同一 Task PR → required checks → 使用预期 PR head SHA 自动 squash merge → 清理远端分支。
 
@@ -214,6 +214,8 @@ AEC-S 不使用 admin merge，也不绕过 branch protection。真实回归仓�
 正式公共模型保留十个顶层实体：Project、Task、TaskRevision、Run、Agent、Workspace、Finding、Decision、OutboxMessage 与 Event。Runtime Session/健康样本保存在 Run/Agent 内，校准、Gate 和控制事实不扩张为组织实体。
 
 只注册用户信任的仓库和命令。Codex 使用显式 workspace-write/read-only。Kimi Executor Session 使用 ACP `auto` 模式，只对位置完整且经 realpath 确认位于 worktree 内的请求签发单次 Permission；位置缺失、为空、在外部或通过符号链接逃逸时一律拒绝，并持久化 Session ID 供 Repair 恢复。Kimi Review 使用 `plan` 模式且拒绝全部 Permission。DSH Executor 使用 `workspace-write`，Reviewer 不挂载文件工具。Secret 配置会被拒绝，Decision Resolution、Finding/Scope 证据、Outbox、Event 与返回状态中的已知凭据格式会在持久化前脱敏；这种模式匹配防线不能替代“不要把凭据写入 Task 输入”。监督日志、结构化结果、Diff、Runtime 响应和内嵌 Reviewer Prompt 均有硬大小上限。
+
+每个受监督 Runtime 与 Validation 进程树还会进入由 AEC-S 持有的 macOS Seatbelt 策略。进程获得隔离的 `HOME`/XDG/临时目录，不继承 SSH Agent Socket、GitHub Token、用户/系统 Git 配置或 macOS Keychain 服务。除精确声明的 worktree、控制器输出目录、AEC-S 安装目录和所选 Runtime 自身状态外，用户主目录和用户临时数据均不可读；Executor 只能写入 worktree、控制器输出、隔离的临时目录/Home 与 Runtime 状态，Reviewer 不获得 worktree 写权限。AEC-S 会对该内核强制边界进行功能探测；一旦无法执行，所有 Runtime 都会标记为不可用，绝不退回仅靠环境变量的建议性限制。Apple 已弃用 `sandbox-exec` 启动器但仍随 macOS 提供，因此其移除或协议漂移会成为明确的 fail-closed 兼容事件。Runtime 必然需要访问自身的模型服务认证状态；该边界阻止的是无关宿主与 Git 权威的继承，而不是阻止 Runtime 使用使其自身可运行的凭据。
 
 Task 要求的 Environment Contract 组件会在 `prepare` 阶段校验注册命令、版本和 Agent 能力。Scope Calibration 与 Progressive DAG Parking 会记录明确的 `observe|enforce` 策略证据；`observe` 下的 Scope Expansion 必须经 Human Decision 才能准入新 Revision。Drift Budget 触发有界同步事件，Validation 生成文件后还会再次检查 Risk Floor。两种模式下，确定性安全不变量始终执行。
 

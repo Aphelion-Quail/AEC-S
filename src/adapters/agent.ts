@@ -21,6 +21,7 @@ export type AgentInvocation = {
   command: CommandSpec;
   stdin?: string;
   structuredOutputPath: string;
+  runtimeStatePaths?: string[];
 };
 
 export type InvocationOptions = {
@@ -176,6 +177,7 @@ class CodexAdapter extends BaseAdapter {
         command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: 3600 },
         stdin: options.prompt,
         structuredOutputPath: output,
+        runtimeStatePaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
       };
     }
     const args = [
@@ -193,6 +195,7 @@ class CodexAdapter extends BaseAdapter {
       command: { program: this.binary(), args, cwd: options.workspacePath, timeoutSeconds: options.kind === "review" ? 1800 : 3600 },
       stdin: options.prompt,
       structuredOutputPath: output,
+      runtimeStatePaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
     };
   }
 
@@ -278,6 +281,9 @@ class BridgeAdapter extends BaseAdapter {
     const kimiShareDir = typeof this.agent.config.shareDir === "string"
       ? this.agent.config.shareDir
       : this.runtime === "kimi" ? discoverKimiShareDirectory(this.binary()) : undefined;
+    const dshHome = this.runtime === "deepseek_harness" && typeof this.agent.config.dshHome === "string"
+      ? this.agent.config.dshHome
+      : undefined;
     const safeConfig = this.runtime === "kimi"
       ? {
           binary: this.binary(),
@@ -297,7 +303,7 @@ class BridgeAdapter extends BaseAdapter {
             ? { reviewArgs: this.agent.config.reviewArgs.map(String) }
             : { reviewArgs: [this.dshConfig("review")] }),
           ...(typeof this.agent.config.cwd === "string" ? { cwd: this.agent.config.cwd } : {}),
-          ...(typeof this.agent.config.dshHome === "string" ? { dshHome: this.agent.config.dshHome } : {}),
+          ...(dshHome ? { dshHome } : {}),
           ...(typeof this.agent.config.provider === "string" ? { provider: this.agent.config.provider } : {}),
           ...(typeof this.agent.config.model === "string" ? { model: this.agent.config.model } : {}),
           ...(typeof this.agent.config.maxTokens === "number" ? { maxTokens: this.agent.config.maxTokens } : {}),
@@ -312,6 +318,10 @@ class BridgeAdapter extends BaseAdapter {
       },
       stdin: prompt,
       structuredOutputPath: output,
+      runtimeStatePaths: [
+        ...(kimiShareDir ? [kimiShareDir] : []),
+        ...(dshHome ? [dshHome] : []),
+      ],
     };
   }
 

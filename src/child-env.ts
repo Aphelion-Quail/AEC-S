@@ -1,4 +1,5 @@
 import type { ChildEnvironmentProfile } from "./types.js";
+import { nodeCoverageDirectory } from "./isolation.js";
 
 const SAFE_ENVIRONMENT_KEYS = [
   "HOME",
@@ -9,15 +10,11 @@ const SAFE_ENVIRONMENT_KEYS = [
   "NO_COLOR",
   "PATH",
   "SHELL",
-  "SSH_AUTH_SOCK",
   "TERM",
   "TMPDIR",
   "TMP",
   "TEMP",
   "USER",
-  "XDG_CACHE_HOME",
-  "XDG_CONFIG_HOME",
-  "XDG_DATA_HOME",
 ] as const;
 
 const PROFILE_KEYS: Record<Exclude<ChildEnvironmentProfile, "restricted">, readonly string[]> = {
@@ -40,6 +37,8 @@ export function childEnvironment(
 ): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {};
   copyDefined(environment, source, SAFE_ENVIRONMENT_KEYS);
+  const coverageDirectory = nodeCoverageDirectory(source);
+  if (coverageDirectory) environment.NODE_V8_COVERAGE = coverageDirectory;
   if (profile !== "restricted") copyDefined(environment, source, PROFILE_KEYS[profile]);
   return { ...environment, ...overrides };
 }

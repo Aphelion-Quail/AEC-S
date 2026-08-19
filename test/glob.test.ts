@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { globsMayOverlap, matchesAny, tasksConflict } from "../src/glob.js";
+import { repoGlobSchema } from "../src/input.js";
 
 test("matches repository path globs", () => {
   assert.equal(matchesAny("src/core/a.ts", ["src/core/**"]), true);
@@ -48,4 +49,13 @@ test("treats wildcard intersections as conflicts unless disjointness is proven",
     true,
   );
   assert.equal(globsMayOverlap(["src/a/**"], ["src/b/**"]), false);
+});
+
+test("matches adversarial globstars in bounded deterministic time", () => {
+  const glob = `${"**/".repeat(48)}target`;
+  const path = `${"segment/".repeat(256)}miss`;
+  const started = performance.now();
+  assert.equal(matchesAny(path, [glob]), false);
+  assert.ok(performance.now() - started < 1_500);
+  assert.throws(() => repoGlobSchema.parse(`${"**/".repeat(65)}target`), /bounded/);
 });

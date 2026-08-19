@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { AecSDatabase } from "../src/db.js";
-import { deliverSystemOutboxOnce } from "../src/outbox.js";
+import { deliverSystemOutboxOnce, systemOutboxLoop } from "../src/outbox.js";
 import { createGitRepository, tempDir } from "./helpers.js";
 
 test("delivers only successful system Outbox messages and leaves failures retryable", async () => {
@@ -56,4 +56,18 @@ test("recovers an Outbox delivery whose delivering lease expired", async () => {
   }), () => new Date("2026-01-01T00:00:30.000Z")), 1);
   assert.equal(db.listOutbox(project.id).find((candidate) => candidate.id === message.id)?.attempts, 2);
   db.close();
+});
+
+test("keeps the system Outbox loop alive across transient database failures", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const failingDb = {
+    listDeliverableOutbox() {
+      attempts += 1;
+      if (attempts >= 2) controller.abort();
+      throw new Error("database is temporarily locked");
+    },
+  } as unknown as AecSDatabase;
+  await systemOutboxLoop(failingDb, controller.signal, 1);
+  assert.equal(attempts, 2);
 });

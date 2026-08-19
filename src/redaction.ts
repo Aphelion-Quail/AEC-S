@@ -7,6 +7,9 @@ const SECRET_PATTERNS: SecretPattern[] = [
   [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED]"],
   [/\bAIza[0-9A-Za-z_-]{35}\b/g, "[REDACTED]"],
   [/\bxox[baprs]-[A-Za-z0-9-]{10,}\b/g, "[REDACTED]"],
+  [/\bxapp-[A-Za-z0-9-]{10,}\b/g, "[REDACTED]"],
+  [/\bglpat-[A-Za-z0-9_-]{20,}\b/g, "[REDACTED]"],
+  [/\bnpm_[A-Za-z0-9]{20,}\b/g, "[REDACTED]"],
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED]"],
   [/-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----[\s\S]*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g, "[REDACTED]"],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{12,}\b/gi, "[REDACTED]"],
@@ -21,7 +24,13 @@ const SECRET_PATTERNS: SecretPattern[] = [
   [/[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/gi, "[REDACTED]"],
 ];
 
-const SECRET_KEY_PATTERN = /(?:token|password|secret|api[_-]?key|private[_-]?key|credential|authorization)/i;
+const SECRET_KEY_PATTERN = /(?:^|[_-])(?:access[_-]?token|refresh[_-]?token|auth(?:orization)?|password|secret|api[_-]?key|private[_-]?key|credential|token)(?:$|[_-])/i;
+
+function secretKey(key: string): boolean {
+  if (/^(?:tokenUsage|inputTokens|outputTokens|totalTokens)$/i.test(key)) return false;
+  if (SECRET_KEY_PATTERN.test(key)) return true;
+  return /(?:AccessToken|RefreshToken|ApiKey|PrivateKey|Password|Credential|Authorization)$/.test(key);
+}
 
 export function redactText(value: string, maxLength = 4_000): string {
   let result = value;
@@ -37,7 +46,7 @@ export function redactJson<T>(value: T): T {
   if (value && typeof value === "object") {
     return Object.fromEntries(Object.entries(value).map(([key, child]) => [
       key,
-      SECRET_KEY_PATTERN.test(key) ? "[REDACTED]" : redactJson(child),
+      secretKey(key) ? "[REDACTED]" : redactJson(child),
     ])) as T;
   }
   return value;

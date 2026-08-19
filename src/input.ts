@@ -19,23 +19,27 @@ const remoteNameSchema = z.string().min(1).max(160).regex(
   "must be a safe Git remote name",
 );
 
-export const repoGlobSchema = z.string().min(1).refine((value) => {
+export const repoGlobSchema = z.string().min(1).max(512).refine((value) => {
   const normalized = value.replaceAll("\\", "/");
-  return !normalized.includes("\0") && !normalized.startsWith("/") && !normalized.split("/").includes("..");
-}, "must be a repository-relative glob without parent traversal");
+  return !normalized.includes("\0") && !normalized.startsWith("/") && !normalized.split("/").includes("..") &&
+    normalized.split("/").length <= 64 && (normalized.match(/[?*]/g)?.length ?? 0) <= 64;
+}, "must be a bounded repository-relative glob without parent traversal");
 
 export const commandSpecSchema = z.object({
   program: z.string().min(1).refine((value) => !value.includes("\0"), "program contains NUL"),
   args: z.array(z.string()),
   cwd: z.string().optional(),
   timeoutSeconds: z.number().positive().max(86_400).optional(),
+}).strict();
+
+const jobCommandSpecSchema = commandSpecSchema.extend({
   env: z.record(z.string(), z.string()).optional(),
 }).strict();
 
 export const taskScopeSchema = z.object({
-  writeGlobs: z.array(repoGlobSchema),
-  watchGlobs: z.array(repoGlobSchema).optional(),
-  impactGlobs: z.array(repoGlobSchema).optional(),
+  writeGlobs: z.array(repoGlobSchema).max(256),
+  watchGlobs: z.array(repoGlobSchema).max(256).optional(),
+  impactGlobs: z.array(repoGlobSchema).max(256).optional(),
   tags: z.array(z.string().min(1)),
 }).strict().superRefine((value, context) => {
   if (value.watchGlobs === undefined && value.impactGlobs === undefined) {
@@ -92,7 +96,7 @@ const projectBaseSchema = z.object({
   fullValidation: commandListSchema.optional(),
   postMergeSmoke: commandListSchema.optional(),
   requiredChecks: z.array(z.string().min(1)).optional(),
-  highRiskGlobs: z.array(repoGlobSchema).optional(),
+  highRiskGlobs: z.array(repoGlobSchema).max(256).optional(),
   maxConcurrency: z.number().int().min(1).max(64).optional(),
 }).strict();
 
@@ -181,8 +185,17 @@ export const decisionInputSchema = z.object({
 export const resolutionSchema = z.record(z.string(), z.unknown());
 
 export const jobInputSchema = z.object({
-  command: commandSpecSchema,
+  command: jobCommandSpecSchema,
   environmentProfile: z.enum(["restricted", "codex", "kimi", "deepseek_harness"]).optional(),
+  isolation: z.object({
+    workspacePath: z.string().min(1),
+    mode: z.enum(["workspace-write", "read-only"]),
+    controllerPath: z.string().min(1),
+    runtimeStatePaths: z.array(z.string().min(1)).optional(),
+    gitMetadataPaths: z.array(z.string().min(1)).optional(),
+    homePath: z.string().min(1),
+    tempPath: z.string().min(1),
+  }).strict().optional(),
   stdin: z.string().optional(),
   stdoutPath: z.string().min(1),
   stderrPath: z.string().min(1),

@@ -13,4 +13,8 @@ test("rejects option-like Git names and malformed internal Job input", () => {
   assert.throws(() => projectInputSchema.parse({ ...base, targetBranch: "--upload-pack=evil" }));
   assert.throws(() => projectInputSchema.parse({ ...base, remoteName: "-origin" }));
   assert.throws(() => jobInputSchema.parse({ command: { program: "node", args: [] }, stdoutPath: "out" }));
+  assert.throws(() => projectInputSchema.parse({
+    ...base,
+    defaultValidation: [{ program: "node", args: [], env: { SECRET: "not-a-public-command-field" } }],
+  }));
 });

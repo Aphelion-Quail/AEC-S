@@ -1,5 +1,5 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AecSDatabase } from "./db.js";
 import type {
   Agent,
@@ -21,6 +21,7 @@ import type {
   WorkerResult,
   Workspace,
 } from "./types.js";
+import { gitMetadataReadPaths, probeProcessIsolation, runtimeStatePaths } from "./isolation.js";
 import { newId, nowIso } from "./ids.js";
 import { adapterFor, type AgentAdapter, type AgentInvocation } from "./adapters/agent.js";
 import type { RuntimeProbeResult } from "./runtime-probe.js";
@@ -61,6 +62,7 @@ import {
   createOrGetPullRequest,
   deleteRemoteTaskBranch,
   inspectRequiredChecks,
+  githubCheckPollIntervalMs,
   mergePullRequest,
   pushTaskBranch,
   reconcileMergedPullRequest,
@@ -315,6 +317,7 @@ export class AecSEngine {
     const results = new Map<string, RuntimeProbeResult>();
     const probeCache = new Map<string, Promise<RuntimeProbeResult>>();
     const agents = this.db.listAgents().filter((agent) => agent.enabled && agent.availability !== "offline");
+    const isolation = probeProcessIsolation();
     const probes = agents.map((agent) => {
       const cacheKey = JSON.stringify({ adapter: agent.adapter, config: agent.config });
       let pending = probeCache.get(cacheKey);
@@ -323,7 +326,18 @@ export class AecSEngine {
         probeCache.set(cacheKey, pending);
       }
       return pending.then(
-        (probe) => ({ agent, probe }),
+        (probe) => ({
+          agent,
+          probe: isolation.ok ? {
+            ...probe,
+            ...(probe.checks ? { checks: { ...probe.checks, isolation } } : {}),
+          } : {
+            ...probe,
+            ok: false,
+            detail: `Runtime isolation unavailable: ${isolation.detail}`,
+            ...(probe.checks ? { checks: { ...probe.checks, isolation } } : {}),
+          },
+        }),
         (error: unknown) => ({
           agent,
           probe: { ok: false, detail: redactText(error instanceof Error ? error.message : String(error)) } as RuntimeProbeResult,
@@ -1182,7 +1196,7 @@ export class AecSEngine {
       ? String((existing as JsonObject).deadlineAt ?? new Date(Date.now() + 1_800_000).toISOString())
       : new Date(Date.now() + 1_800_000).toISOString();
     if (Date.parse(deadlineAt) <= Date.now()) throw new Error(`Timed out waiting for GitHub checks on PR #${prNumber}`);
-    const intervalMs = Math.max(250, Number(process.env.AEC_S_GITHUB_CHECK_POLL_MS ?? 5_000));
+    const intervalMs = Math.max(250, githubCheckPollIntervalMs());
     const nextAttemptAt = new Date(Date.now() + intervalMs).toISOString();
     run.error = this.failureEvidence(run, { externalWait: { type: "github_checks", startedAt, deadlineAt, nextAttemptAt } });
     run.status = "interrupted";
@@ -1522,6 +1536,10 @@ export class AecSEngine {
     const workspace = this.db.getWorkspace(run.workspaceId);
     if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
     const runtime = this.requireAgent(agentId);
+    const commandStatePath = runtime.adapter === "command"
+      ? join(this.db.paths.home, "runtime-state", agentId)
+      : undefined;
+    if (commandStatePath) mkdirSync(commandStatePath, { recursive: true, mode: 0o700 });
     const authorityHeadSha = run.job?.authorityHeadSha ?? await branchHead(workspace.path, "HEAD");
     const guardedInvocation: AgentInvocation = {
       ...invocation,
@@ -1549,6 +1567,8 @@ export class AecSEngine {
         environmentProfile: runtime.adapter === "command"
           ? "restricted"
           : runtime.adapter,
+        isolationMode: label === "review" ? "read-only" : "workspace-write",
+        runtimeStatePaths: commandStatePath ? [commandStatePath] : invocation.runtimeStatePaths,
       },
     );
     const postHeadSha = await branchHead(workspace.path, "HEAD");
@@ -1573,9 +1593,15 @@ export class AecSEngine {
       agentId?: string;
       authorityHeadSha?: string;
       environmentProfile?: ChildEnvironmentProfile;
+      isolationMode?: "workspace-write" | "read-only";
+      runtimeStatePaths?: string[];
       allowFailure?: boolean;
     } = {},
   ): Promise<JobExecution> {
+    const workspace = this.db.getWorkspace(run.workspaceId);
+    if (!workspace) throw new Error(`Workspace not found: ${run.workspaceId}`);
+    const task = this.requireTask(run.taskId);
+    const project = this.requireProject(task.projectId);
     let job = run.job;
     let input: JobInput;
     if (!job) {
@@ -1596,6 +1622,15 @@ export class AecSEngine {
       input = {
         command,
         ...(options.environmentProfile ? { environmentProfile: options.environmentProfile } : {}),
+        isolation: {
+          workspacePath: workspace.path,
+          mode: options.isolationMode ?? "workspace-write",
+          controllerPath: options.structuredOutputPath ? dirname(options.structuredOutputPath) : run.logDir,
+          runtimeStatePaths: runtimeStatePaths(options.environmentProfile ?? "restricted", options.runtimeStatePaths ?? []),
+          gitMetadataPaths: gitMetadataReadPaths(workspace.path, project.repoPath),
+          homePath: join(run.logDir, "isolation", jobId, "home"),
+          tempPath: join(run.logDir, "isolation", jobId, "tmp"),
+        },
         ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
         stdoutPath: paths.stdout,
         stderrPath: paths.stderr,
@@ -1656,6 +1691,20 @@ export class AecSEngine {
     run.job = undefined;
     if (job.agentId) this.db.releaseAgentSlot(job.id);
     this.saveRun(run);
+    if (job.agentId && result.status === "sandbox_denied") {
+      if (options.isolationMode === "read-only") {
+        throw new AecError(
+          AEC_ERROR.reviewerWorkspaceModified,
+          `Reviewer ${job.agentId} modified the task workspace or attempted another prohibited write`,
+          { reviewerId: job.agentId },
+        );
+      }
+      throw new AecError(
+        AEC_ERROR.runtimeAuthorityViolation,
+        `Runtime authority violation: Agent ${job.agentId} attempted a prohibited host, Git, or out-of-worktree operation`,
+        { agentId: job.agentId, label },
+      );
+    }
     if (!options.allowFailure && (result.status !== "completed" || result.exitCode !== 0)) {
       const stderr = existsSync(input.stderrPath) ? readFileSync(input.stderrPath, "utf8").trim() : "";
       const stdout = existsSync(input.stdoutPath) ? readFileSync(input.stdoutPath, "utf8").trim() : "";
