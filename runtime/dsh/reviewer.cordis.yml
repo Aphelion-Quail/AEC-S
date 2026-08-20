@@ -17,6 +17,19 @@
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
 
+- id: aec-s-run-network
+  name: '@deepseek-ai/dsh-mcp-client'
+  disabled: !!js "!process.env.AEC_S_RUN_MCP_URL || !process.env.AEC_S_RUN_MCP_TOKEN"
+  config:
+    serverName: aec-s-network
+    transport: streamable-http
+    url: !!js process.env.AEC_S_RUN_MCP_URL
+    headers:
+      Authorization: !!js "`Bearer ${process.env.AEC_S_RUN_MCP_TOKEN}`"
+    failOnStartupError: true
+    reconnect:
+      enabled: false
+
 - id: agent-spine
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:

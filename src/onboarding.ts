@@ -1,15 +1,18 @@
-import { existsSync, readFileSync, readdirSync, renameSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, renameSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { AecSDatabase } from "./db.js";
 import { AecSEngine } from "./engine.js";
+import type { AgentAdapter } from "./adapters/agent.js";
 import { execCommand } from "./exec.js";
 import { branchHead, currentBranch, safeGitCommand } from "./git.js";
 import { redactText } from "./redaction.js";
 import { getAecSPaths } from "./paths.js";
 import { serviceAction } from "./service.js";
-import type { AgentInput, Project, ProjectInput } from "./types.js";
+import type { Agent, AgentInput, Project, ProjectInput } from "./types.js";
 import { DSH_COMPATIBILITY, type RuntimeProbeResult } from "./runtime-probe.js";
+import { fingerprint } from "./fingerprint.js";
+import { projectInputSchema } from "./input.js";
 
 export type OnboardingLanguage = "en" | "zh-CN";
 
@@ -33,6 +36,23 @@ export type InitializationResult = {
   runtimes: RuntimeReadiness[];
   nextActions: Array<{ id: string; command?: string }>;
 };
+
+export function registerInspectedProject(db: AecSDatabase, input: ProjectInput): Project {
+  const project = projectInputSchema.parse({ ...input, repoPath: realpathSync(resolve(input.repoPath)) }) as ProjectInput;
+  const existing = db.listProjects().find((candidate) => candidate.repoPath === project.repoPath);
+  if (existing) return existing;
+  if (project.id && db.getProject(project.id)) {
+    const baseId = project.id;
+    const digest = fingerprint(project.repoPath);
+    let length = 8;
+    do {
+      project.id = `${baseId}-${digest.slice(0, length)}`;
+      length += 4;
+    } while (db.getProject(project.id) && length <= digest.length + 4);
+    if (db.getProject(project.id)) throw new Error(`Unable to derive a unique Project ID for ${project.repoPath}`);
+  }
+  return db.createProject(project);
+}
 
 export type HostReadinessCheck = {
   id: "macos" | "node" | "npm" | "git" | "githubCli" | "githubAuth" | "shell" | "path" | "dataDirectory";
@@ -72,7 +92,10 @@ function legacySchemaVersion(database: string): number | undefined {
   }
 }
 
-export async function initializeAecS(options: { installService?: boolean } = {}): Promise<InitializationResult> {
+export async function initializeAecS(options: {
+  installService?: boolean;
+  adapterFactory?: (agent: Agent) => AgentAdapter;
+} = {}): Promise<InitializationResult> {
   let paths = getAecSPaths();
   const version = legacySchemaVersion(paths.database);
   let archivedHome: string | undefined;
@@ -102,11 +125,10 @@ export async function initializeAecS(options: { installService?: boolean } = {})
     for (const registration of registrations) {
       if (!db.getAgent(registration.id!)) db.createAgent({ ...registration, availability: "registered" });
     }
-    const engine = new AecSEngine(db);
-    // Two successful probes recover a Runtime; three consecutive failures
-    // cross the default debounce threshold and make the failure explicit.
-    await engine.refreshAgentAvailability();
-    await engine.refreshAgentAvailability();
+    const engine = new AecSEngine(db, { adapterFactory: options.adapterFactory });
+    // Installation records one real health sample. Repeating the same probe
+    // here would inflate latency and misclassify one transient fault as the
+    // configured multi-sample failure threshold.
     const probes = await engine.refreshAgentAvailability();
     const service = options.installService === false ? "skipped" : await serviceAction("install", paths);
     const runtimes: RuntimeReadiness[] = db.listAgents().map((agent) => {
@@ -245,6 +267,24 @@ function packageManager(repoPath: string, packageJson: { packageManager?: string
   return undefined;
 }
 
+function lockfileSourceHosts(repoPath: string): string[] {
+  const hosts = new Set<string>();
+  for (const filename of ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock"]) {
+    const path = join(repoPath, filename);
+    if (!existsSync(path)) continue;
+    const content = readFileSync(path, "utf8").slice(0, 16 * 1024 * 1024);
+    for (const match of content.matchAll(/https:\/\/[^\s"'<>]+/g)) {
+      try {
+        const url = new URL(match[0].replace(/[),\]}]+$/, ""));
+        const host = url.hostname.toLowerCase().replace(/\.$/, "");
+        if (/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(host) &&
+            !host.endsWith(".local") && !host.endsWith(".localhost")) hosts.add(host);
+      } catch { /* A malformed lock source is ignored and cannot expand network authority. */ }
+    }
+  }
+  return [...hosts];
+}
+
 async function gitValue(repoPath: string, args: string[]): Promise<string | undefined> {
   const result = await execCommand(safeGitCommand(repoPath, args, 30));
   return result.exitCode === 0 ? result.stdout.trim() || undefined : undefined;
@@ -277,8 +317,11 @@ export async function inspectProject(repoPathInput: string): Promise<ProjectInsp
     packageJson = JSON.parse(await (await import("node:fs/promises")).readFile(packageJsonPath, "utf8")) as typeof packageJson;
   }
   const scripts = packageJson.scripts ?? {};
-  const validationNames = ["check", "typecheck", "lint", "test", "test:all", "validate", "build"]
-    .filter((name) => typeof scripts[name] === "string");
+  const validationNames = typeof scripts["test:all"] === "string"
+    ? ["test:all"]
+    : typeof scripts.validate === "string"
+      ? ["validate"]
+      : ["check", "typecheck", "lint", "test", "build"].filter((name) => typeof scripts[name] === "string");
   const docs = ["README.md", "README.zh-CN.md", "ARCHITECTURE.md", "docs/architecture.md"]
     .filter((path) => existsSync(join(repoPath, path)));
   const workflow = workflowFacts(repoPath);
@@ -289,6 +332,16 @@ export async function inspectProject(repoPathInput: string): Promise<ProjectInsp
   const hasRust = existsSync(join(repoPath, "Cargo.toml"));
   const hasGo = existsSync(join(repoPath, "go.mod"));
   const hasPython = existsSync(join(repoPath, "pyproject.toml")) || existsSync(join(repoPath, "pytest.ini"));
+  const dependencyHosts = [
+    ...(existsSync(packageJsonPath) ? ["registry.npmjs.org"] : []),
+    ...(hasFlutter ? ["pub.dev", "storage.googleapis.com"] : []),
+    ...(hasRust ? ["crates.io", "index.crates.io", "static.crates.io"] : []),
+    ...(hasGo ? ["proxy.golang.org", "sum.golang.org"] : []),
+    ...(hasPython ? ["pypi.org", "files.pythonhosted.org"] : []),
+    ...(existsSync(join(repoPath, "build.gradle")) || existsSync(join(repoPath, "build.gradle.kts"))
+      ? ["plugins.gradle.org", "services.gradle.org", "repo.maven.apache.org"] : []),
+    ...lockfileSourceHosts(repoPath),
+  ];
   const stack = [
     ...(existsSync(packageJsonPath) ? ["node"] : []),
     ...(existsSync(join(repoPath, "tsconfig.json")) || dependencies.typescript ? ["typescript"] : []),
@@ -333,6 +386,7 @@ export async function inspectProject(repoPathInput: string): Promise<ProjectInsp
       version: 1,
       components: environmentComponents,
     },
+    operationalConfig: { networkPolicy: { mode: "brokered", dependencyHosts: [...new Set(dependencyHosts)].sort() } },
     defaultValidation: [
       ...validationNames.map((name) => ({ program: managerCommand, args: ["run", name] })),
       ...extraValidations.map((validation) => validation.command),

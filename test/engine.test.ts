@@ -38,6 +38,28 @@ test("reconciles an orphan active Run whose Task is already terminal", async () 
   db.close();
 });
 
+test("fails closed before creating a Run when process isolation is unavailable", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-isolation-unavailable-"));
+  const project = db.createProject({ name: "isolation-unavailable", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "isolated-executor", name: "executor", adapter: "command", roles: ["executor"] });
+  const [task] = new AecSEngine(db).submitGraph(project.id, [{
+    id: "task-isolation-unavailable",
+    projectId: project.id,
+    title: "Refuse advisory execution",
+    goal: "Do not create a Run without Seatbelt",
+    scope: { writeGlobs: ["blocked.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["No execution attempt occurs"],
+  }]);
+  await new AecSEngine(db, {
+    processIsolationProbe: () => ({ ok: false, detail: "synthetic unavailable isolation" }),
+  }).runTask(task!.id);
+  assert.equal(db.getTask(task!.id)?.status, "operational_blocked");
+  assert.equal(db.getLatestRunForTask(task!.id), undefined);
+  assert.equal(db.getAgent(agent.id)?.healthFailures, 0);
+  assert.equal(db.listEvents(project.id).some((event) => event.type === "runtime.isolation_unavailable"), true);
+  db.close();
+});
+
 test("selects the least normalized-loaded eligible Runtime", async () => {
   const db = new AecSDatabase(tempDir("aec-s-runtime-order-"));
   const project = db.createProject({ name: "runtime-order", repoPath: createGitRepository() });
@@ -432,6 +454,86 @@ test("enforces global and Project scheduler concurrency limits", async () => {
     assert.match(timeline[2]!, /:start$/);
     assert.match(timeline[3]!, /:end$/);
   }
+});
+
+test("refills a freed scheduler slot without waiting for the slowest sibling", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-continuous-refill-"));
+  const project = db.createProject({
+    name: "continuous-refill",
+    repoPath: createGitRepository(),
+    maxConcurrency: 3,
+  });
+  db.createAgent({
+    id: "refill-agent",
+    name: "refill agent",
+    adapter: "command",
+    roles: ["executor"],
+    maxConcurrency: 3,
+  });
+  const engine = new AecSEngine(db, { globalConcurrency: 2 });
+  engine.submitGraph(project.id, [
+    { id: "refill-slow", projectId: project.id, title: "Slow", goal: "Finish slowly", scope: { writeGlobs: ["slow.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["done"] },
+    { id: "refill-fast", projectId: project.id, title: "Fast", goal: "Finish quickly", scope: { writeGlobs: ["fast.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["done"] },
+    { id: "refill-third", projectId: project.id, title: "Third", goal: "Use the freed slot", scope: { writeGlobs: ["third.txt"], watchGlobs: [], tags: [] }, acceptanceCriteria: ["done"] },
+  ]);
+  const timeline: string[] = [];
+  const internal = engine as unknown as { runTaskSafely(taskId: string): Promise<void> };
+  internal.runTaskSafely = async (taskId: string) => {
+    timeline.push(`${taskId}:start`);
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, taskId === "refill-slow" ? 100 : 10));
+    db.updateTaskStatus(taskId, "succeeded");
+    timeline.push(`${taskId}:end`);
+  };
+  assert.equal(await engine.runOnce(), 3);
+  assert.ok(timeline.indexOf("refill-third:start") < timeline.indexOf("refill-slow:end"), timeline.join(","));
+  db.close();
+});
+
+test("does not pause scheduling while an unrelated Runtime health probe is pending", async () => {
+  const db = new AecSDatabase(tempDir("aec-s-background-health-"));
+  const project = db.createProject({ name: "background-health", repoPath: createGitRepository() });
+  db.createAgent({ id: "known-executor", name: "known executor", adapter: "command", roles: ["executor"] });
+  db.createAgent({
+    id: "pending-runtime",
+    name: "pending Runtime",
+    adapter: "command",
+    roles: ["executor"],
+    availability: "registered",
+  });
+  let releaseProbe!: () => void;
+  const pendingProbe = new Promise<void>((resolvePromise) => { releaseProbe = resolvePromise; });
+  const engine = new AecSEngine(db, {
+    agentHealthcheckIntervalMs: 1,
+    adapterFactory: (agent) => {
+      const adapter = adapterFor(agent);
+      adapter.probe = async () => {
+        if (agent.id === "pending-runtime") await pendingProbe;
+        return { ok: true, detail: "fixture", version: "fixture/1" };
+      };
+      return adapter;
+    },
+  });
+  const [task] = engine.submitGraph(project.id, [{
+    id: "background-health-task",
+    projectId: project.id,
+    title: "Schedule from last known health",
+    goal: "Do not wait for an unrelated probe",
+    scope: { writeGlobs: ["health.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Task is scheduled"],
+  }]);
+  const internal = engine as unknown as { runTaskSafely(taskId: string): Promise<void> };
+  internal.runTaskSafely = async (taskId: string) => db.updateTaskStatus(taskId, "succeeded");
+  const controller = new AbortController();
+  const daemon = engine.daemon(controller.signal);
+  const deadline = Date.now() + 500;
+  while (db.getTask(task!.id)?.status !== "succeeded" && Date.now() < deadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 10));
+  }
+  assert.equal(db.getTask(task!.id)?.status, "succeeded");
+  controller.abort();
+  releaseProbe();
+  await daemon;
+  db.close();
 });
 
 test("serializes scheduler tasks whose declared Scopes conflict", async () => {
@@ -1274,7 +1376,8 @@ test("keeps cancellation terminal when a supervised validation job is interrupte
     validationCommands: [{ program: process.execPath, args: ["-e", "setInterval(() => {}, 1000)"], timeoutSeconds: 60 }],
   }]);
   const running = engine.runTask(task!.id);
-  for (let count = 0; count < 200; count += 1) {
+  const validationDeadline = Date.now() + 15_000;
+  while (Date.now() < validationDeadline) {
     const run = db.getLatestRunForTask(task!.id);
     if (run?.phase === "validate" && run.job?.pid) break;
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -1287,6 +1390,45 @@ test("keeps cancellation terminal when a supervised validation job is interrupte
   assert.equal(run.status, "failed");
   assert.equal(run.error?.operationalRetry, undefined);
   assert.equal(existsSync(join(repo, "cancel-validation.txt")), false);
+  db.close();
+});
+
+test("rejects pause or cancellation after the merge authority boundary starts", () => {
+  const home = tempDir("aec-s-merge-control-boundary-");
+  const db = new AecSDatabase(home);
+  const project = db.createProject({ name: "merge-control-boundary", repoPath: createGitRepository() });
+  const agent = db.createAgent({ id: "merge-control-agent", name: "executor", adapter: "command", roles: ["executor"] });
+  const task = db.createTask({
+    id: "merge-control-task",
+    projectId: project.id,
+    title: "Finish convergence",
+    goal: "Do not abandon an in-flight merge",
+    scope: { writeGlobs: ["merged.txt"], watchGlobs: [], tags: [] },
+    acceptanceCriteria: ["Merge convergence remains authoritative"],
+  });
+  const timestamp = new Date().toISOString();
+  db.createRun({
+    id: "merge-control-run",
+    taskId: task.id,
+    agentId: agent.id,
+    workspaceId: "merge-control-workspace",
+    phase: "merge",
+    status: "active",
+    attempt: 1,
+    repairCount: 0,
+    rotationCount: 0,
+    baseSha: "base",
+    validation: [],
+    effects: { merge: { operationId: "merge-control", status: "started" } },
+    logDir: home,
+    startedAt: timestamp,
+    updatedAt: timestamp,
+  });
+  db.updateTaskStatus(task.id, "running");
+  const engine = new AecSEngine(db);
+  assert.throws(() => engine.applyDirective({ action: "cancel", taskIds: [task.id] }), /merge authority boundary/);
+  assert.throws(() => engine.applyDirective({ action: "pause", taskIds: [task.id] }), /merge authority boundary/);
+  assert.equal(db.getTask(task.id)?.status, "running");
   db.close();
 });
 
@@ -1455,7 +1597,7 @@ test("automatically retries an operationally blocked Run after the dependency re
   db.close();
 });
 
-test("preserves durable control evidence when a phase becomes operationally blocked", async () => {
+test("archives stale external waits while preserving other durable control evidence", async () => {
   const home = tempDir("aec-s-control-evidence-");
   const db = new AecSDatabase(home);
   const project = db.createProject({ name: "control-evidence", repoPath: createGitRepository() });
@@ -1485,7 +1627,8 @@ test("preserves durable control evidence when a phase becomes operationally bloc
   assert.equal(internal.claimRun(run), true);
   await internal.handlePhaseError(run, new Error("transient validation failure"));
   const stored = db.getRun(run.id)!;
-  assert.ok(stored.error?.externalWait);
+  assert.equal(stored.error?.externalWait, undefined);
+  assert.ok(Array.isArray(stored.error?.externalWaitHistory));
   assert.ok(stored.error?.stabilityObservation);
   assert.ok(stored.error?.postMergeRepair);
   assert.ok(stored.error?.operationalRetry);
@@ -1674,6 +1817,7 @@ test("reconciles enabled Agent health while preserving explicit offline state", 
     name: "health agent",
     adapter: "command",
     roles: ["executor"],
+    availability: "registered",
     config: { binary: "/definitely/missing/aec-s-agent" },
   });
   db.createAgent({
@@ -1690,7 +1834,7 @@ test("reconciles enabled Agent health while preserving explicit offline state", 
   assert.equal(db.getAgent("manual-offline-agent")?.availability, "offline");
   db.updateAgent("health-agent", { config: { binary: process.execPath } });
   await engine.refreshAgentAvailability();
-  assert.equal(db.getAgent("health-agent")?.availability, "healthy");
+  assert.equal(db.getAgent("health-agent")?.availability, "degraded");
   await engine.refreshAgentAvailability();
   assert.equal(db.getAgent("health-agent")?.availability, "available");
   db.close();
@@ -1703,6 +1847,10 @@ test("releases Runtime capacity during the post-merge observation window", async
     name: "observation-capacity",
     repoPath: repo,
     operationalConfig: { stabilityObservationSeconds: 1 },
+    postMergeSmoke: [{
+      program: process.execPath,
+      args: ["-e", "require('node:fs').readFileSync('README.md', 'utf8')"],
+    }],
   });
   registerFakeAgents(db);
   const engine = new AecSEngine(db, { globalConcurrency: 1 });

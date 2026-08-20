@@ -14,12 +14,13 @@ AEC-S 使用了一些仍受其各自许可证约束的第三方软件。PolyForm
 | --- | --- | --- | --- |
 | [Agent Client Protocol TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk) | 0.23.0 | Apache-2.0 | Zed Industries 及贡献者 |
 | [Kimi Agent SDK](https://github.com/MoonshotAI/kimi-agent-sdk) | 0.1.8 | MIT | Moonshot AI |
-| [DeepSeek Harness SDK、Credential seam 与锁定 Runtime composition 包](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
+| [DeepSeek Harness SDK、Credential seam、MCP Client Bridge 与锁定 Runtime composition 包](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
 | [Cordis](https://github.com/cordiverse/cordis) | 4.0.1 | MIT | Cordis 贡献者 |
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
+| [Koffi](https://koffi.dev/) | 3.1.5 | MIT | Koromix 及贡献者 |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-锁定的生产依赖图共包含 193 个软件包：177 个 MIT、1 个 Apache-2.0、5 个 BSD-3-Clause、8 个 ISC、1 个 BSD-2-Clause 和 1 个 Python-2.0。DSH 软件包统一锁定在 `0.1.0-rc.6` 软件包/Runtime 版本线；AEC-S 还会通过初始化握手验证 JSON-RPC Server 身份。版本不匹配时 Runtime 必须不可用，不得回退为 command Adapter。
+锁定的生产依赖图共包含 194 个软件包：178 个 MIT、1 个 Apache-2.0、5 个 BSD-3-Clause、8 个 ISC、1 个 BSD-2-Clause 和 1 个 Python-2.0。DSH 软件包（包括两套 Composition 使用的 MCP Client Bridge）统一锁定在 `0.1.0-rc.6` 软件包/Runtime 版本线；AEC-S 还会通过初始化握手验证 JSON-RPC Server 身份。版本不匹配时 Runtime 必须不可用，不得回退为 command Adapter。
 
 非 MIT 的生产依赖如下：
 

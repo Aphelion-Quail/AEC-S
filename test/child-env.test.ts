@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { childEnvironment } from "../src/child-env.js";
 import { execCommand } from "../src/exec.js";
 import { startSupervisedJob, waitForJob } from "../src/job.js";
 import { tempDir } from "./helpers.js";
+import { writeJsonAtomic } from "../src/files.js";
 
 test("builds capability-scoped child environments", () => {
   const source = {
@@ -15,17 +16,23 @@ test("builds capability-scoped child environments", () => {
     OPENAI_API_KEY: "codex-credential",
     GH_TOKEN: "controller-credential",
     UNRELATED_SECRET: "must-not-pass",
+    AEC_S_RUN_MCP_TOKEN: "run-capability",
+    HTTPS_PROXY: "http://127.0.0.1:1234",
   };
   assert.deepEqual(childEnvironment("restricted", {}, source), { PATH: "/usr/bin", HOME: "/tmp/user" });
   assert.deepEqual(childEnvironment("deepseek_harness", {}, source), {
     PATH: "/usr/bin",
     HOME: "/tmp/user",
     DEEPSEEK_API_KEY: "runtime-credential",
+    AEC_S_RUN_MCP_TOKEN: "run-capability",
+    HTTPS_PROXY: "http://127.0.0.1:1234",
   });
   assert.deepEqual(childEnvironment("codex", {}, source), {
     PATH: "/usr/bin",
     HOME: "/tmp/user",
     OPENAI_API_KEY: "codex-credential",
+    AEC_S_RUN_MCP_TOKEN: "run-capability",
+    HTTPS_PROXY: "http://127.0.0.1:1234",
   });
 });
 
@@ -50,6 +57,9 @@ test("runtime jobs receive only approved credentials without persisting their va
   const inputPath = join(directory, "input.json");
   const outputPath = join(directory, "stdout.log");
   const value = `runtime-${Date.now()}`;
+  const capability = `capability-${Date.now()}`;
+  const capabilityPath = join(directory, "capability.json");
+  writeJsonAtomic(capabilityPath, { AEC_S_RUN_MCP_TOKEN: capability });
   const previousRuntime = process.env.DEEPSEEK_API_KEY;
   const previousUnrelated = process.env.UNRELATED_RUNTIME_SECRET;
   process.env.DEEPSEEK_API_KEY = value;
@@ -62,9 +72,10 @@ test("runtime jobs receive only approved credentials without persisting their va
     const job = startSupervisedJob({
       command: {
         program: process.execPath,
-        args: ["-e", "process.stdout.write(`${process.env.DEEPSEEK_API_KEY ?? 'missing'}:${process.env.UNRELATED_RUNTIME_SECRET ?? 'absent'}`)"],
+        args: ["-e", "process.stdout.write(`${process.env.DEEPSEEK_API_KEY ?? 'missing'}:${process.env.UNRELATED_RUNTIME_SECRET ?? 'absent'}:${Boolean(process.env.AEC_S_RUN_MCP_TOKEN)}`)"],
       },
       environmentProfile: "deepseek_harness",
+      ephemeralEnvironmentPath: capabilityPath,
       isolation: {
         workspacePath,
         mode: "read-only",
@@ -79,8 +90,10 @@ test("runtime jobs receive only approved credentials without persisting their va
       resultPath: join(directory, "result.json"),
     }, inputPath);
     assert.equal((await waitForJob(job, 5)).exitCode, 0);
-    assert.equal(readFileSync(outputPath, "utf8"), `${value}:absent`);
+    assert.equal(readFileSync(outputPath, "utf8"), `${value}:absent:true`);
     assert.equal(readFileSync(inputPath, "utf8").includes(value), false);
+    assert.equal(readFileSync(inputPath, "utf8").includes(capability), false);
+    assert.equal(existsSync(capabilityPath), false);
   } finally {
     if (previousRuntime === undefined) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = previousRuntime;

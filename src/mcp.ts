@@ -287,6 +287,17 @@ export async function serveMcpHttp(db: AecSDatabase, options: McpHttpOptions = {
   app.all("/mcp", (_request: IncomingMessage, response: ServerResponse) => {
     jsonResponse(response, 405, { error: "Method not allowed" });
   });
+  app.use((error: unknown, _request: IncomingMessage, response: ServerResponse, next: (error?: unknown) => void) => {
+    if (response.headersSent) return next(error);
+    const status = error && typeof error === "object" && "status" in error && Number((error as { status?: unknown }).status) === 413
+      ? 413
+      : 400;
+    jsonResponse(response, status, {
+      jsonrpc: "2.0",
+      error: { code: status === 413 ? -32002 : -32700, message: status === 413 ? "Request body too large" : "Invalid request body" },
+      id: null,
+    });
+  });
 
   await new Promise<void>((resolve, reject) => {
     let httpServer: HttpServer | undefined;

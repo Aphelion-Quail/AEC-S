@@ -25,7 +25,7 @@ import type {
 import { agentInputSchema, decisionInputSchema, projectInputSchema, taskInputSchema, taskScopeSchema } from "./input.js";
 import { newId, nowIso } from "./ids.js";
 import { fingerprint } from "./fingerprint.js";
-import { matchesAny } from "./glob.js";
+import { globsMayOverlap } from "./glob.js";
 import { ensureAecSPaths, getAecSPaths, type AecSPaths } from "./paths.js";
 import { isSecretKey, redactJson, redactText } from "./redaction.js";
 
@@ -78,6 +78,7 @@ const DEFAULT_OPERATIONAL_CONFIG = {
   healthRecoveryThreshold: 2,
   healthProbeIntervalSeconds: 60,
   stabilityObservationSeconds: 0,
+  networkPolicy: { mode: "brokered" as const, dependencyHosts: [] as string[] },
 };
 
 const DEFAULT_CONTROL_POLICY = {
@@ -144,7 +145,7 @@ export class AecSDatabase {
 
   private migrate(allowLegacyMigration: boolean): void {
     const currentVersion = Number((this.db.prepare("PRAGMA user_version").get() as Row).user_version ?? 0);
-    const latestVersion = 7;
+    const latestVersion = 9;
     if (currentVersion > latestVersion) {
       throw new Error(`AEC-S database schema ${currentVersion} is newer than supported schema ${latestVersion}`);
     }
@@ -399,6 +400,24 @@ export class AecSDatabase {
       if (!this.tableHasColumn("runs", "metrics_json")) this.db.exec("ALTER TABLE runs ADD COLUMN metrics_json TEXT");
       return;
     }
+    if (version === 8) {
+      if (!this.tableHasColumn("runs", "network_policy_digest")) this.db.exec("ALTER TABLE runs ADD COLUMN network_policy_digest TEXT");
+      if (!this.tableHasColumn("runs", "gateway_status")) this.db.exec("ALTER TABLE runs ADD COLUMN gateway_status TEXT");
+      return;
+    }
+    if (version === 9) {
+      this.db.exec(`
+        CREATE INDEX IF NOT EXISTS idx_tasks_status_priority
+          ON tasks(status, priority DESC, created_at, id);
+        CREATE INDEX IF NOT EXISTS idx_runs_jobs
+          ON runs(started_at) WHERE job_json IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS idx_agent_leases_agent
+          ON agent_leases(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_findings_project_created
+          ON findings(project_id, created_at);
+      `);
+      return;
+    }
     throw new Error(`Unknown AEC-S database migration: ${version}`);
   }
 
@@ -534,6 +553,7 @@ export class AecSDatabase {
             intentVersion: updated.intentVersion,
             environmentContract: updated.environmentContract,
             controlPolicy: updated.controlPolicy,
+            networkPolicy: updated.operationalConfig?.networkPolicy,
           }),
           reason: "calibration",
           createdAt: nowIso(),
@@ -579,9 +599,7 @@ export class AecSDatabase {
     const proposedRiskClass = input.proposedRiskClass ?? "normal";
     const project = this.getProject(input.projectId);
     if (!project) throw new Error(`Project not found: ${input.projectId}`);
-    const pathRisk = input.scope.writeGlobs.some((glob) => project.highRiskGlobs.some((candidate) =>
-      matchesAny(glob.replace(/[*?].*$/, ""), [candidate]) || matchesAny(candidate.replace(/[*?].*$/, ""), [glob])
-    ));
+    const pathRisk = project.highRiskGlobs.length > 0 && globsMayOverlap(input.scope.writeGlobs, project.highRiskGlobs);
     const docsOnly = input.scope.writeGlobs.length > 0 && input.scope.writeGlobs.every((path) =>
       path.endsWith(".md") || path.startsWith("docs/"));
     const effectiveRiskClass = proposedRiskClass === "core" || pathRisk
@@ -603,6 +621,7 @@ export class AecSDatabase {
       intentVersion: project.intentVersion,
       environmentContract: project.environmentContract,
       controlPolicy: project.controlPolicy,
+      networkPolicy: project.operationalConfig?.networkPolicy,
     });
     const task: Task = {
       id: input.id ?? newId("task"),
@@ -705,7 +724,7 @@ export class AecSDatabase {
   listRunnableTasks(): Task[] {
     return (
       this.db
-        .prepare("SELECT * FROM tasks WHERE status IN ('queued', 'ready', 'operational_blocked') ORDER BY priority DESC, created_at, id")
+        .prepare("SELECT * FROM tasks WHERE status='ready' ORDER BY priority DESC, created_at, id")
         .all() as Row[]
     ).map((row) => this.taskFromRow(row));
   }
@@ -842,7 +861,7 @@ export class AecSDatabase {
       throw new Error("Scope expansion must add at least one new write or watch glob");
     }
     const project = this.getProject(task.projectId)!;
-    const hitsRiskFloor = scope.writeGlobs.some((path) => matchesAny(path, project.highRiskGlobs));
+    const hitsRiskFloor = project.highRiskGlobs.length > 0 && globsMayOverlap(scope.writeGlobs, project.highRiskGlobs);
     const docsOnly = scope.writeGlobs.length > 0 && scope.writeGlobs.every((path) =>
       path.endsWith(".md") || path.startsWith("docs/"));
     const effectiveRiskClass = current.effectiveRiskClass === "core" || hitsRiskFloor
@@ -870,6 +889,7 @@ export class AecSDatabase {
         intentVersion: project.intentVersion,
         environmentContract: project.environmentContract,
         controlPolicy: project.controlPolicy,
+        networkPolicy: project.operationalConfig?.networkPolicy,
       }),
       reason: "scope_expansion",
       createdAt: nowIso(),
@@ -1042,6 +1062,9 @@ export class AecSDatabase {
       if (count >= agent.maxConcurrency) return false;
       const result = this.db.prepare("INSERT OR IGNORE INTO agent_leases(job_id, agent_id, run_id, created_at) VALUES (?, ?, ?, ?)")
         .run(jobId, agentId, runId, nowIso());
+      if (result.changes === 1) {
+        this.db.prepare("UPDATE agents SET last_assigned_at=? WHERE id=?").run(nowIso(), agentId);
+      }
       this.db.prepare("UPDATE agents SET current_load=(SELECT COUNT(*) FROM agent_leases WHERE agent_id=?) WHERE id=?")
         .run(agentId, agentId);
       this.db.prepare("UPDATE agents SET availability='busy' WHERE id=? AND availability='available' AND current_load>=max_concurrency")
@@ -1122,11 +1145,12 @@ export class AecSDatabase {
     let availability = agent.availability;
     if (!agent.enabled) availability = "disabled";
     else if (!healthy && failures >= failureThreshold) availability = "unavailable";
+    else if (!healthy && ["available", "busy"].includes(agent.availability)) availability = agent.availability;
     else if (!healthy) availability = "degraded";
-    else if (successes >= recoveryThreshold || ["available", "healthy", "busy"].includes(agent.availability)) {
+    else if (agent.availability === "registered" || successes >= recoveryThreshold || ["available", "healthy", "busy"].includes(agent.availability)) {
       availability = agent.currentLoad >= agent.maxConcurrency ? "busy" : "available";
     }
-    else availability = "healthy";
+    else availability = "degraded";
     this.db.prepare(`UPDATE agents SET health_successes=?, health_failures=?, availability=?, runtime_version=COALESCE(?, runtime_version)
       WHERE id=?`).run(successes, failures, availability, version ?? null, agentId);
     return this.getAgent(agentId)!;
@@ -1142,8 +1166,9 @@ export class AecSDatabase {
         id, task_id, agent_id, workspace_id, phase, status, attempt, repair_count,
         rotation_count, base_sha, codex_session_id, worker_result_json, worker_result_path, validation_json, review_json,
         effects_json, job_json, log_dir, diff_path, error_json, started_at, updated_at, lease_until, lease_owner,
-        runtime_session_id, runtime_version, task_revision_id, context_fingerprint, metrics_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+        runtime_session_id, runtime_version, task_revision_id, context_fingerprint, metrics_json,
+        network_policy_digest, gateway_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(...this.runValues(run));
     const task = this.getTask(run.taskId);
     this.appendEvent({
@@ -1163,7 +1188,8 @@ export class AecSDatabase {
         task_id=?, agent_id=?, workspace_id=?, phase=?, status=?, attempt=?, repair_count=?,
         rotation_count=?, base_sha=?, codex_session_id=?, worker_result_json=?, worker_result_path=?, validation_json=?, review_json=?,
         effects_json=?, job_json=?, log_dir=?, diff_path=?, error_json=?, started_at=?, updated_at=?, lease_until=?, lease_owner=?,
-        runtime_session_id=?, runtime_version=?, task_revision_id=?, context_fingerprint=?, metrics_json=?
+        runtime_session_id=?, runtime_version=?, task_revision_id=?, context_fingerprint=?, metrics_json=?,
+        network_policy_digest=?, gateway_status=?
         WHERE id=? AND lease_owner IS ?`)
       .run(...values.slice(1), run.id, expectedOwner ?? null);
     return result.changes === 1;
@@ -1208,6 +1234,8 @@ export class AecSDatabase {
       run.taskRevisionId ?? null,
       run.contextFingerprint ?? null,
       run.metrics ? JSON.stringify(run.metrics) : null,
+      run.networkPolicyDigest ?? null,
+      run.gatewayStatus ?? null,
     ];
   }
 
@@ -1286,6 +1314,8 @@ export class AecSDatabase {
       ...(row.runtime_version ? { runtimeVersion: String(row.runtime_version) } : {}),
       ...(row.task_revision_id ? { taskRevisionId: String(row.task_revision_id) } : {}),
       ...(row.context_fingerprint ? { contextFingerprint: String(row.context_fingerprint) } : {}),
+      ...(row.network_policy_digest ? { networkPolicyDigest: String(row.network_policy_digest) } : {}),
+      ...(row.gateway_status ? { gatewayStatus: String(row.gateway_status) as Run["gatewayStatus"] } : {}),
       ...(row.metrics_json ? { metrics: json(row.metrics_json, undefined) } : {}),
       ...(row.worker_result_json ? { workerResult: json(row.worker_result_json, undefined) } : {}),
       ...(row.worker_result_path ? { workerResultPath: String(row.worker_result_path) } : {}),
@@ -1517,15 +1547,15 @@ export class AecSDatabase {
     const dismissed = this.db.prepare(`SELECT * FROM findings
       WHERE signature=? AND task_revision_id=? AND status='dismissed' ORDER BY updated_at DESC LIMIT 1`)
       .get(signature, input.taskRevisionId) as Row | undefined;
+    if (dismissed) return this.findingFromRow(dismissed);
     const timestamp = nowIso();
     const finding: Finding = {
       ...input,
       id: newId("finding"),
       signature,
-      status: dismissed ? "dismissed" : "structurally_valid",
+      status: "structurally_valid",
       createdAt: timestamp,
       updatedAt: timestamp,
-      ...(dismissed?.resolution_evidence ? { resolutionEvidence: String(dismissed.resolution_evidence) } : {}),
     };
     this.db.prepare(`INSERT INTO findings(
       id, project_id, task_id, run_id, task_revision_id, signature, status, severity,
@@ -1541,7 +1571,7 @@ export class AecSDatabase {
       projectId: finding.projectId,
       taskId: finding.taskId,
       runId: finding.runId,
-      type: dismissed ? "finding.auto_dismissed" : "finding.created",
+      type: "finding.created",
       payload: { findingId: finding.id, signature },
     });
       return finding;
@@ -1560,6 +1590,13 @@ export class AecSDatabase {
     if (status) { where.push("status=?"); args.push(status); }
     const sql = `SELECT * FROM findings${where.length ? ` WHERE ${where.join(" AND ")}` : ""} ORDER BY created_at`;
     return (this.db.prepare(sql).all(...args) as Row[]).map((row) => this.findingFromRow(row));
+  }
+
+  listProjectFindings(projectId?: string): Finding[] {
+    const rows = projectId
+      ? this.db.prepare("SELECT * FROM findings WHERE project_id=? ORDER BY created_at").all(projectId) as Row[]
+      : this.db.prepare("SELECT * FROM findings ORDER BY created_at").all() as Row[];
+    return rows.map((row) => this.findingFromRow(row));
   }
 
   transitionFinding(
@@ -1758,7 +1795,7 @@ export class AecSDatabase {
       agents: this.listAgents(),
       workspaces: this.listWorkspaces(projectId),
       decisions: this.listDecisions(projectId),
-      findings: tasks.flatMap((task) => this.listFindings(task.id)),
+      findings: this.listProjectFindings(projectId),
       outbox: this.listOutbox(projectId),
       events: this.listEvents(projectId),
     });

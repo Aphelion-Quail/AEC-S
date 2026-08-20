@@ -2,12 +2,13 @@ import { realpathSync } from "node:fs";
 import { relative, sep } from "node:path";
 
 type GlobToken = { kind: "literal"; value: string } | { kind: "one" | "star" | "globstar" | "globstar-slash" };
+type CompiledGlob = { normalized: string; tokens: GlobToken[]; hasWildcard: boolean; literalRoot: string };
 
-const globCache = new Map<string, GlobToken[]>();
+const globCache = new Map<string, CompiledGlob>();
 const MAX_GLOB_CACHE_ENTRIES = 1_024;
 
-function compileGlob(glob: string): GlobToken[] {
-  const normalized = glob.replaceAll("\\", "/").replace(/^\.\//, "");
+function compileGlob(glob: string): CompiledGlob {
+  const normalized = normalizeGlob(glob);
   const cached = globCache.get(normalized);
   if (cached) return cached;
   const tokens: GlobToken[] = [];
@@ -35,17 +36,27 @@ function compileGlob(glob: string): GlobToken[] {
     const oldest = globCache.keys().next().value as string | undefined;
     if (oldest !== undefined) globCache.delete(oldest);
   }
-  globCache.set(normalized, tokens);
-  return tokens;
+  const segments = normalized.split("/");
+  const literal: string[] = [];
+  for (const segment of segments) {
+    if (/[?*]/.test(segment)) break;
+    literal.push(segment);
+  }
+  const hasWildcard = /[?*]/.test(normalized);
+  if (!hasWildcard) literal.pop();
+  const compiled = { normalized, tokens, hasWildcard, literalRoot: literal.join("/") };
+  globCache.set(normalized, compiled);
+  return compiled;
 }
 
 function matchesGlob(path: string, glob: string): boolean {
-  const tokens = compileGlob(glob);
-  const memo = new Map<string, boolean>();
+  const { tokens } = compileGlob(glob);
+  const width = path.length + 1;
+  const memo = new Uint8Array((tokens.length + 1) * width);
   const visit = (tokenIndex: number, pathIndex: number): boolean => {
-    const key = `${tokenIndex}:${pathIndex}`;
-    const known = memo.get(key);
-    if (known !== undefined) return known;
+    const key = tokenIndex * width + pathIndex;
+    const known = memo[key];
+    if (known !== 0) return known === 2;
     const token = tokens[tokenIndex];
     let result: boolean;
     if (!token) {
@@ -61,12 +72,10 @@ function matchesGlob(path: string, glob: string): boolean {
     } else if (token.kind === "globstar") {
       result = visit(tokenIndex + 1, pathIndex) || (pathIndex < path.length && visit(tokenIndex, pathIndex + 1));
     } else {
-      result = visit(tokenIndex + 1, pathIndex);
-      for (let index = pathIndex; !result && index < path.length; index += 1) {
-        if (path[index] === "/") result = visit(tokenIndex + 1, index + 1);
-      }
+      const nextSlash = path.indexOf("/", pathIndex);
+      result = visit(tokenIndex + 1, pathIndex) || (nextSlash >= 0 && visit(tokenIndex, nextSlash + 1));
     }
-    memo.set(key, result);
+    memo[key] = result ? 2 : 1;
     return result;
   };
   return visit(0, 0);
@@ -79,6 +88,12 @@ export function matchesAny(path: string, globs: string[]): boolean {
 
 export function globsMayOverlap(left: string[], right: string[]): boolean {
   if (left.length === 0 || right.length === 0) return true;
+  const leftCompiled = left.map(compileGlob);
+  const rightCompiled = right.map(compileGlob);
+  if (leftCompiled.every((glob) => glob.literalRoot) && rightCompiled.every((glob) => glob.literalRoot)) {
+    const leftTopLevel = new Set(leftCompiled.map((glob) => glob.literalRoot.split("/", 1)[0]!));
+    if (!rightCompiled.some((glob) => leftTopLevel.has(glob.literalRoot.split("/", 1)[0]!))) return false;
+  }
   for (const a of left) {
     for (const b of right) {
       if (globPairMayOverlap(a, b)) return true;
@@ -88,13 +103,13 @@ export function globsMayOverlap(left: string[], right: string[]): boolean {
 }
 
 function globPairMayOverlap(left: string, right: string): boolean {
-  const leftWildcard = /[?*]/.test(left);
-  const rightWildcard = /[?*]/.test(right);
-  if (!leftWildcard && !rightWildcard) return normalizeGlob(left) === normalizeGlob(right);
-  if (!leftWildcard && matchesGlob(normalizeGlob(left), right)) return true;
-  if (!rightWildcard && matchesGlob(normalizeGlob(right), left)) return true;
-  const leftRoot = literalDirectoryRoot(left);
-  const rightRoot = literalDirectoryRoot(right);
+  const leftCompiled = compileGlob(left);
+  const rightCompiled = compileGlob(right);
+  if (!leftCompiled.hasWildcard && !rightCompiled.hasWildcard) return leftCompiled.normalized === rightCompiled.normalized;
+  if (!leftCompiled.hasWildcard) return matchesGlob(leftCompiled.normalized, right);
+  if (!rightCompiled.hasWildcard) return matchesGlob(rightCompiled.normalized, left);
+  const leftRoot = leftCompiled.literalRoot;
+  const rightRoot = rightCompiled.literalRoot;
   if (!leftRoot || !rightRoot) return true;
   return (
     leftRoot === rightRoot ||
@@ -105,17 +120,6 @@ function globPairMayOverlap(left: string, right: string): boolean {
 
 function normalizeGlob(glob: string): string {
   return glob.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
-}
-
-function literalDirectoryRoot(glob: string): string {
-  const segments = normalizeGlob(glob).split("/");
-  const literal: string[] = [];
-  for (const segment of segments) {
-    if (/[?*]/.test(segment)) break;
-    literal.push(segment);
-  }
-  if (!/[?*]/.test(glob)) literal.pop();
-  return literal.join("/");
 }
 
 export function tasksConflict(

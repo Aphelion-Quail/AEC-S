@@ -1,4 +1,4 @@
-import { closeSync, existsSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, openSync, readFileSync, unlinkSync, writeFileSync, writeSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { dirname, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,13 @@ import { readJson, writeJsonAtomic } from "./files.js";
 import { jobInputSchema, jobResultSchema } from "./input.js";
 import { fingerprint } from "./fingerprint.js";
 import { childEnvironment } from "./child-env.js";
-import { descendantProcessIds, killProcessTreeByPid, killRecordedProcesses } from "./process-control.js";
+import {
+  descendantProcessIds,
+  killProcessTreeByPid,
+  killRecordedProcesses,
+  processIdentity,
+  processMatchesIdentity,
+} from "./process-control.js";
 import { isolatedCommand, isolationEnvironment } from "./isolation.js";
 
 function within(root: string, path: string): boolean {
@@ -30,6 +36,77 @@ function assertJobControlPaths(input: JobInput, inputPath: string): void {
   if (within(input.isolation.workspacePath, controller)) {
     throw new Error("Supervised Job controller path must not be writable through the Runtime workspace");
   }
+  if (input.ephemeralEnvironmentPath && !within(controller, input.ephemeralEnvironmentPath)) {
+    throw new Error(`Supervised Job ephemeral environment escapes controller ownership: ${input.ephemeralEnvironmentPath}`);
+  }
+}
+
+type LockedProcess = { pid: number; startedAt?: string };
+type SupervisorLockRecord = {
+  version: 1;
+  supervisor: LockedProcess;
+  command?: Required<LockedProcess>;
+  descendants?: Required<LockedProcess>[];
+};
+
+function readSupervisorLock(path: string): SupervisorLockRecord {
+  const text = readFileSync(path, "utf8").trim();
+  if (/^\d+$/.test(text)) return { version: 1, supervisor: { pid: Number(text) } };
+  const value = JSON.parse(text) as Partial<SupervisorLockRecord>;
+  if (value.version !== 1 || !Number.isInteger(value.supervisor?.pid) || value.supervisor!.pid <= 0) {
+    throw new Error(`Supervised Job lock is malformed: ${path}`);
+  }
+  return value as SupervisorLockRecord;
+}
+
+function lockedProcessAlive(process: LockedProcess): boolean {
+  return process.startedAt ? processMatchesIdentity(process.pid, process.startedAt) : processAlive(process.pid);
+}
+
+async function terminateStaleLockProcesses(record: SupervisorLockRecord): Promise<void> {
+  const recorded = new Map((record.descendants ?? []).map((process) => [process.pid, process.startedAt]));
+  if (record.command && processMatchesIdentity(record.command.pid, record.command.startedAt)) {
+    killProcessTreeByPid(record.command.pid, "SIGKILL", () => {
+      try { process.kill(record.command!.pid, "SIGKILL"); return true; } catch { return false; }
+    });
+  }
+  killRecordedProcesses(recorded, "SIGKILL");
+  const deadline = Date.now() + 2_500;
+  while (Date.now() < deadline) {
+    const commandAlive = record.command ? processMatchesIdentity(record.command.pid, record.command.startedAt) : false;
+    const descendantAlive = [...recorded].some(([pid, startedAt]) => processMatchesIdentity(pid, startedAt));
+    if (!commandAlive && !descendantAlive) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    if (commandAlive && record.command) {
+      killProcessTreeByPid(record.command.pid, "SIGKILL", () => {
+        try { process.kill(record.command!.pid, "SIGKILL"); return true; } catch { return false; }
+      });
+    }
+    killRecordedProcesses(recorded, "SIGKILL");
+  }
+  throw new Error("AEC-S cannot safely recover a Job while its prior command process tree remains alive");
+}
+
+function preflightStaleSupervisor(resultPath: string): void {
+  const lockPath = `${resultPath}.supervisor.lock`;
+  if (!existsSync(lockPath)) return;
+  const pause = new Int32Array(new SharedArrayBuffer(4));
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    let record: SupervisorLockRecord;
+    try { record = readSupervisorLock(lockPath); } catch { return; }
+    if (!lockedProcessAlive(record.supervisor)) {
+      if (record.command && processMatchesIdentity(record.command.pid, record.command.startedAt)) {
+        killProcessTreeByPid(record.command.pid, "SIGKILL", () => {
+          try { process.kill(record.command!.pid, "SIGKILL"); return true; } catch { return false; }
+        });
+      }
+      killRecordedProcesses(new Map((record.descendants ?? []).map((process) => [process.pid, process.startedAt])), "SIGKILL");
+      return;
+    }
+    // A just-signalled supervisor may still be visible for a few scheduler
+    // ticks. Bound this preflight so normal concurrent reconcilers remain cheap.
+    Atomics.wait(pause, 0, 0, 5);
+  }
 }
 
 export async function runJobFile(inputPath: string, expectedDigest: string): Promise<void> {
@@ -40,36 +117,46 @@ export async function runJobFile(inputPath: string, expectedDigest: string): Pro
     throw new Error(`Supervised JobInput integrity check failed: ${inputPath}`);
   }
   const supervisorLock = `${input.resultPath}.supervisor.lock`;
+  const startGatePath = `${input.resultPath}.start`;
   let ownsSupervisorLock = false;
+  let lockRecord: SupervisorLockRecord | undefined;
   const lockDeadline = Date.now() + (input.command.timeoutSeconds ?? 300) * 1_000 + 10_000;
   while (!ownsSupervisorLock) {
     if (existsSync(input.resultPath)) return;
     try {
       const lock = openSync(supervisorLock, "wx", 0o600);
-      try { writeFileSync(lock, `${process.pid}\n`); } finally { closeSync(lock); }
+      try {
+        const startedAt = processIdentity(process.pid);
+        if (!startedAt) throw new Error("AEC-S cannot establish the supervisor process identity");
+        lockRecord = { version: 1, supervisor: { pid: process.pid, startedAt } };
+        writeFileSync(lock, `${JSON.stringify(lockRecord)}\n`);
+        fsyncSync(lock);
+      } finally { closeSync(lock); }
       ownsSupervisorLock = true;
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-      let owner = 0;
-      try { owner = Number(readFileSync(supervisorLock, "utf8").trim()); }
+      let existing: SupervisorLockRecord;
+      try { existing = readSupervisorLock(supervisorLock); }
       catch { continue; }
-      if (!Number.isInteger(owner) || owner <= 0 || !processAlive(owner)) {
+      if (!lockedProcessAlive(existing.supervisor)) {
+        await terminateStaleLockProcesses(existing);
         try { unlinkSync(supervisorLock); } catch { /* Another reconciler won. */ }
         continue;
       }
-      if (Date.now() >= lockDeadline) throw new Error(`Timed out waiting for existing supervisor ${owner}`);
+      if (Date.now() >= lockDeadline) throw new Error(`Timed out waiting for existing supervisor ${existing.supervisor.pid}`);
       await new Promise((resolve) => setTimeout(resolve, 100));
     }
   }
   mkdirSync(dirname(input.stdoutPath), { recursive: true, mode: 0o700 });
   mkdirSync(dirname(input.stderrPath), { recursive: true, mode: 0o700 });
+  try { unlinkSync(startGatePath); } catch { /* A prior supervisor may not have reached its execution gate. */ }
   const startedAt = nowIso();
   const stdout = openSync(input.stdoutPath, "a", 0o600);
   const stderr = openSync(input.stderrPath, "a", 0o600);
   let finished = false;
-    let outputLimitExceeded: string | undefined;
-    let sandboxDenied = false;
-    let stdinError: string | undefined;
+  let outputLimitExceeded: string | undefined;
+  let sandboxDenied = false;
+  let stdinError: string | undefined;
   const outputLimit = 8 * 1024 * 1024;
   let stdoutBytes = 0;
   let stderrBytes = 0;
@@ -79,28 +166,31 @@ export async function runJobFile(inputPath: string, expectedDigest: string): Pro
     closeSync(stdout);
     closeSync(stderr);
     writeJsonAtomic(input.resultPath, { ...result, inputDigest });
+    try { unlinkSync(startGatePath); } catch { /* The result is already durable. */ }
     if (ownsSupervisorLock) {
       try { unlinkSync(supervisorLock); } catch { /* Result is already durable. */ }
     }
   };
   try {
     const environmentProfile = input.environmentProfile ?? "restricted";
-    const launch = isolatedCommand(input.command, input.isolation, environmentProfile);
+    const launch = isolatedCommand(input.command, input.isolation, environmentProfile, startGatePath);
     const isolationOverrides = isolationEnvironment(input.isolation, environmentProfile);
+    const ephemeralEnvironment = input.ephemeralEnvironmentPath && existsSync(input.ephemeralEnvironmentPath)
+      ? readJson<Record<string, string>>(input.ephemeralEnvironmentPath)
+      : {};
+    if (input.ephemeralEnvironmentPath) {
+      try { unlinkSync(input.ephemeralEnvironmentPath); } catch { /* Capability expiry also closes the gateway. */ }
+    }
     const child = spawn(launch.program, launch.args, {
       cwd: launch.cwd,
-      env: childEnvironment(environmentProfile, { ...input.command.env, ...isolationOverrides }),
+      env: childEnvironment(environmentProfile, { ...input.command.env, ...isolationOverrides, ...ephemeralEnvironment }),
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
     const observedDescendants = new Map<number, string>();
-    const recordDescendants = (): void => {
-      for (const [pid, startedAt] of descendantProcessIds(child.pid)) observedDescendants.set(pid, startedAt);
-    };
-    recordDescendants();
-    const descendantCensus = setInterval(recordDescendants, 50);
-    descendantCensus.unref();
+    const detachedRoots = new Map<number, string>();
     let timedOut = false;
+    let descendantTrackingError: string | undefined;
     let terminateTree: NodeJS.Timeout | undefined;
     let forceKill: NodeJS.Timeout | undefined;
     const forwardCancellation = (): void => {
@@ -117,6 +207,101 @@ export async function runJobFile(inputPath: string, expectedDigest: string): Pro
         forceKill.unref();
       }
     };
+    if (!child.pid) throw new Error("AEC-S could not obtain the supervised command PID");
+    let childStartedAt: string | undefined;
+    try {
+      childStartedAt = processIdentity(child.pid);
+      if (!childStartedAt) throw new Error("AEC-S could not establish the supervised command identity");
+    } catch (error) {
+      // The command gate has not been opened yet, but it is still a live child.
+      // Never leave it behind if native process identity cannot be established.
+      killProcessTreeByPid(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
+      throw error;
+    }
+    lockRecord = { ...lockRecord!, command: { pid: child.pid, startedAt: childStartedAt } };
+    writeJsonAtomic(supervisorLock, lockRecord);
+    writeJsonAtomic(startGatePath, { inputDigest, command: lockRecord.command });
+    const recordDescendants = (): void => {
+      if (descendantTrackingError) return;
+      try {
+        let changed = false;
+        const covered = descendantProcessIds(child.pid);
+        const observe = (processes: ReadonlyMap<number, string>): void => {
+          for (const [pid, startedAt] of processes) {
+            covered.set(pid, startedAt);
+            if (observedDescendants.get(pid) === startedAt) continue;
+            observedDescendants.set(pid, startedAt);
+            changed = true;
+          }
+        };
+        observe(covered);
+
+        // Once an observed process has been reparented out of the command
+        // tree, keep only the top of that live subtree as a tracking root.
+        // The roots remain disjoint, so each active process is recursively
+        // enumerated at most once per census instead of once per ancestor.
+        for (const [pid, startedAt] of detachedRoots) {
+          if (covered.get(pid) === startedAt) {
+            detachedRoots.delete(pid);
+            continue;
+          }
+          const currentStartedAt = processIdentity(pid);
+          if (currentStartedAt !== startedAt) {
+            // A zombie can retain children for the brief interval before they
+            // are reparented. Preserve the old last-chance census for a gone
+            // identity, but never walk a PID already reused by another process.
+            if (currentStartedAt === undefined) observe(descendantProcessIds(pid));
+            detachedRoots.delete(pid);
+            if (observedDescendants.get(pid) === startedAt) {
+              observedDescendants.delete(pid);
+              changed = true;
+            }
+            continue;
+          }
+          covered.set(pid, startedAt);
+          observe(descendantProcessIds(pid));
+        }
+
+        // Anything previously observed but no longer covered is either dead
+        // or the root of a newly detached subtree. Identity checks prevent PID
+        // reuse from expanding supervision into an unrelated process tree.
+        for (const [pid, startedAt] of observedDescendants) {
+          if (covered.get(pid) === startedAt) continue;
+          const currentStartedAt = processIdentity(pid);
+          if (currentStartedAt !== startedAt) {
+            if (currentStartedAt === undefined) observe(descendantProcessIds(pid));
+            observedDescendants.delete(pid);
+            detachedRoots.delete(pid);
+            changed = true;
+            continue;
+          }
+          const descendants = descendantProcessIds(pid);
+          // If discovery order temporarily selected a nested process first,
+          // collapse it under the newly identified ancestor on this tick.
+          for (const [descendantPid, descendantStartedAt] of descendants) {
+            if (detachedRoots.get(descendantPid) === descendantStartedAt) detachedRoots.delete(descendantPid);
+          }
+          detachedRoots.set(pid, startedAt);
+          covered.set(pid, startedAt);
+          observe(descendants);
+        }
+        if (changed) {
+          lockRecord = {
+            ...lockRecord!,
+            descendants: [...observedDescendants].map(([pid, startedAt]) => ({ pid, startedAt })),
+          };
+          writeJsonAtomic(supervisorLock, lockRecord);
+        }
+      } catch (error) {
+        descendantTrackingError = error instanceof Error ? error.message : String(error);
+        forwardCancellation();
+      }
+    };
+    recordDescendants();
+    // libproc is fast enough to observe the brief spawn -> setsid -> reparent
+    // window that a ps-based 50 ms census misses.
+    const descendantCensus = setInterval(recordDescendants, process.platform === "darwin" ? 1 : 25);
+    descendantCensus.unref();
     const writeBounded = (descriptor: number, chunk: Buffer, stream: "stdout" | "stderr"): void => {
       const previous = stream === "stdout" ? stdoutBytes : stderrBytes;
       const remaining = Math.max(0, outputLimit - previous);
@@ -163,7 +348,7 @@ export async function runJobFile(inputPath: string, expectedDigest: string): Pro
         finishedAt: nowIso(),
       });
     });
-    child.on("close", (exitCode, signal) => {
+    child.on("close", async (exitCode, signal) => {
       recordDescendants();
       clearInterval(descendantCensus);
       clearTimeout(timeout);
@@ -177,13 +362,25 @@ export async function runJobFile(inputPath: string, expectedDigest: string): Pro
       // entrypoint has completed, even on the nominal success path.
       killProcessTreeByPid(child.pid, "SIGKILL", () => child.kill("SIGKILL"));
       killRecordedProcesses(observedDescendants, "SIGKILL");
+      const convergenceDeadline = Date.now() + 1_000;
+      while (Date.now() < convergenceDeadline && [...observedDescendants].some(([pid, startedAt]) => processMatchesIdentity(pid, startedAt))) {
+        killRecordedProcesses(observedDescendants, "SIGKILL");
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      const escapedDescendants = [...observedDescendants].filter(([pid, startedAt]) => processMatchesIdentity(pid, startedAt));
       process.off("SIGTERM", onSignal);
       process.off("SIGINT", onSignal);
       finish({
-        status: stdinError ? "spawn_error" : outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : sandboxDenied && exitCode !== 0 ? "sandbox_denied" : "completed",
+        status: descendantTrackingError || escapedDescendants.length > 0 || stdinError ? "spawn_error" : outputLimitExceeded ? "output_limit" : timedOut ? "timed_out" : sandboxDenied && exitCode !== 0 ? "sandbox_denied" : "completed",
         exitCode,
         signal,
-        ...(stdinError ? { error: `Failed to deliver supervised Job input: ${stdinError}` } : outputLimitExceeded ? { error: outputLimitExceeded } : {}),
+        ...(descendantTrackingError
+          ? { error: `Failed to track supervised descendants: ${descendantTrackingError}` }
+          : escapedDescendants.length > 0
+            ? { error: `Supervised command left ${escapedDescendants.length} descendant process(es) alive` }
+            : stdinError
+              ? { error: `Failed to deliver supervised Job input: ${stdinError}` }
+              : outputLimitExceeded ? { error: outputLimitExceeded } : {}),
         startedAt,
         finishedAt: nowIso(),
       });
@@ -266,6 +463,7 @@ export function startSupervisedJob(
   assertJobControlPaths(input, inputPath);
   const inputDigest = fingerprint(input);
   writeJsonAtomic(inputPath, input);
+  preflightStaleSupervisor(input.resultPath);
   const pending: JobState = { id: jobId, inputPath, inputDigest, resultPath: input.resultPath, startedAt: nowIso() };
   beforeSpawn?.(pending);
   const compiledEntry = fileURLToPath(new URL("./cli.js", import.meta.url));

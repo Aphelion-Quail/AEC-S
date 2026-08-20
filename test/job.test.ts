@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { processAlive, runJobFile, startSupervisedJob, waitForJob } from "../src/job.js";
-import { execCommand } from "../src/exec.js";
+import { execCommand, execCommandToFile } from "../src/exec.js";
 import { tempDir } from "./helpers.js";
 import type { JobInput } from "../src/types.js";
 import { writeJsonAtomic } from "../src/files.js";
@@ -68,8 +68,33 @@ test("bounds captured command output in memory", async () => {
     timeoutSeconds: 10,
   });
   assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /\[output truncated\]/);
-  assert.ok(result.stdout.length <= 8 * 1024 * 1024);
+  assert.ok(result.stdout.endsWith("\n[output truncated]\n"));
+  assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 8 * 1024 * 1024);
+});
+
+test("bounds invalid UTF-8 command output after decoding", async () => {
+  const result = await execCommand({
+    program: process.execPath,
+    args: ["-e", "process.stdout.write(Buffer.alloc(8 * 1024 * 1024, 0xff))"],
+    timeoutSeconds: 10,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.ok(result.stdout.endsWith("\n[output truncated]\n"));
+  assert.ok(Buffer.byteLength(result.stdout, "utf8") <= 8 * 1024 * 1024);
+});
+
+test("bounds stderr while streaming command output to a file", async () => {
+  const directory = tempDir("aec-s-command-file-output-");
+  const outputPath = join(directory, "stdout.log");
+  const result = await execCommandToFile({
+    program: process.execPath,
+    args: ["-e", "process.stdout.write('file output'); for(let i=0;i<9216;i++) process.stderr.write('x'.repeat(1024))"],
+    timeoutSeconds: 10,
+  }, outputPath);
+  assert.equal(result.exitCode, 0);
+  assert.equal(readFileSync(outputPath, "utf8"), "file output");
+  assert.ok(result.stderr.endsWith("\n[output truncated]\n"));
+  assert.ok(Buffer.byteLength(result.stderr, "utf8") <= 8 * 1024 * 1024);
 });
 
 test("terminates supervised commands that exceed the durable log limit", async () => {
@@ -110,6 +135,38 @@ test("deduplicates supervisors across the persisted pre-spawn crash window", asy
   assert.equal(readFileSync(marker, "utf8"), "once");
 });
 
+test("kills the prior command before recovering a supervisor crash after spawn", async () => {
+  const directory = tempDir("aec-s-supervisor-post-spawn-");
+  const spawned = join(directory, "workspace", "spawned.txt");
+  const sideEffect = join(directory, "workspace", "side-effect.txt");
+  const input = isolated(directory, {
+    command: {
+      program: process.execPath,
+      args: ["-e", `
+        const fs=require('node:fs');
+        fs.writeFileSync(${JSON.stringify(spawned)},String(process.pid));
+        setTimeout(()=>fs.appendFileSync(${JSON.stringify(sideEffect)},process.pid+':'+Date.now()+'\\n'),500);
+        setTimeout(()=>process.exit(0),900);
+      `],
+      timeoutSeconds: 5,
+    },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  });
+  const inputPath = join(directory, "input.json");
+  const first = startSupervisedJob(input, inputPath, "recover-after-spawn");
+  const spawnDeadline = Date.now() + 3_000;
+  while (!existsSync(spawned) && Date.now() < spawnDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(existsSync(spawned), true);
+  assert.ok(first.pid);
+  process.kill(first.pid!, "SIGKILL");
+  const reconciler = startSupervisedJob(input, inputPath, "recover-after-spawn");
+  assert.equal((await waitForJob(reconciler, 5)).status, "completed");
+  const sideEffects = readFileSync(sideEffect, "utf8").trim().split(/\r?\n/);
+  assert.equal(sideEffects.length, 1, sideEffects.join(", "));
+});
+
 test("kills Agent descendant processes when a supervised command times out", async () => {
   const directory = tempDir("aec-s-process-tree-");
   const marker = join(directory, "descendant-write.txt");
@@ -141,6 +198,78 @@ test("kills a detached Runtime descendant recorded before the entrypoint exits",
   assert.equal((await waitForJob(job, 5)).exitCode, 0);
   await new Promise((resolve) => setTimeout(resolve, 1_000));
   assert.equal(existsSync(marker), false);
+});
+
+test("kills a detached Runtime descendant when the entrypoint exits immediately", async () => {
+  if (process.platform !== "darwin") return;
+  for (let trial = 0; trial < 5; trial += 1) {
+    const directory = tempDir(`aec-s-rapid-detached-${trial}-`);
+    const marker = join(directory, "workspace", "detached-write.txt");
+    const grandchild = `setTimeout(() => require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'leaked'), 700);setTimeout(()=>process.exit(0),900)`;
+    const parent = `const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(grandchild)}],{detached:true,stdio:'ignore'});child.unref();process.exit(0)`;
+    const job = startSupervisedJob(isolated(directory, {
+      command: { program: process.execPath, args: ["-e", parent], timeoutSeconds: 5 },
+      stdoutPath: join(directory, "stdout.log"),
+      stderrPath: join(directory, "stderr.log"),
+      resultPath: join(directory, "result.json"),
+    }), join(directory, "input.json"));
+    assert.equal((await waitForJob(job, 5)).status, "completed");
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    assert.equal(existsSync(marker), false, `trial ${trial} leaked a detached descendant`);
+  }
+});
+
+test("tracks a detached subtree after its original parent exits", async () => {
+  if (process.platform !== "darwin") return;
+  const directory = tempDir("aec-s-reparented-subtree-");
+  const marker = join(directory, "workspace", "late-descendant-write.txt");
+  const leaf = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'leaked'),1200);setTimeout(()=>process.exit(0),1400)`;
+  const helper = `const {spawn}=require('node:child_process');setTimeout(()=>{const child=spawn(process.execPath,['-e',${JSON.stringify(leaf)}],{detached:true,stdio:'ignore'});child.unref()},500);setTimeout(()=>process.exit(0),750)`;
+  const intermediary = `const {spawn}=require('node:child_process');const child=spawn(process.execPath,['-e',${JSON.stringify(helper)}],{detached:true,stdio:'ignore'});child.unref();setTimeout(()=>process.exit(0),200)`;
+  const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(intermediary)}],{stdio:'ignore'});setTimeout(()=>process.exit(0),1000)`;
+  const job = startSupervisedJob(isolated(directory, {
+    command: { program: process.execPath, args: ["-e", parent], timeoutSeconds: 5 },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath: join(directory, "result.json"),
+  }), join(directory, "input.json"));
+  assert.equal((await waitForJob(job, 5)).status, "completed");
+  await new Promise((resolve) => setTimeout(resolve, 1_000));
+  assert.equal(existsSync(marker), false);
+});
+
+test("prunes exited descendant identities while the command remains active", async () => {
+  if (process.platform !== "darwin") return;
+  const directory = tempDir("aec-s-descendant-pruning-");
+  const pidPath = join(directory, "workspace", "short-child.pid");
+  const resultPath = join(directory, "result.json");
+  const shortChild = `require('node:fs').writeFileSync(${JSON.stringify(pidPath)},String(process.pid));setTimeout(()=>process.exit(0),600)`;
+  const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(shortChild)}],{stdio:'ignore'});setTimeout(()=>process.exit(0),2500)`;
+  const job = startSupervisedJob(isolated(directory, {
+    command: { program: process.execPath, args: ["-e", parent], timeoutSeconds: 5 },
+    stdoutPath: join(directory, "stdout.log"),
+    stderrPath: join(directory, "stderr.log"),
+    resultPath,
+  }), join(directory, "input.json"));
+  const pidDeadline = Date.now() + 2_000;
+  while (!existsSync(pidPath) && Date.now() < pidDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(existsSync(pidPath), true);
+  const shortPid = Number(readFileSync(pidPath, "utf8"));
+  const lockPath = `${resultPath}.supervisor.lock`;
+  const includesShortPid = (): boolean => {
+    try {
+      const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { descendants?: Array<{ pid: number }> };
+      return lock.descendants?.some(({ pid }) => pid === shortPid) ?? false;
+    } catch { return false; }
+  };
+  const observedDeadline = Date.now() + 1_000;
+  while (!includesShortPid() && Date.now() < observedDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(includesShortPid(), true, "short-lived descendant was never persisted");
+  const pruneDeadline = Date.now() + 1_500;
+  while (includesShortPid() && Date.now() < pruneDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
+  assert.equal(includesShortPid(), false, "dead descendant identity remained in the hot census set");
+  assert.equal(existsSync(resultPath), false, "command exited before descendant pruning was observed");
+  assert.equal((await waitForJob(job, 5)).status, "completed");
 });
 
 test("kills descendant processes when a direct command times out", async () => {

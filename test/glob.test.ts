@@ -49,6 +49,8 @@ test("treats wildcard intersections as conflicts unless disjointness is proven",
     true,
   );
   assert.equal(globsMayOverlap(["src/a/**"], ["src/b/**"]), false);
+  assert.equal(globsMayOverlap(["feature.txt"], ["critical/**"]), false);
+  assert.equal(globsMayOverlap(["critical/config.ts"], ["critical/**"]), true);
 });
 
 test("matches adversarial globstars in bounded deterministic time", () => {

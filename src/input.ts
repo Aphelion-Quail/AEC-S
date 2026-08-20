@@ -83,6 +83,13 @@ const operationalConfigSchema = z.object({
   driftMaxCommits: z.number().int().min(1).optional(),
   driftMaxSeconds: z.number().int().min(1).optional(),
   stabilityObservationSeconds: z.number().int().min(0).optional(),
+  networkPolicy: z.object({
+    mode: z.literal("brokered"),
+    dependencyHosts: z.array(z.string().min(1).max(253).regex(
+      /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
+      "must be a lowercase public DNS hostname",
+    )).max(128),
+  }).strict().optional(),
 }).strict();
 const controlPolicySchema = z.object({
   version: z.number().int().min(1).optional(),
@@ -201,11 +208,13 @@ export const resolutionSchema = boundedJsonRecordSchema;
 export const jobInputSchema = z.object({
   command: jobCommandSpecSchema,
   environmentProfile: z.enum(["restricted", "codex", "kimi", "deepseek_harness"]).optional(),
+  ephemeralEnvironmentPath: pathSchema.optional(),
   isolation: z.object({
     workspacePath: pathSchema,
     workspaceAccess: z.enum(["full", "metadata"]).optional(),
     mode: z.enum(["workspace-write", "read-only"]),
     networkAccess: z.enum(["none", "provider"]),
+    loopbackPorts: z.array(z.number().int().min(1).max(65_535)).max(8).optional(),
     controllerPath: pathSchema,
     runtimeOutputPath: pathSchema,
     evidenceReadPaths: z.array(pathSchema).max(32).optional(),

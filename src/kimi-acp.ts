@@ -223,6 +223,7 @@ export async function runKimiAcp(options: KimiAcpOptions & {
   thinkingLevel?: string;
   agentFile?: string;
   signal?: AbortSignal;
+  mcpServers?: acp.McpServer[];
 }): Promise<KimiAcpRunResult> {
   const permissionSummary = { requested: 0, allowedOnce: 0, rejected: 0, toolKinds: [] as string[] };
   let text = "";
@@ -292,15 +293,15 @@ export async function runKimiAcp(options: KimiAcpOptions & {
       // is the durable reconstruction operation; `resume` is the fallback for
       // agents that support continuation without replaying history.
       if (initialized.agentCapabilities?.loadSession) {
-        setup = await connection.loadSession({ sessionId: options.sessionId, cwd: options.workspace, mcpServers: [] });
+        setup = await connection.loadSession({ sessionId: options.sessionId, cwd: options.workspace, mcpServers: options.mcpServers ?? [] });
       } else if (initialized.agentCapabilities?.sessionCapabilities?.resume != null) {
-        setup = await connection.resumeSession({ sessionId: options.sessionId, cwd: options.workspace, mcpServers: [] });
+        setup = await connection.resumeSession({ sessionId: options.sessionId, cwd: options.workspace, mcpServers: options.mcpServers ?? [] });
       } else {
         throw new Error("Kimi ACP cannot resume the persisted Runtime Session");
       }
       activeSessionId = options.sessionId;
     } else {
-      const created = await connection.newSession({ cwd: options.workspace, mcpServers: [] });
+      const created = await connection.newSession({ cwd: options.workspace, mcpServers: options.mcpServers ?? [] });
       setup = created;
       activeSessionId = created.sessionId;
     }

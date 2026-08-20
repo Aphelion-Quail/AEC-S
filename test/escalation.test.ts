@@ -78,6 +78,43 @@ test("creates an immediate typed Decision for a non-technical Worker blocker", a
   db.close();
 });
 
+test("rejects undeclared Decision actions and cannot revive a terminal Task", () => {
+  const db = new AecSDatabase(tempDir("aec-s-decision-authority-"));
+  const project = db.createProject({ name: "decision-authority", repoPath: createGitRepository() });
+  const engine = new AecSEngine(db);
+  const [task] = engine.submitGraph(project.id, [{
+    id: "decision-authority-task",
+    projectId: project.id,
+    title: "Bound decision authority",
+    goal: "Only declared actions may change state",
+    scope: { writeGlobs: ["authority.txt"], impactGlobs: [], tags: [] },
+    acceptanceCriteria: ["Decision authority remains bounded"],
+  }]);
+  const recordOnly = db.createDecision({
+    projectId: project.id,
+    taskId: task!.id,
+    kind: "record",
+    title: "Record only",
+    body: "This decision cannot resume work",
+    options: ["record"],
+  });
+  assert.throws(() => engine.resolveDecision(recordOnly.id, { action: "resume_task" }), /does not permit action/);
+  assert.equal(db.getDecision(recordOnly.id)?.status, "pending");
+  const staleResume = db.createDecision({
+    projectId: project.id,
+    taskId: task!.id,
+    kind: "direction",
+    title: "Potentially stale resume",
+    body: "Cancellation must remain terminal",
+    options: ["resume_task"],
+  });
+  engine.applyDirective({ action: "cancel", taskIds: [task!.id] });
+  assert.throws(() => engine.resolveDecision(staleResume.id, { action: "resume_task" }), /cannot change terminal Task/);
+  assert.equal(db.getTask(task!.id)?.status, "cancelled");
+  assert.equal(db.getDecision(staleResume.id)?.status, "pending");
+  db.close();
+});
+
 test("resolves replace_task by creating an immutable replacement in the same Project", () => {
   const db = new AecSDatabase(tempDir("aec-s-replacement-"));
   const project = db.createProject({ name: "replacement", repoPath: createGitRepository() });

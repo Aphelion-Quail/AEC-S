@@ -17,6 +17,11 @@ const SAFE_ENVIRONMENT_KEYS = [
   "USER",
 ] as const;
 
+const RUNTIME_BROKER_KEYS = [
+  "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY", "NO_PROXY", "NODE_USE_ENV_PROXY",
+  "AEC_S_RUN_MCP_URL", "AEC_S_RUN_MCP_TOKEN",
+] as const;
+
 const PROFILE_KEYS: Record<Exclude<ChildEnvironmentProfile, "restricted">, readonly string[]> = {
   codex: ["CODEX_HOME", "OPENAI_API_KEY"],
   kimi: ["KIMI_SHARE_DIR", "MOONSHOT_API_KEY"],
@@ -39,6 +44,9 @@ export function childEnvironment(
   copyDefined(environment, source, SAFE_ENVIRONMENT_KEYS);
   const coverageDirectory = nodeCoverageDirectory(source);
   if (coverageDirectory) environment.NODE_V8_COVERAGE = coverageDirectory;
-  if (profile !== "restricted") copyDefined(environment, source, PROFILE_KEYS[profile]);
+  if (profile !== "restricted") {
+    copyDefined(environment, source, PROFILE_KEYS[profile]);
+    copyDefined(environment, source, RUNTIME_BROKER_KEYS);
+  }
   return { ...environment, ...overrides };
 }

@@ -7,8 +7,10 @@ import {
   formatInitialization,
   formatProjectInspection,
   inspectProject,
+  registerInspectedProject,
   type InitializationResult,
 } from "../src/onboarding.js";
+import { AecSDatabase } from "../src/db.js";
 import { builtCliPath, createGitRepository, tempDir } from "./helpers.js";
 
 function onboardingRepository(): string {
@@ -50,7 +52,58 @@ test("detects project toolchain, validation, CI, and Required Check candidates",
   assert.deepEqual(inspected.detected.ciWorkflows, ["CI"]);
   assert.deepEqual(inspected.detected.requiredCheckCandidates, ["Quality Gate"]);
   assert.deepEqual(inspected.project.environmentContract?.components.map((component) => component.id), ["git", "node", "package-manager"]);
+  assert.deepEqual(inspected.project.operationalConfig?.networkPolicy, { mode: "brokered", dependencyHosts: ["registry.npmjs.org"] });
   assert.deepEqual(inspected.detected.requiredHumanConfirmation, ["intent", "deliveryMode", "authoritativeGates"]);
+});
+
+test("prefers one aggregate validation script over redundant component scripts", async () => {
+  const repo = onboardingRepository();
+  const packageJson = {
+    name: "guided-project",
+    packageManager: "npm@11.6.0",
+    engines: { node: ">=26" },
+    scripts: {
+      check: "tsc --noEmit",
+      lint: "oxlint .",
+      test: "node --test",
+      validate: "npm run check && npm run test",
+      "test:all": "npm run lint && npm run validate",
+    },
+  };
+  writeFileSync(join(repo, "package.json"), JSON.stringify(packageJson, null, 2));
+  const all = await inspectProject(repo);
+  assert.deepEqual(all.detected.validationCandidates, ["test:all"]);
+  assert.deepEqual(all.project.defaultValidation, [{ program: "npm", args: ["run", "test:all"] }]);
+
+  delete (packageJson.scripts as Partial<typeof packageJson.scripts>)["test:all"];
+  writeFileSync(join(repo, "package.json"), JSON.stringify(packageJson, null, 2));
+  const validate = await inspectProject(repo);
+  assert.deepEqual(validate.detected.validationCandidates, ["validate"]);
+  assert.deepEqual(validate.project.defaultValidation, [{ program: "npm", args: ["run", "validate"] }]);
+});
+
+test("registers same-named repositories with stable unique IDs and deduplicates the same path", () => {
+  const home = tempDir("aec-s-import-id-");
+  const root = tempDir("aec-s-same-name-");
+  const firstPath = join(root, "first", "same-name");
+  const secondPath = join(root, "second", "same-name");
+  mkdirSync(firstPath, { recursive: true });
+  mkdirSync(secondPath, { recursive: true });
+  const db = new AecSDatabase(home);
+  const base = {
+    id: "same-name",
+    name: "same-name",
+    targetBranch: "main",
+    intent: "fixture",
+  };
+  const first = registerInspectedProject(db, { ...base, repoPath: firstPath });
+  const duplicate = registerInspectedProject(db, { ...base, repoPath: firstPath });
+  const second = registerInspectedProject(db, { ...base, repoPath: secondPath });
+  assert.equal(duplicate.id, first.id);
+  assert.notEqual(second.id, first.id);
+  assert.match(second.id, /^same-name-[a-f0-9]{8,}$/);
+  assert.equal(db.listProjects().length, 2);
+  db.close();
 });
 
 test("never prints embedded Git remote credentials during project inspection", async () => {
@@ -59,6 +112,16 @@ test("never prints embedded Git remote credentials during project inspection", a
   const inspected = await inspectProject(repo);
   assert.equal(inspected.detected.remoteUrl?.includes("super-secret-password"), false);
   assert.equal(formatProjectInspection(inspected, "en").includes("super-secret-password"), false);
+});
+
+test("detects HTTPS lockfile sources without admitting local addresses", async () => {
+  const repo = onboardingRepository();
+  writeFileSync(join(repo, "package-lock.json"), JSON.stringify({ packages: {
+    "node_modules/example": { resolved: "https://cdn.example.org/example.tgz" },
+    "node_modules/local": { resolved: "https://127.0.0.1/private.tgz" },
+  } }));
+  const inspected = await inspectProject(repo);
+  assert.deepEqual(inspected.project.operationalConfig?.networkPolicy?.dependencyHosts, ["cdn.example.org", "registry.npmjs.org"]);
 });
 
 test("renders a bilingual ready path without asking for repeated credential setup", () => {

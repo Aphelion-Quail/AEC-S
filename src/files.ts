@@ -1,18 +1,24 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 
 export function writeJsonAtomic(path: string, value: unknown): void {
+  const serialized = `${JSON.stringify(value, null, 2)}\n`;
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const temp = `${path}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`;
-  const descriptor = openSync(temp, "w", 0o600);
   try {
-    writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
-    fsyncSync(descriptor);
-  } finally {
-    closeSync(descriptor);
+    const descriptor = openSync(temp, "w", 0o600);
+    try {
+      writeFileSync(descriptor, serialized);
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temp, path);
+  } catch (error) {
+    try { rmSync(temp, { force: true }); } catch { /* Preserve the originating filesystem error. */ }
+    throw error;
   }
-  renameSync(temp, path);
   const directory = openSync(dirname(path), "r");
   try { fsyncSync(directory); } finally { closeSync(directory); }
 }

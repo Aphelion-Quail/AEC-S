@@ -19,6 +19,75 @@ test("proves the required macOS process isolation primitive", macOnly, () => {
   assert.equal(probeProcessIsolation().ok, true);
 });
 
+test("limits provider network access to declared loopback brokers", macOnly, async () => {
+  const root = tempDir("aec-s-loopback-network-");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(controller, { recursive: true });
+  const allowed = createServer((socket) => { socket.on("error", () => undefined); socket.end("ok"); });
+  const denied = createServer((socket) => { socket.on("error", () => undefined); socket.end("unexpected"); });
+  await Promise.all([new Promise<void>((resolve) => allowed.listen(0, "127.0.0.1", resolve)), new Promise<void>((resolve) => denied.listen(0, "127.0.0.1", resolve))]);
+  const allowedPort = (allowed.address() as { port: number }).port;
+  const deniedPort = (denied.address() as { port: number }).port;
+  const stdoutPath = join(controller, "stdout.log");
+  const program = `
+    const net=require('node:net');
+    const attempt=(port)=>new Promise(resolve=>{const socket=net.connect(port,'127.0.0.1');socket.once('connect',()=>{socket.destroy();resolve('connected')});socket.once('error',error=>resolve(error.code));});
+    Promise.all([attempt(${allowedPort}),attempt(${deniedPort})]).then(value=>process.stdout.write(JSON.stringify(value)));
+  `;
+  try {
+    const job = startSupervisedJob({
+      command: { program: process.execPath, args: ["-e", program], cwd: workspace, timeoutSeconds: 10 },
+      isolation: {
+        workspacePath: workspace, mode: "read-only", networkAccess: "provider", loopbackPorts: [allowedPort],
+        controllerPath: controller, runtimeOutputPath: join(controller, "runtime-output"),
+        homePath: join(controller, "home"), tempPath: join(controller, "tmp"),
+      },
+      stdoutPath, stderrPath: join(controller, "stderr.log"), resultPath: join(controller, "result.json"),
+    }, join(controller, "input.json"));
+    assert.equal((await waitForJob(job, 15)).exitCode, 0);
+    assert.deepEqual(JSON.parse(readFileSync(stdoutPath, "utf8")), ["connected", "EPERM"]);
+  } finally {
+    allowed.close();
+    denied.close();
+  }
+});
+
+test("denies Finder and System Events AppleEvent access", macOnly, async () => {
+  const root = tempDir("aec-s-appleevent-isolation-");
+  const workspace = join(root, "workspace");
+  const controller = join(root, "controller");
+  mkdirSync(workspace, { recursive: true, mode: 0o700 });
+  mkdirSync(controller, { recursive: true, mode: 0o700 });
+  for (const target of ["Finder", "System Events"]) {
+    const stdoutPath = join(controller, `${target}.stdout.log`);
+    const job = startSupervisedJob({
+      command: {
+        program: "/usr/bin/osascript",
+        args: ["-e", `tell application "${target}" to get name`],
+        cwd: workspace,
+        timeoutSeconds: 5,
+      },
+      isolation: {
+        workspacePath: workspace,
+        mode: "workspace-write",
+        networkAccess: "none",
+        controllerPath: controller,
+        runtimeOutputPath: join(controller, `${target}-runtime-output`),
+        homePath: join(controller, `${target}-home`),
+        tempPath: join(controller, `${target}-tmp`),
+      },
+      stdoutPath,
+      stderrPath: join(controller, `${target}.stderr.log`),
+      resultPath: join(controller, `${target}.result.json`),
+    }, join(controller, `${target}.input.json`));
+    const result = await waitForJob(job, 10);
+    assert.notEqual(result.exitCode, 0, `${target} AppleEvent unexpectedly succeeded`);
+    assert.doesNotMatch(readFileSync(stdoutPath, "utf8"), new RegExp(target));
+  }
+});
+
 test("maps Kimi authentication into isolated HOME with explicit Runtime state grants", () => {
   const root = tempDir("aec-s-kimi-isolated-home-");
   const share = join(root, ".kimi-code");
@@ -362,6 +431,7 @@ test("denies network access unless a first-class Runtime receives the explicit p
         workspacePath: workspace,
         mode: "read-only",
         networkAccess: "provider",
+        loopbackPorts: [address.port],
         controllerPath: controller,
         runtimeOutputPath: join(controller, "provider-runtime-output"),
         homePath: join(controller, "provider-home"),

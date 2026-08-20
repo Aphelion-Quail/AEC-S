@@ -30,6 +30,15 @@ test("DSH compositions fail closed when required workspace state is absent", () 
   assert.doesNotMatch(executor, /DSH_CWD\s*\?\?\s*process\.cwd/);
 });
 
+test("Runtime protocol identities use authoritative version sources", () => {
+  const probe = readFileSync(join(root, "src", "runtime-probe.ts"), "utf8");
+  const liveGate = readFileSync(join(root, "scripts", "test-runtimes-live.mjs"), "utf8");
+  assert.match(probe, /clientInfo:\s*\{\s*name:\s*"aec-s-probe",\s*version:\s*aecSVersion\(\)\s*\}/);
+  assert.doesNotMatch(probe, /clientInfo:\s*\{[^}]*version:\s*"\d+\.\d+\.\d+/);
+  assert.match(liveGate, /packageVersion:\s*DSH_COMPATIBILITY\.packageVersion/);
+  assert.doesNotMatch(liveGate, /config:\s*\{\s*packageVersion:\s*"\d+\.\d+\.\d+-rc\.\d+"/);
+});
+
 test("live Runtime gate formats unexpected failures through the shared redactor", async () => {
   const script = pathToFileURL(join(root, "scripts", "test-runtimes-live.mjs")).href;
   const module = await import(script) as {

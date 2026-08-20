@@ -59,7 +59,7 @@ node dist/src/cli.js doctor
 
 获得授权时，向导会自动建立仅属主可读写的状态目录和 SQLite、注册并启动用户级 LaunchAgent、验证 Core 与 MCP 健康状态；若 MCP 未收敛，会执行一次有界的自动重启。随后可选择 WorkBuddy、自定义 MCP Agent 或暂时跳过。检测到 WorkBuddy CLI 时会自动配置；自定义客户端只会得到回环 Endpoint 和仅属主 Token 文件的位置，不会看到 Token 值。
 
-项目导入会自动检测 Git remote 与目标分支、GitHub、包管理器、Node/TypeScript、Flutter、Rust、Go、Python 标记、Validation 候选、GitHub Actions/Required Check 和架构文档。Human 只确认 Intent、交付方向和权威 Gate，不需要编写 `project.json`。
+项目导入会自动检测 Git remote 与目标分支、GitHub、包管理器、Node/TypeScript、Flutter、Rust、Go、Python 标记、Validation 候选、GitHub Actions/Required Check、架构文档，以及检测到的工具链所对应的官方公开依赖主机；后者会保存为 `operationalConfig.networkPolicy = { mode: "brokered", dependencyHosts: [...] }`。Human 只确认 Intent、交付方向和权威 Gate，不需要编写 `project.json`。1.0 明确不支持需要认证的私有包仓库。
 
 完成边界会以不含凭据的形式原子写入 `$AEC_S_HOME/onboarding.json`。之后再次裸执行 `aec-s` 会显示 Core、服务、MCP、Runtime、Front Agent 与 Project 的日常状态，不会重跑安装流程。自动化仍可使用 `aec-s init --json`；高级用户也可继续使用默认只生成提案的显式导入命令：
 
@@ -243,11 +243,13 @@ AEC-S 不使用 admin merge，也不绕过 branch protection。真实回归仓�
 
 只注册用户信任的仓库和命令。AEC-S 对完整 Codex 进程树施加显式 workspace-write/read-only；只有在外层内核边界已经生效后才关闭 Codex CLI 内层沙箱，因为 macOS 拒绝嵌套 Seatbelt。Kimi Executor Session 使用 ACP `auto` 模式，只对位置完整且经 realpath 确认位于 worktree 内的请求签发单次 Permission；位置缺失、为空、在外部或通过符号链接逃逸时一律拒绝，并持久化 Session ID 供 Repair 恢复。Kimi Review 使用 `plan` 模式且拒绝全部 Permission。DSH Executor 使用 `workspace-write`；Reviewer 不挂载文件工具，内核边界只允许读取 worktree 元数据和控制器持有的 Review Packet，不允许读取仓库文件或 Git 对象。Secret 配置会被拒绝，Decision Resolution、Finding/Scope 证据、Outbox、Event 与返回状态中的已知凭据格式会在持久化前脱敏；这种模式匹配防线不能替代“不要把凭据写入 Task 输入”。监督日志、结构化结果、Diff、Runtime 响应和内嵌 Reviewer Prompt 均有硬大小上限。
 
-每个受监督 Runtime 与 Validation 进程树还会进入由 AEC-S 持有、默认拒绝的 macOS Seatbelt 策略。进程获得隔离的 `HOME`/XDG/临时目录，不继承 SSH Agent Socket、GitHub Token、用户/系统 Git 配置、AppleEvent 权限或 macOS Keychain 服务。除精确声明的 worktree、只读控制器证据、AEC-S 安装目录和所选 Runtime 根目录外，用户主目录和用户临时数据均不可读。每次调用只有唯一的 Runtime 输出目录可在控制器附近写入；JobInput、JobResult、日志和 Gate 证据均由控制器持有，持久化的 Job 输入与结果还必须绑定同一个 SHA-256 摘要。Supervisor 会维护绑定进程启动时间的后代账本，即使子进程脱离原进程组，也会对已记录后代执行终止。Codex 的 `auth.json`/`config.toml`、Kimi 的 `config.toml`/`bin` 等凭据、策略与可执行路径即使位于自定义 Runtime 根目录，也仍被显式禁止写入；当前 Codex/Kimi 会动态创建名称的 Session、数据库、Cache、Index、Log、Telemetry 和原子状态文件可写。受信任的 Kimi ACP 进程还可以原子刷新自身的凭据 JSON 与 OAuth 锁；Agent 请求的路径仍由 ACP 单次 Permission 独立限制在 worktree 内。DSH 凭据文件保持只读。Executor 获得 worktree 写权限，Reviewer 不获得。除标准安装位置外，AEC-S 还会拒绝执行当前 `PATH` 中发现的 `gh`、`ssh` 与 Keychain Helper 等凭据程序。AEC-S 会在每条执行路径之前对该内核强制边界进行功能探测；一旦无法执行，所有 Runtime 都会标记为不可用，绝不退回仅靠环境变量的建议性限制。Apple 已弃用 `sandbox-exec` 启动器但仍随 macOS 提供，因此其移除或协议漂移会成为明确的 fail-closed 兼容事件。
+每个受监督 Runtime 与 Validation 进程树还会进入由 AEC-S 持有、默认拒绝的 macOS Seatbelt 策略。进程获得隔离的 `HOME`/XDG/临时目录，不继承 SSH Agent Socket、GitHub Token、用户/系统 Git 配置、AppleEvent 权限或 macOS Keychain 服务。Mach 服务查询默认拒绝；`osascript`、Finder/System Events、AppleEvent、TCC、LaunchServices、securityd 与凭据 Helper 均被显式拒绝并纳入隔离功能探测。除精确声明的 worktree、只读控制器证据、AEC-S 安装目录和所选 Runtime 根目录外，用户主目录和用户临时数据均不可读。每次调用只有唯一的 Runtime 输出目录可在控制器附近写入；JobInput、JobResult、日志和 Gate 证据均由控制器持有，持久化的 Job 输入与结果还必须绑定同一个 SHA-256 摘要。命令通过启动闸门前，Supervisor 必须先持久化其 PID 与微秒分辨率的 macOS `libproc` 身份。1ms 原生后代账本会跨进程组脱离持续跟踪已记录子进程，把新身份写入 Supervisor lock，并在所有后代收敛前拒绝完成；恢复方必须先终止旧命令组和已记录的 detached 后代，才能重新执行。Codex 的 `auth.json`/`config.toml`、Kimi 的 `config.toml`/`bin` 等凭据、策略与可执行路径即使位于自定义 Runtime 根目录，也仍被显式禁止写入；当前 Codex/Kimi 会动态创建名称的 Session、数据库、Cache、Index、Log、Telemetry 和原子状态文件可写。受信任的 Kimi ACP 进程还可以原子刷新自身的凭据 JSON 与 OAuth 锁；Agent 请求的路径仍由 ACP 单次 Permission 独立限制在 worktree 内。DSH 凭据文件保持只读。Executor 获得 worktree 写权限，Reviewer 不获得。除标准安装位置外，AEC-S 还会拒绝执行当前 `PATH` 中发现的 `gh`、`ssh` 与 Keychain Helper 等凭据程序。AEC-S 会在创建或恢复 Run 之前对该内核强制边界进行功能探测；一旦无法执行，工作会带证据进入 `operational_blocked`，既不退回建议性限制，也不消耗 Agent 尝试。Apple 已弃用 `sandbox-exec` 启动器但仍随 macOS 提供，因此其移除或协议漂移会成为明确的 fail-closed 兼容事件。
 
-普通受限命令、Validation 和 Environment Contract 探测均禁止入站与出站网络。Codex、Kimi、DSH 的控制进程必须访问模型服务，因此获得显式的 `provider` 网络例外；该例外作用于整个 Runtime 进程树。AEC-S 当前不声称对一等 Runtime 实现了域名级出站控制，锁定版本的 Runtime 实现仍属于可信计算基。Runtime 自身的工具策略、worktree realpath 校验、只读 Review 与 DSH Sandbox 继续生效，但它们不能替代未来由代理承载的模型传输或受控出站代理。
+普通受限命令、Validation 和 Environment Contract 探测均禁止入站与出站网络。一等 Runtime 只能连接该 Run 临时创建的两个回环服务：面向 Adapter 自有模型 Provider 白名单的 HTTPS CONNECT Proxy，以及带认证的 Run MCP Gateway。Provider Proxy 只接受精确声明的 DNS 主机和 443 端口，解析并固定公网地址，同时拒绝 IP 字面量、私网、回环、链路本地、保留地址和云元数据地址；它不终止 TLS、不读取正文，也不记录 URL、Token、Prompt 或模型内容。Runtime 升级若需要新主机，会在 Adapter 声明经审查前 fail closed，用户配置不能扩大该白名单。
 
-由 AEC-S 持有的 Git 命令会禁用仓库 Hook 和可选文件系统监视器、拒绝 `ext` 传输，并拒绝本地配置中声明 Filter、外部 Diff/Textconv、Credential Helper、自定义 Hook 路径或配置 Include 的仓库。这样可防止仓库控制的 Git 配置在暂存、生成 Diff、Commit、创建 worktree 或交付时变成代码执行路径。Runtime 仍不能 Commit 或 Push：Seatbelt 内的 Git 元数据只读，AEC-S 还会在发布前重新核对 `HEAD` 与最终 Gate Diff。
+Run MCP Gateway 向 Executor 与 Reviewer 提供 `aec_s_fetch`，并只向 Executor 提供 `aec_s_network_exec`。`fetch` 仅执行无认证的公网 HTTPS GET/HEAD，响应上限 8 MiB，并拒绝认证 Header、URL 凭据、私网目标和跨域重定向。`network_exec` 会启动独立受监督的 Seatbelt 进程；该进程可访问 worktree，但没有 Runtime Home、Provider Key、GitHub Token、SSH Agent、用户 Git 凭据或 Keychain，只能访问项目导入时检测到的依赖主机，并拒绝发布、登录、Token 管理、SSH 与 Git 交付操作。Capability Token 绑定 Run、Task Revision、角色、Scope 与过期时间，不进入 SQLite、JobInput、Event 或日志，并在 Gateway 关闭或 Daemon 恢复后失效。Event 只保存主机、操作类别、结果与字节数。Provider 服务仍会接收正常开发上下文，锁定的官方 Runtime 仍属于可信计算基；1.0 不承诺防御恶意官方 Runtime，也不支持带认证的私有依赖。
+
+由 AEC-S 持有的 Git 命令会禁用仓库 Hook 和可选文件系统监视器、拒绝 `ext` 传输，并拒绝本地配置中声明 Filter、外部 Diff/Textconv、Credential Helper、自定义 Hook 路径或配置 Include 的仓库。这样可防止仓库控制的 Git 配置在暂存、生成 Diff、Commit、创建 worktree 或交付时变成代码执行路径。Runtime 不能修改已注册 Project 的 Git 元数据、改变其 `HEAD`，也不能完成 AEC-S 的 Commit/Push/Merge effect；AEC-S 还会在发布前重新核对 `HEAD` 与最终 Gate Diff。Executor 可以创建任意 Scope 内文件，其中也可能包含恰好构成另一份本地仓库的文件，但这些仍只是受 Gate 约束的普通 worktree 内容，并不会取得 Project 或远端交付权威。
 
 Task 要求的 Environment Contract 组件会在 `prepare` 阶段校验注册命令、版本和 Agent 能力。注册的探测命令会在已创建的 worktree 内通过持久化 Job Supervisor 运行，并强制只读文件系统与断网，而不是直接继承 Daemon 的非隔离进程上下文。Scope Calibration 与 Progressive DAG Parking 会记录明确的 `observe|enforce` 策略证据；`observe` 下的 Scope Expansion 必须经 Human Decision 才能准入新 Revision。Drift Budget 触发有界同步事件，Validation 生成文件后还会再次检查 Risk Floor。两种模式下，确定性安全不变量始终执行。
 
@@ -266,9 +268,9 @@ npm run test:all
 npm run test:runtimes:live
 ```
 
-`test:all` 执行 lint、严格类型检查、许可证策略、强制包策略与覆盖率门槛。包策略会独立要求所有安装脚本包逐项匹配已审核的 `allowScripts` 名称和版本，并检查生产、开发、可选及 Peer 依赖中的全部 DSH 预发布包是否精确锁定，因此安全性不依赖包管理器默认行为。GitHub Actions 只使用协议级替身、不可变发布提交及无真实凭据环境。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，并验证 Codex→Kimi、Kimi→DSH、DSH→Codex 严格 Review 矩阵、execute/repair/resume、逐 Runtime cancel、Adapter 边界健康防抖、跨 Runtime 调度、Daemon Run 恢复、等待状态释放容量和副作用对账。它会脱敏边界处的意外异常，并生成经过 Schema 校验、仅含版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本的报告。
+`test:all` 执行 lint、严格类型检查、许可证策略、强制包策略与覆盖率门槛。包策略会独立要求所有安装脚本包逐项匹配已审核的 `allowScripts` 名称和版本，并检查生产、开发、可选及 Peer 依赖中的全部 DSH 预发布包是否精确锁定，因此安全性不依赖包管理器默认行为。GitHub Actions 只使用协议级替身、不可变发布提交及无真实凭据环境。`test:runtimes:live` 仅供维护者本机运行，要求 `AEC_S_LIVE_RUNTIME_CONFIRM=1`，并验证 Codex→Kimi、Kimi→DSH、DSH→Codex 严格 Review 矩阵、每种 Runtime 的受控 Fetch/依赖操作、execute/repair/resume、逐 Runtime cancel、Adapter 边界健康防抖、跨 Runtime 调度、Daemon Run 恢复、等待状态释放容量和副作用对账。它会脱敏边界处的意外异常，并生成经过 Schema 校验、仅含版本、场景 ID、PASS/FAIL、时间与报告 Schema 版本的报告。
 
-测试覆盖正式十实体投影、TaskRevision/Finding 证据、确定性调度与健康防抖、Scope 冲突、Validation/Review Repair、supervisor 恢复、合并后收敛、全部十一个 MCP 工具，以及 Git/GitHub 副作用幂等。独立的真实门禁进一步验证 Codex/Kimi/DSH 的执行、Review、Repair/Resume、Cancel 隔离和健康阈值。
+测试覆盖正式十实体投影、TaskRevision/Finding 证据、确定性调度与健康防抖、Scope 冲突、Validation/Review Repair、supervisor 恢复、合并后收敛、全部十一个控制面 MCP 工具、Run 级网络工具、精确回环出站、Capability 过期，以及 Git/GitHub 副作用幂等。独立的真实门禁进一步验证 Codex/Kimi/DSH 的执行、Review、Repair/Resume、Cancel 隔离和健康阈值。
 
 ## 许可与维护
 
