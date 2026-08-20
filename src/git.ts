@@ -53,12 +53,15 @@ async function acquireProjectFileLock(project: Project): Promise<{ databasePath:
       try {
         lockDb.exec("BEGIN IMMEDIATE");
         transactionOpen = true;
-        const row = lockDb.prepare("SELECT owner, pid, lease_until FROM project_lock WHERE id=1").get() as
-          | { owner: string | null; pid: number | null; lease_until: number | null }
+        const row = lockDb.prepare("SELECT owner, pid FROM project_lock WHERE id=1").get() as
+          | { owner: string | null; pid: number | null }
           | undefined;
-        const expired = !row?.owner || !row.lease_until || row.lease_until <= Date.now();
+        const unowned = !row?.owner;
         const dead = row?.pid ? !processIsAlive(row.pid) : true;
-        if (expired || dead) {
+        // A lease timestamp alone cannot safely fence a Git operation because
+        // the owner may still be running. Recover only an unowned lock or one
+        // whose owning process is verifiably gone.
+        if (unowned || dead) {
           lockDb.prepare("UPDATE project_lock SET owner=?, pid=?, lease_until=? WHERE id=1")
             .run(token, process.pid, Date.now() + LOCK_LEASE_MS);
           lockDb.exec("COMMIT");

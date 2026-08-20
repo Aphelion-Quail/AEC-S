@@ -140,6 +140,14 @@ async function runKimi(
           ? { agentFile: config.reviewAgentFile }
           : config.agentFile ? { agentFile: config.agentFile } : {}),
         signal: cancellation.signal,
+        ...(process.env.AEC_S_RUN_MCP_URL && process.env.AEC_S_RUN_MCP_TOKEN ? {
+          mcpServers: [{
+            type: "http" as const,
+            name: "aec-s-run-network",
+            url: process.env.AEC_S_RUN_MCP_URL,
+            headers: [{ name: "Authorization", value: `Bearer ${process.env.AEC_S_RUN_MCP_TOKEN}` }],
+          }],
+        } : {}),
       });
       return {
         value: parseRuntimeJsonObject(result.text),

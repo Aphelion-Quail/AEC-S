@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, realpathSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import { DatabaseSync } from "node:sqlite";
 import { createGitRepository, fixturePath, tempDir } from "./helpers.js";
 import { projectLockDatabasePath, withProjectGitLock } from "../src/git.js";
 import type { Project } from "../src/types.js";
@@ -72,6 +73,58 @@ test("releases the in-process queue when file-lock release fails", async () => {
   const result = await Promise.race([
     withProjectGitLock(project, async () => "recovered"),
     new Promise<string>((_, reject) => setTimeout(() => reject(new Error("release failure deadlocked the queue")), 2_000)),
+  ]);
+  assert.equal(result, "recovered");
+});
+
+test("does not steal an expired Project Git lock from a live owner", async () => {
+  const repo = createGitRepository();
+  const owner: Project = { ...projectFor(repo), id: "live-owner" };
+  const contender: Project = { ...projectFor(repo), id: "live-contender" };
+  const databasePath = await projectLockDatabasePath(owner);
+  let contenderEntered = false;
+  let contenderPromise!: Promise<string>;
+  let protectedWhileOwnerWasActive = false;
+
+  await withProjectGitLock(owner, async () => {
+    const lockDb = new DatabaseSync(databasePath);
+    try {
+      const update = lockDb.prepare("UPDATE project_lock SET lease_until=? WHERE id=1")
+        .run(Date.now() - 1);
+      assert.equal(update.changes, 1);
+    } finally {
+      lockDb.close();
+    }
+
+    contenderPromise = withProjectGitLock(contender, async () => {
+      contenderEntered = true;
+      return "acquired";
+    });
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+    protectedWhileOwnerWasActive = !contenderEntered;
+  });
+
+  assert.equal(await contenderPromise, "acquired");
+  assert.equal(protectedWhileOwnerWasActive, true);
+});
+
+test("recovers a Project Git lock whose owner process is dead", async () => {
+  const repo = createGitRepository();
+  const project: Project = { ...projectFor(repo), id: "dead-owner" };
+  const databasePath = await projectLockDatabasePath(project);
+  await withProjectGitLock(project, async () => undefined);
+
+  const lockDb = new DatabaseSync(databasePath);
+  try {
+    lockDb.prepare("UPDATE project_lock SET owner=?, pid=?, lease_until=? WHERE id=1")
+      .run("stale-owner", 2_147_483_647, Date.now() + 60_000);
+  } finally {
+    lockDb.close();
+  }
+
+  const result = await Promise.race([
+    withProjectGitLock(project, async () => "recovered"),
+    new Promise<string>((_, reject) => setTimeout(() => reject(new Error("dead owner was not recovered")), 2_000)),
   ]);
   assert.equal(result, "recovered");
 });

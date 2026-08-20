@@ -10,6 +10,7 @@ import { AecSDatabase } from "../dist/src/db.js";
 import { AecSEngine } from "../dist/src/engine.js";
 import { cancelSupervisedJob } from "../dist/src/job.js";
 import { redactText } from "../dist/src/redaction.js";
+import { DSH_COMPATIBILITY } from "../dist/src/runtime-probe.js";
 import { aecSVersion } from "../dist/src/version.js";
 
 const RUNTIMES = [
@@ -20,7 +21,7 @@ const RUNTIMES = [
     adapter: "deepseek_harness",
     capability: "fixture-git",
     reviewerFamily: "codex",
-    config: { packageVersion: "0.1.0-rc.6" },
+    config: { packageVersion: DSH_COMPATIBILITY.packageVersion },
   },
 ];
 
@@ -130,7 +131,10 @@ async function main() {
       repoPath: repo,
       targetBranch: "main",
       maxConcurrency: 3,
-      operationalConfig: { stabilityObservationSeconds: 0 },
+      operationalConfig: {
+        stabilityObservationSeconds: 0,
+        networkPolicy: { mode: "brokered", dependencyHosts: ["registry.npmjs.org"] },
+      },
       controlPolicy: { strictReviewMinRuntimeFamilies: 2, circuitBreaker: "enforce" },
     });
     for (const runtime of RUNTIMES) {
@@ -170,7 +174,7 @@ async function main() {
       id: `live-${family}`,
       projectId: project.id,
       title: `Live ${family} lifecycle`,
-      goal: `On the initial execution Turn, make no changes and return a technical blocked result requesting Repair. When AEC-S resumes the same Session for Repair, create ${family}.txt containing exactly AEC-S-LIVE-PASS.`,
+      goal: `First call aec_s_fetch with HEAD https://registry.npmjs.org/zod and aec_s_network_exec with npm view zod version. On the initial execution Turn, make no changes and return a technical blocked result requesting Repair. When AEC-S resumes the same Session for Repair, create ${family}.txt containing exactly AEC-S-LIVE-PASS.`,
       scope: { writeGlobs: [`${family}.txt`], watchGlobs: [], tags: ["live-runtime"] },
       acceptanceCriteria: ["The target contains AEC-S-LIVE-PASS after one same-Session Repair"],
       requiredCapabilities: [capability],
@@ -185,6 +189,11 @@ async function main() {
     record("LIVE-EXECUTE-THREE-RUNTIMES", tasks.every((task) => db.getTask(task.id)?.status === "succeeded"));
     record("LIVE-DETERMINISTIC-RUNTIME-ASSIGNMENT", runs.every((run, index) => run?.agentId === `${RUNTIMES[index].family}-executor`));
     record("LIVE-REPAIR-RESUME-EACH-RUNTIME", runs.every((run) => run && run.repairCount >= 1 && typeof run.runtimeSessionId === "string"));
+    record("LIVE-BROKERED-NETWORK-EACH-RUNTIME", tasks.every((task) => {
+      const events = db.listEvents(project.id, 2_000).filter((event) => event.taskId === task.id);
+      return events.some((event) => event.type === "network.fetch" && event.payload.result !== "rejected") &&
+        events.some((event) => event.type === "network.exec" && event.payload.result === "completed");
+    }));
     record("LIVE-HETEROGENEOUS-REVIEW-MATRIX", runs.every((run, index) =>
       run?.review?.completed && run.review.reviewerAgentId === `${RUNTIMES[index].reviewerFamily}-reviewer`));
     record("LIVE-AEC-S-OWNS-COMMIT-AND-MERGE", runs.every((run) =>

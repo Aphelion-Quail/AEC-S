@@ -33,29 +33,26 @@ export function selectDeterministicAgent(input: {
   loadOverride?: Map<string, number>;
 }): Agent | undefined {
   const { agents, role, capabilities, excluded, excludedFamilies, loadOverride } = input;
-  return agents
-    .filter(
-      (agent) =>
-        agent.enabled &&
-        agent.availability === "available" &&
-        agent.roles.includes(role) &&
-        (agent.adapter === "command" || agent.runtimeCapabilities?.structuredOutput === true) &&
-        (role !== "reviewer" || agent.adapter === "command" || agent.runtimeCapabilities?.reviewMode === true) &&
-        (loadOverride?.get(agent.id) ?? agent.currentLoad) < agent.maxConcurrency &&
-        !excluded.has(agent.id) &&
-        !excludedFamilies.has(agent.runtimeFamily ?? agent.adapter) &&
-        capabilities.every((capability) => agent.capabilities.includes(capability)),
-    )
-    .sort((left, right) => {
-      const loadDelta =
-        (loadOverride?.get(left.id) ?? left.currentLoad) / left.maxConcurrency -
-        (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency;
-      if (loadDelta !== 0) return loadDelta;
-      const assignmentDelta =
-        Date.parse(left.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") -
-        Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z");
-      if (assignmentDelta !== 0) return assignmentDelta;
-      return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
-    })[0];
+  const compare = (left: Agent, right: Agent): number => {
+    const loadDelta =
+      (loadOverride?.get(left.id) ?? left.currentLoad) / left.maxConcurrency -
+      (loadOverride?.get(right.id) ?? right.currentLoad) / right.maxConcurrency;
+    if (loadDelta !== 0) return loadDelta;
+    const assignmentDelta =
+      Date.parse(left.lastAssignedAt ?? "1970-01-01T00:00:00.000Z") -
+      Date.parse(right.lastAssignedAt ?? "1970-01-01T00:00:00.000Z");
+    if (assignmentDelta !== 0) return assignmentDelta;
+    return left.id < right.id ? -1 : left.id > right.id ? 1 : 0;
+  };
+  let selected: Agent | undefined;
+  for (const agent of agents) {
+    if (!agent.enabled || agent.availability !== "available" || !agent.roles.includes(role) ||
+        (agent.adapter !== "command" && agent.runtimeCapabilities?.structuredOutput !== true) ||
+        (role === "reviewer" && agent.adapter !== "command" && agent.runtimeCapabilities?.reviewMode !== true) ||
+        (loadOverride?.get(agent.id) ?? agent.currentLoad) >= agent.maxConcurrency ||
+        excluded.has(agent.id) || excludedFamilies.has(agent.runtimeFamily ?? agent.adapter) ||
+        !capabilities.every((capability) => agent.capabilities.includes(capability))) continue;
+    if (!selected || compare(agent, selected) < 0) selected = agent;
+  }
+  return selected;
 }
-

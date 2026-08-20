@@ -203,6 +203,17 @@ test("exposes AEC-S MCP over loopback Streamable HTTP", async () => {
     assert.equal(unboundFindingTransition.isError, true);
     const unauthorized = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
     assert.equal(unauthorized.status, 401);
+    const oversized = await fetch(url, {
+      method: "POST",
+      headers: { authorization: `Bearer ${httpToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ payload: "x".repeat(256 * 1024) }),
+    });
+    assert.equal(oversized.status, 413);
+    assert.deepEqual(await oversized.json(), {
+      jsonrpc: "2.0",
+      error: { code: -32002, message: "Request body too large" },
+      id: null,
+    });
     const missingSession = await fetch(url, {
       headers: { authorization: `Bearer ${httpToken}` },
     });

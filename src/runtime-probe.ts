@@ -13,6 +13,7 @@ import { KIMI_ACP_CLIENT_VERSION, probeKimiAcp } from "./kimi-acp.js";
 import { redactText } from "./redaction.js";
 import { within } from "./async.js";
 import { childEnvironment } from "./child-env.js";
+import { aecSVersion } from "./version.js";
 
 export type ProbeCheck = {
   ok: boolean;
@@ -204,7 +205,7 @@ async function kimiLegacyCompatibility(
       workDir: workspace,
       executablePath: binary,
       ...(shareDirectory ? { environmentVariables: { KIMI_SHARE_DIR: shareDirectory } } : {}),
-      clientInfo: { name: "aec-s-probe", version: "0.9.0-rc.3" },
+      clientInfo: { name: "aec-s-probe", version: aecSVersion() },
     }), 15_000, "Kimi SDK initialize");
     return {
       ok: true,

@@ -31,7 +31,7 @@ test("persists the formal AEC-S entity projections", () => {
   assert.equal(db.getAgent(agent.id)?.name, "fake");
   assert.equal(db.getTask(task.id)?.goal, "Create feature.txt");
   assert.equal(db.getDecision(decision.id)?.status, "resolved");
-  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
   assert.equal(statSync(db.paths.database).mode & 0o777, 0o600);
   assert.equal(statSync(db.paths.mcpHttpToken).mode & 0o777, 0o600);
   for (const sidecar of [`${db.paths.database}-wal`, `${db.paths.database}-shm`]) {
@@ -91,9 +91,9 @@ test("upgrades a pre-lease Run schema through recorded migrations", () => {
   assert.ok(columns.includes("worker_result_path"));
   assert.deepEqual(
     (db.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>).map((row) => row.version),
-    [1, 2, 3, 4, 5, 6, 7],
+    [1, 2, 3, 4, 5, 6, 7, 8, 9],
   );
-  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 7);
+  assert.equal((db.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version, 9);
   db.close();
 });
 
@@ -128,8 +128,12 @@ test("fences stale Run writes and atomically resumes an interrupted Run", () => 
     updatedAt: timestamp,
     leaseOwner: "owner-a",
     leaseUntil: new Date(Date.now() + 60_000).toISOString(),
+    networkPolicyDigest: "policy-digest",
+    gatewayStatus: "active",
   };
   db.createRun(run);
+  assert.equal(db.getRun(run.id)?.networkPolicyDigest, "policy-digest");
+  assert.equal(db.getRun(run.id)?.gatewayStatus, "active");
   const stale = db.getRun(run.id)!;
   assert.equal(db.claimRun(run.id, "owner-a", "owner-b", new Date(Date.now() + 60_000).toISOString()), true);
   stale.phase = "merge";

@@ -14,12 +14,13 @@ The current source and npm package do not bundle `node_modules`, third-party nat
 | --- | --- | --- | --- |
 | [Agent Client Protocol TypeScript SDK](https://github.com/agentclientprotocol/typescript-sdk) | 0.23.0 | Apache-2.0 | Zed Industries and contributors |
 | [Kimi Agent SDK](https://github.com/MoonshotAI/kimi-agent-sdk) | 0.1.8 | MIT | Moonshot AI |
-| [DeepSeek Harness SDK, credential seam, and pinned runtime composition packages](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
+| [DeepSeek Harness SDK, credential seam, MCP client bridge, and pinned runtime composition packages](https://github.com/deepseek-ai/deepseek-harness) | 0.1.0-rc.6 | MIT | DeepSeek AI |
 | [Cordis](https://github.com/cordiverse/cordis) | 4.0.1 | MIT | Cordis contributors |
 | [Model Context Protocol TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) | 1.30.0 | MIT | Copyright 2024 Anthropic, PBC |
+| [Koffi](https://koffi.dev/) | 3.1.5 | MIT | Koromix and contributors |
 | [Zod](https://github.com/colinhacks/zod) | 4.4.3 | MIT | Copyright 2025 Colin McDonnell |
 
-The locked production dependency graph contains 193 packages: 177 MIT, 1 Apache-2.0, 5 BSD-3-Clause, 8 ISC, 1 BSD-2-Clause, and 1 Python-2.0. DSH packages are pinned to one `0.1.0-rc.6` package/runtime line; AEC-S additionally verifies the JSON-RPC server identity through an initialization handshake. A mismatch is an unavailable Runtime, not a command-adapter fallback.
+The locked production dependency graph contains 194 packages: 178 MIT, 1 Apache-2.0, 5 BSD-3-Clause, 8 ISC, 1 BSD-2-Clause, and 1 Python-2.0. DSH packages, including the MCP client bridge used by both compositions, are pinned to one `0.1.0-rc.6` package/runtime line; AEC-S additionally verifies the JSON-RPC server identity through an initialization handshake. A mismatch is an unavailable Runtime, not a command-adapter fallback.
 
 The non-MIT production dependencies are:
 

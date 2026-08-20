@@ -91,12 +91,15 @@ export class TerminalWizardPrompt implements WizardPrompt {
     render(false);
     emitKeypressEvents(this.inputStream);
     const wasRaw = this.inputStream.isRaw === true;
+    const wasFlowing = this.inputStream.readableFlowing;
     this.inputStream.setRawMode!(true);
     this.inputStream.resume();
     return await new Promise<T>((resolve, reject) => {
       const finish = (value?: T, error?: Error) => {
         this.inputStream.off("keypress", onKeypress);
         if (!wasRaw) this.inputStream.setRawMode!(false);
+        if (wasFlowing === true) this.inputStream.resume();
+        else this.inputStream.pause();
         this.write("\n");
         if (error) reject(error);
         else resolve(value!);

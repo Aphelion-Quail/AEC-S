@@ -2,7 +2,6 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { AecSDatabase } from "./db.js";
 import { execCommand } from "./exec.js";
-import { fingerprint } from "./fingerprint.js";
 import { projectInputSchema } from "./input.js";
 import { mcpHttpPort } from "./mcp.js";
 import {
@@ -10,6 +9,7 @@ import {
   initializeAecS,
   inspectProject,
   probeHostReadiness,
+  registerInspectedProject,
   type HostReadiness,
   type InitializationResult,
   type OnboardingLanguage,
@@ -142,14 +142,8 @@ export async function configureWorkBuddy(paths: AecSPaths): Promise<FrontAgentCo
   if (!binary) return { kind: "workbuddy", configured: false, detail: "WorkBuddy CLI was not found" };
   const existing = await execCommand({ program: binary, args: ["mcp", "get", "aec-s"], timeoutSeconds: 30 });
   if (existing.exitCode === 0) return { kind: "workbuddy", configured: true, detail: "Existing AEC-S MCP connection reused" };
-  const entry = process.env.AEC_S_CLI_ENTRY?.trim() || process.argv[1];
-  if (!entry) return { kind: "workbuddy", configured: false, detail: "AEC-S CLI entry could not be resolved" };
-  const configuration = JSON.stringify({
-    type: "stdio",
-    command: realpathSync(process.execPath),
-    args: [realpathSync(resolve(entry)), "mcp"],
-    env: { AEC_S_HOME: paths.home },
-  });
+  const configuration = stdioMcpConfiguration(paths);
+  if (!configuration) return { kind: "workbuddy", configured: false, detail: "AEC-S CLI entry could not be resolved" };
   const added = await execCommand({
     program: binary,
     args: ["mcp", "add-json", "--scope", "user", "aec-s", configuration],
@@ -160,11 +154,22 @@ export async function configureWorkBuddy(paths: AecSPaths): Promise<FrontAgentCo
     : { kind: "workbuddy", configured: false, detail: added.stderr.trim() || added.stdout.trim() || "WorkBuddy rejected the MCP configuration" };
 }
 
+function stdioMcpConfiguration(paths: AecSPaths): string | undefined {
+  const entry = process.env.AEC_S_CLI_ENTRY?.trim() || process.argv[1];
+  if (!entry) return undefined;
+  return JSON.stringify({
+    type: "stdio",
+    command: realpathSync(process.execPath),
+    args: [realpathSync(resolve(entry)), "mcp"],
+    env: { AEC_S_HOME: paths.home },
+  });
+}
+
 async function configureFrontAgent(
   prompt: WizardPrompt,
   language: OnboardingLanguage,
   paths: AecSPaths,
-  endpoint: string,
+  endpoint: string | undefined,
   configure: (paths: AecSPaths) => Promise<FrontAgentConfiguration>,
 ): Promise<FrontAgentConfiguration> {
   prompt.write(`${tr(language,
@@ -180,19 +185,41 @@ async function configureFrontAgent(
     const result = await configure(paths);
     prompt.write(`${result.configured ? "✓" : "!"} WorkBuddy — ${result.detail ?? ""}\n\n`);
     if (!result.configured) {
-      prompt.write(`${tr(language, "MCP Endpoint", "MCP Endpoint")}: ${endpoint}\n`);
-      prompt.write(`${tr(language, "Authentication token file", "认证令牌文件")}: ${paths.mcpHttpToken}\n\n`);
+      if (endpoint) {
+        prompt.write(`${tr(language, "MCP Endpoint", "MCP Endpoint")}: ${endpoint}\n`);
+        prompt.write(`${tr(language, "Authentication token file", "认证令牌文件")}: ${paths.mcpHttpToken}\n\n`);
+      } else {
+        const configuration = stdioMcpConfiguration(paths);
+        prompt.write(`${tr(language,
+          "No background HTTP MCP endpoint is running. A stdio MCP connection remains available on demand.",
+          "后台 HTTP MCP Endpoint 未运行；stdio MCP 连接仍可按需使用。",
+        )}\n`);
+        if (configuration) prompt.write(`${configuration}\n\n`);
+      }
     }
     return result;
   }
   if (selected === "custom") {
-    prompt.write(`${tr(language, "MCP Endpoint", "MCP Endpoint")}: ${endpoint}\n`);
-    prompt.write(`${tr(language, "Authentication token file", "认证令牌文件")}: ${paths.mcpHttpToken}\n`);
+    if (endpoint) {
+      prompt.write(`${tr(language, "MCP Endpoint", "MCP Endpoint")}: ${endpoint}\n`);
+      prompt.write(`${tr(language, "Authentication token file", "认证令牌文件")}: ${paths.mcpHttpToken}\n`);
+      prompt.write(`${tr(language,
+        "Configure the token as a Bearer secret in the client; do not copy it into a project or chat.",
+        "请在客户端中把该令牌配置为 Bearer Secret，不要将其复制到项目或聊天中。",
+      )}\n\n`);
+      return { kind: "custom", configured: true, detail: endpoint };
+    }
+    const configuration = stdioMcpConfiguration(paths);
     prompt.write(`${tr(language,
-      "Configure the token as a Bearer secret in the client; do not copy it into a project or chat.",
-      "请在客户端中把该令牌配置为 Bearer Secret，不要将其复制到项目或聊天中。",
+      "The background HTTP MCP endpoint is not running. Configure your Agent with this on-demand stdio MCP connection:",
+      "后台 HTTP MCP Endpoint 未运行。请使用以下按需启动的 stdio MCP 连接配置 Agent：",
+    )}\n`);
+    if (configuration) prompt.write(`${configuration}\n`);
+    prompt.write(`${tr(language,
+      "AEC-S has not marked the custom Front Agent as configured; client setup is still required.",
+      "AEC-S 未将自定义 Front Agent 标记为已配置；仍需在客户端完成设置。",
     )}\n\n`);
-    return { kind: "custom", configured: true, detail: endpoint };
+    return { kind: "custom", configured: false, detail: configuration ? "stdio MCP configuration shown" : "AEC-S CLI entry could not be resolved" };
   }
   return { kind: "skipped", configured: false };
 }
@@ -246,12 +273,7 @@ async function importFirstProject(
   });
   const db = new AecSDatabase();
   try {
-    const existing = db.listProjects().find((candidate) => candidate.repoPath === projectInput.repoPath);
-    if (existing) return existing;
-    if (projectInput.id && db.getProject(projectInput.id)) {
-      projectInput.id = `${projectInput.id}-${fingerprint(projectInput.repoPath).slice(0, 8)}`;
-    }
-    return db.createProject(projectInput);
+    return registerInspectedProject(db, projectInput);
   } finally {
     db.close();
   }
@@ -358,7 +380,7 @@ export async function runSetupWizard(overrides: Partial<SetupWizardDependencies>
     state = {
       ...state,
       mcpEndpoint: health.mcpRunning ? health.endpoint : undefined,
-      frontAgent: await configureFrontAgent(prompt, language, paths, health.endpoint, dependencies.configureWorkBuddy),
+      frontAgent: await configureFrontAgent(prompt, language, paths, health.mcpRunning ? health.endpoint : undefined, dependencies.configureWorkBuddy),
     };
     writeOnboardingState(paths, state);
   }
@@ -379,7 +401,7 @@ export async function runSetupWizard(overrides: Partial<SetupWizardDependencies>
   prompt.write(`Core                ${state.serviceEnabled ? "Running" : "Ready"}\n`);
   prompt.write(`Background Service  ${state.serviceEnabled ? "Running" : "Skipped"}\n`);
   prompt.write(`MCP                 ${health.mcpRunning ? "Running" : "On demand"}\n`);
-  prompt.write(`Front Agent         ${state.frontAgent?.kind === "workbuddy" ? "WorkBuddy" : state.frontAgent?.kind === "custom" ? "Custom" : "Not configured"}\n`);
+  prompt.write(`Front Agent         ${state.frontAgent?.configured ? state.frontAgent.kind === "workbuddy" ? "WorkBuddy" : "Custom" : "Not configured"}\n`);
   for (const runtime of runtimePool(initialization)) {
     prompt.write(`${familyLabel(runtime.family).padEnd(20)} ${runtime.available ? "Available" : "Unavailable"}\n`);
   }
@@ -412,7 +434,7 @@ export async function formatDailyControl(language: OnboardingLanguage): Promise<
       `${tr(language, "Core", "Core").padEnd(20)} READY`,
       `${tr(language, "Background Service", "后台服务").padEnd(20)} ${health.serviceRunning ? "RUNNING" : state?.serviceEnabled ? "STOPPED" : "DISABLED"}`,
       `${"MCP".padEnd(20)} ${health.mcpRunning ? "RUNNING" : "STOPPED"}`,
-      `${tr(language, "Front Agent", "Front Agent").padEnd(20)} ${state?.frontAgent?.kind ?? "not configured"}`,
+      `${tr(language, "Front Agent", "Front Agent").padEnd(20)} ${state?.frontAgent?.configured ? state.frontAgent.kind : "not configured"}`,
       "",
       ...runtimeLines,
       "",

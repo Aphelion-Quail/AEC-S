@@ -49,6 +49,7 @@ test("delegates fresh and resumed Codex isolation to the outer AEC-S boundary", 
   const repaired = adapter.repair(repairInput);
   const resumed = adapter.resume(repairInput);
   for (const [index, invocation] of [started, fresh, repaired, resumed].entries()) {
+    assert.equal(invocation.mcpTransport, "codex");
     assert.equal(invocation.command.cwd, workspace);
     assert.deepEqual(invocation.command.args.slice(0, 8), [
       "--ask-for-approval", "never", "--sandbox", "danger-full-access", "--cd", workspace, "exec", index >= 2 ? "resume" : "--json",
@@ -104,6 +105,7 @@ for (const runtime of ["kimi", "deepseek_harness"] as const) {
     ];
     assert.deepEqual(invocations.map((invocation) => invocation.command.args[2]), ["execute", "execute", "review", "repair", "repair"]);
     assert.ok(invocations.every((invocation) => invocation.command.program === process.execPath));
+    assert.ok(invocations.every((invocation) => invocation.mcpTransport === runtime));
     assert.ok(invocations.every((invocation) => invocation.command.args[1] === runtime));
     assert.equal(invocations[3]!.command.args[5], "session-one");
     assert.equal(invocations[4]!.command.args[5], "session-one");

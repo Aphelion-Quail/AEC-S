@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createRequire } from "node:module";
-import type { Agent, CommandSpec } from "../types.js";
+import type { Agent, InternalCommandSpec } from "../types.js";
 import { execCommand } from "../exec.js";
 import { discoverExecutable } from "../runtime-discovery.js";
 import { newId } from "../ids.js";
@@ -23,12 +23,13 @@ function runtimeOutputPath(runDir: string, kind: InvocationKind): string {
 }
 
 export type AgentInvocation = {
-  command: CommandSpec;
+  command: InternalCommandSpec;
   stdin?: string;
   structuredOutputPath: string;
   evidenceReadPath: string;
   runtimeRootPaths?: string[];
   stateWritePaths?: string[];
+  mcpTransport?: "codex" | "kimi" | "deepseek_harness";
 };
 
 export type InvocationOptions = {
@@ -193,6 +194,7 @@ class CodexAdapter extends BaseAdapter {
         structuredOutputPath: output,
         evidenceReadPath: options.runDir,
         runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
+        mcpTransport: "codex",
       };
     }
     const args = [
@@ -212,6 +214,7 @@ class CodexAdapter extends BaseAdapter {
       structuredOutputPath: output,
       evidenceReadPath: options.runDir,
       runtimeRootPaths: [String(this.agent.config.codexHome ?? process.env.CODEX_HOME ?? join(process.env.HOME ?? "", ".codex"))],
+      mcpTransport: "codex",
     };
   }
 
@@ -339,6 +342,7 @@ class BridgeAdapter extends BaseAdapter {
         ...(kimiShareDir ? [kimiShareDir] : []),
         ...(dshHome ? [dshHome] : []),
       ],
+      mcpTransport: this.runtime,
     };
   }
 

@@ -2,11 +2,56 @@ import { spawn } from "node:child_process";
 import { createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
-import type { ChildEnvironmentProfile, CommandSpec } from "./types.js";
+import type { ChildEnvironmentProfile, InternalCommandSpec } from "./types.js";
 import { childEnvironment } from "./child-env.js";
 import { killProcessTree } from "./process-control.js";
 
 const MAX_CAPTURED_BYTES = 8 * 1024 * 1024;
+const OUTPUT_TRUNCATION_MARKER = Buffer.from("\n[output truncated]\n");
+// Leave enough raw-byte headroom for a replacement character when a bounded
+// capture ends in the middle of an invalid UTF-8 sequence. This keeps the
+// returned string within the same byte limit after decoding.
+const UTF8_REPLACEMENT_HEADROOM = 4;
+
+class BoundedCapture {
+  private readonly chunks: Buffer[] = [];
+  private bytes = 0;
+  private truncated = false;
+
+  append(chunk: Buffer): void {
+    if (this.truncated) return;
+    const remaining = MAX_CAPTURED_BYTES - this.bytes;
+    if (chunk.length <= remaining) {
+      this.chunks.push(chunk);
+      this.bytes += chunk.length;
+      return;
+    }
+    if (remaining > 0) {
+      // Copy the retained prefix so a single oversized stream chunk cannot
+      // keep an arbitrarily large backing buffer alive until process exit.
+      this.chunks.push(Buffer.from(chunk.subarray(0, remaining)));
+      this.bytes += remaining;
+    }
+    this.truncated = true;
+  }
+
+  text(): string {
+    const captured = Buffer.concat(this.chunks, this.bytes);
+    const value = captured.toString("utf8");
+    const valueBytes = Buffer.byteLength(value, "utf8");
+    if (!this.truncated && valueBytes <= MAX_CAPTURED_BYTES) return value;
+    const prefixBytes = Math.max(
+      0,
+      MAX_CAPTURED_BYTES - OUTPUT_TRUNCATION_MARKER.length - UTF8_REPLACEMENT_HEADROOM,
+    );
+    if (valueBytes <= prefixBytes) return `${value}${OUTPUT_TRUNCATION_MARKER.toString("utf8")}`;
+    // `captured` may contain arbitrary bytes. Decode and re-encode before
+    // slicing so invalid input cannot expand beyond the byte ceiling through
+    // repeated U+FFFD replacement characters.
+    const encoded = Buffer.from(value, "utf8");
+    return `${encoded.subarray(0, prefixBytes).toString("utf8")}${OUTPUT_TRUNCATION_MARKER.toString("utf8")}`;
+  }
+}
 
 export type ExecResult = {
   exitCode: number | null;
@@ -17,7 +62,7 @@ export type ExecResult = {
 };
 
 export async function execCommand(
-  command: CommandSpec,
+  command: InternalCommandSpec,
   stdin?: string,
   environmentProfile: ChildEnvironmentProfile = "restricted",
 ): Promise<ExecResult> {
@@ -28,8 +73,8 @@ export async function execCommand(
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
-    let stdout: Buffer = Buffer.alloc(0);
-    let stderr: Buffer = Buffer.alloc(0);
+    const stdout = new BoundedCapture();
+    const stderr = new BoundedCapture();
     let timedOut = false;
     let forceKill: NodeJS.Timeout | undefined;
     const timeout = setTimeout(() => {
@@ -39,8 +84,8 @@ export async function execCommand(
       forceKill.unref();
     }, (command.timeoutSeconds ?? 300) * 1_000);
     timeout.unref();
-    child.stdout.on("data", (chunk: Buffer) => (stdout = appendBounded(stdout, chunk)));
-    child.stderr.on("data", (chunk: Buffer) => (stderr = appendBounded(stderr, chunk)));
+    child.stdout.on("data", (chunk: Buffer) => stdout.append(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
     child.on("error", (error) => {
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
@@ -50,14 +95,14 @@ export async function execCommand(
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       killProcessTree(child, "SIGKILL");
-      resolve({ exitCode, signal, stdout: stdout.toString("utf8"), stderr: stderr.toString("utf8"), timedOut });
+      resolve({ exitCode, signal, stdout: stdout.text(), stderr: stderr.text(), timedOut });
     });
     if (stdin !== undefined) child.stdin.end(stdin);
     else child.stdin.end();
   });
 }
 
-export async function execCommandToFile(command: CommandSpec, outputPath: string): Promise<ExecResult> {
+export async function execCommandToFile(command: InternalCommandSpec, outputPath: string): Promise<ExecResult> {
   const child = spawn(command.program, command.args, {
     cwd: command.cwd,
     env: childEnvironment("restricted", command.env),
@@ -65,7 +110,7 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
     detached: process.platform !== "win32",
   });
   const output = createWriteStream(outputPath, { mode: 0o600 });
-  let stderr: Buffer = Buffer.alloc(0);
+  const stderr = new BoundedCapture();
   let outputBytes = 0;
   let timedOut = false;
   let forceKill: NodeJS.Timeout | undefined;
@@ -76,7 +121,7 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
     forceKill.unref();
   }, (command.timeoutSeconds ?? 300) * 1_000);
   timeout.unref();
-  child.stderr.on("data", (chunk: Buffer) => (stderr = appendBounded(stderr, chunk)));
+  child.stderr.on("data", (chunk: Buffer) => stderr.append(chunk));
   const completed = new Promise<ExecResult>((resolve, reject) => {
     child.on("error", (error) => {
       clearTimeout(timeout);
@@ -88,7 +133,7 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
       clearTimeout(timeout);
       if (forceKill) clearTimeout(forceKill);
       killProcessTree(child, "SIGKILL");
-      resolve({ exitCode, signal, stdout: "", stderr: stderr.toString("utf8"), timedOut });
+      resolve({ exitCode, signal, stdout: "", stderr: stderr.text(), timedOut });
     });
   });
   const limiter = new Transform({
@@ -109,25 +154,18 @@ export async function execCommandToFile(command: CommandSpec, outputPath: string
   );
   const [result, writeError] = await Promise.all([completed, writing]);
   return writeError
-    ? { ...result, exitCode: null, stderr: appendBounded(Buffer.from(result.stderr), Buffer.from(writeError.message)).toString("utf8") }
+    ? { ...result, exitCode: null, stderr: appendCapturedText(result.stderr, writeError.message) }
     : result;
 }
 
-function appendBounded(current: Buffer, chunk: Buffer): Buffer {
-  const marker = Buffer.from("\n[output truncated]\n");
-  if (current.length >= MAX_CAPTURED_BYTES) {
-    if (current.subarray(-marker.length).equals(marker)) return current;
-    const prefixLength = MAX_CAPTURED_BYTES - marker.length - 4;
-    return Buffer.concat([current.subarray(0, prefixLength), marker], prefixLength + marker.length);
-  }
-  const remaining = MAX_CAPTURED_BYTES - current.length;
-  if (chunk.length <= remaining) return Buffer.concat([current, chunk], current.length + chunk.length);
-  if (remaining <= marker.length) return Buffer.concat([current, marker.subarray(0, remaining)], MAX_CAPTURED_BYTES);
-  const contentLength = Math.max(0, remaining - marker.length - 4);
-  return Buffer.concat([current, chunk.subarray(0, contentLength), marker], current.length + contentLength + marker.length);
+function appendCapturedText(current: string, suffix: string): string {
+  const capture = new BoundedCapture();
+  capture.append(Buffer.from(current));
+  capture.append(Buffer.from(suffix));
+  return capture.text();
 }
 
-export async function execChecked(command: CommandSpec, stdin?: string): Promise<string> {
+export async function execChecked(command: InternalCommandSpec, stdin?: string): Promise<string> {
   const result = await execCommand(command, stdin);
   if (result.exitCode !== 0) {
     throw new Error(

@@ -7,6 +7,8 @@ export type ProcessIsolation = {
   workspaceAccess?: "full" | "metadata";
   mode: "workspace-write" | "read-only";
   networkAccess: "none" | "provider";
+  /** Loopback brokers are the only network peers reachable by the process tree. */
+  loopbackPorts?: number[];
   /** Controller-owned evidence is readable but never writable by a Runtime. */
   controllerPath: string;
   /** The sole controller-adjacent directory a Runtime may write. */
@@ -24,6 +26,10 @@ export type CommandSpec = {
   args: string[];
   cwd?: string;
   timeoutSeconds?: number;
+};
+
+/** Controller-only command shape. Public Project and Task inputs never accept env. */
+export type InternalCommandSpec = CommandSpec & {
   env?: Record<string, string>;
 };
 
@@ -58,6 +64,10 @@ export type OperationalConfiguration = {
   driftMaxCommits?: number;
   driftMaxSeconds?: number;
   stabilityObservationSeconds: number;
+  networkPolicy?: {
+    mode: "brokered";
+    dependencyHosts: string[];
+  };
 };
 
 export type ControlPolicy = {
@@ -331,6 +341,8 @@ export type Run = {
   runtimeVersion?: string;
   taskRevisionId?: string;
   contextFingerprint?: string;
+  networkPolicyDigest?: string;
+  gatewayStatus?: "starting" | "active" | "closed" | "failed";
   metrics?: {
     implementationMs: number;
     controlMs: number;
@@ -441,8 +453,10 @@ export type OutboxMessage = {
 };
 
 export type JobInput = {
-  command: CommandSpec;
+  command: InternalCommandSpec;
   environmentProfile?: ChildEnvironmentProfile;
+  /** Owner-only, transient environment handoff; values never enter JobInput or the database. */
+  ephemeralEnvironmentPath?: string;
   isolation: ProcessIsolation;
   stdin?: string;
   stdoutPath: string;

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { readOnboardingState } from "../src/onboarding-state.js";
 import { getAecSPaths } from "../src/paths.js";
 import { runSetupWizard } from "../src/setup-wizard.js";
@@ -90,11 +91,40 @@ test("runs the first-use system wizard and persists the daily-mode boundary", as
     assert.equal(result.state.language, "zh-CN");
     assert.equal(result.state.serviceEnabled, false);
     assert.equal(result.state.frontAgent?.kind, "custom");
+    assert.equal(result.state.frontAgent?.configured, false);
     assert.match(prompt.output, /自动环境探测/);
     assert.match(prompt.output, /DeepSeek Harness\s+UNAVAILABLE/);
     assert.match(prompt.output, /不会阻塞安装/);
+    assert.match(prompt.output, /"type":"stdio"/);
+    assert.doesNotMatch(prompt.output, /http:\/\/127\.0\.0\.1/);
+    assert.doesNotMatch(prompt.output, /mcp-http\.token/);
     assert.match(prompt.output, /AEC-S Ready/);
+    assert.match(prompt.output, /Front Agent\s+Not configured/);
     assert.equal(readOnboardingState(getAecSPaths())?.status, "complete");
+  } finally {
+    if (previousHome === undefined) delete process.env.AEC_S_HOME;
+    else process.env.AEC_S_HOME = previousHome;
+  }
+});
+
+test("offers stdio without advertising a stopped HTTP endpoint when WorkBuddy setup fails", async () => {
+  const home = tempDir("aec-s-setup-stdio-fallback-");
+  const previousHome = process.env.AEC_S_HOME;
+  process.env.AEC_S_HOME = home;
+  try {
+    const prompt = new ScriptedPrompt(["en", "workbuddy", "later"], [true, false]);
+    const result = await runSetupWizard({
+      prompt,
+      probeHost: async () => hostReady,
+      initialize: async () => initialization(true),
+      configureWorkBuddy: async () => ({ kind: "workbuddy", configured: false, detail: "fixture rejection" }),
+    });
+    assert.equal(result.completed, true);
+    assert.equal(result.state.frontAgent?.configured, false);
+    assert.match(prompt.output, /stdio MCP connection remains available/);
+    assert.match(prompt.output, /"type":"stdio"/);
+    assert.doesNotMatch(prompt.output, /http:\/\/127\.0\.0\.1/);
+    assert.doesNotMatch(prompt.output, /mcp-http\.token/);
   } finally {
     if (previousHome === undefined) delete process.env.AEC_S_HOME;
     else process.env.AEC_S_HOME = previousHome;
@@ -179,7 +209,7 @@ test("imports a first Project from its directory without project.json", async ()
     const db = new (await import("../src/db.js")).AecSDatabase();
     try {
       const project = db.getProject(result.state.projectId!);
-      assert.equal(project?.repoPath, repo);
+      assert.equal(project?.repoPath, realpathSync(repo));
       assert.equal(project?.intent, "Maintain the repository with minimal sufficient validation");
     } finally {
       db.close();

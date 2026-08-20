@@ -13,6 +13,7 @@ import {
   formatProjectInspection,
   initializeAecS,
   inspectProject,
+  registerInspectedProject,
   type OnboardingLanguage,
 } from "./onboarding.js";
 import { redactJson, redactText } from "./redaction.js";
@@ -179,7 +180,7 @@ async function main(): Promise<void> {
           deliveryMode: delivery as "local" | "github",
           ...(delivery === "github" ? { requiredChecks } : {}),
         };
-        applied = db.createProject(projectInputSchema.parse(inspected.project));
+        applied = registerInspectedProject(db, projectInputSchema.parse(inspected.project));
       }
       if (args.includes("--json")) output({ ...inspected, ...(applied ? { project: applied } : {}) });
       else process.stdout.write(formatProjectInspection(inspected, onboardingLanguage(args), applied));

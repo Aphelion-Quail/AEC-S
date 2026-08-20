@@ -3,10 +3,11 @@ import { homedir, tmpdir } from "node:os";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import type { ChildEnvironmentProfile, CommandSpec, ProcessIsolation } from "./types.js";
+import type { ChildEnvironmentProfile, InternalCommandSpec, ProcessIsolation } from "./types.js";
 
 const SANDBOX_EXEC = "/usr/bin/sandbox-exec";
 const PACKAGE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+const COMMAND_GATE = fileURLToPath(new URL("./command-gate.js", import.meta.url));
 
 function canonical(path: string): string {
   const absolute = resolve(path);
@@ -175,10 +176,11 @@ export function isolationEnvironment(
 }
 
 export function isolatedCommand(
-  command: CommandSpec,
+  command: InternalCommandSpec,
   isolation: ProcessIsolation,
   environmentProfile: ChildEnvironmentProfile = "restricted",
-): CommandSpec {
+  startGatePath?: string,
+): InternalCommandSpec {
   if (process.platform !== "darwin" || !existsSync(SANDBOX_EXEC)) {
     throw new Error("AEC-S Runtime isolation requires macOS sandbox-exec; execution cannot safely continue");
   }
@@ -208,12 +210,13 @@ export function isolatedCommand(
   if (coverageDirectory) writePaths.push(coverageDirectory);
   if (isolation.mode === "workspace-write") writePaths.push(isolation.workspacePath);
   const protectedReadRoots = [userHome, "/Users", "/Volumes", ...(userTemp ? [userTemp] : [])];
-  const deniedPrograms = ["security", "ssh", "scp", "sftp", "gh", "git-credential-osxkeychain"];
+  const deniedPrograms = ["security", "ssh", "scp", "sftp", "gh", "osascript", "git-credential-osxkeychain"];
   const deniedExecutables = [
     "/usr/bin/security",
     "/usr/bin/ssh",
     "/usr/bin/scp",
     "/usr/bin/sftp",
+    "/usr/bin/osascript",
     "/usr/libexec/git-core/git-credential-osxkeychain",
     "/opt/homebrew/bin/gh",
     "/usr/local/bin/gh",
@@ -224,10 +227,12 @@ export function isolatedCommand(
     "(deny default)",
     "(allow process*)",
     "(allow sysctl-read)",
-    "(allow mach-lookup)",
     "(allow ipc-posix-shm)",
     "(allow file-read*)",
-    ...(isolation.networkAccess === "provider" ? ["(allow network*)"] : []),
+    ...(isolation.networkAccess === "provider"
+      ? (isolation.loopbackPorts ?? []).map((port) =>
+          `(allow network-outbound (remote tcp "localhost:${port}"))`)
+      : []),
     `(deny file-read-data ${subpaths(protectedReadRoots)})`,
     `(allow file-read-data ${subpaths(readPaths)})`,
     ...(isolation.workspaceAccess === "metadata"
@@ -242,13 +247,16 @@ export function isolatedCommand(
     "(allow signal (target children))",
     '(deny mach-lookup (global-name "com.apple.securityd") (global-name "com.apple.securityd.xpc") (global-name "com.apple.securityd.general"))',
     '(deny mach-lookup (global-name "com.apple.tccd") (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.systemevents"))',
+    '(deny mach-lookup (global-name "com.apple.Finder") (global-name "com.apple.appleeventsd") (global-name "com.apple.hiservices-xpcservice"))',
     "(deny appleevent-send)",
     ...deniedExecutables.map((path) => `(deny process-exec (literal ${seatbeltString(path)}))`),
   ].join("\n");
   return {
     ...command,
     program: SANDBOX_EXEC,
-    args: ["-p", profile, executable, ...command.args],
+    args: startGatePath
+      ? ["-p", profile, process.execPath, COMMAND_GATE, startGatePath, executable, ...command.args]
+      : ["-p", profile, executable, ...command.args],
   };
 }
 
@@ -280,13 +288,16 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
       program: process.execPath,
       args: ["-e", `
         const fs=require('node:fs');
+        const {spawnSync}=require('node:child_process');
         const denied=(operation)=>{try{operation();return false}catch(error){return error.code==='EPERM'}};
         const readDenied=denied(()=>fs.readFileSync(${JSON.stringify(protectedPath)}));
         const writeDenied=denied(()=>fs.writeFileSync(${JSON.stringify(escapedWrite)},'x'));
         const controllerWriteDenied=denied(()=>fs.writeFileSync(${JSON.stringify(join(controller, "forged-result.json"))},'x'));
         fs.writeFileSync(${JSON.stringify(join(workspace, "allowed"))},'ok');
         fs.writeFileSync(${JSON.stringify(join(runtimeOutput, "allowed.json"))},'{}');
-        process.exit(readDenied&&writeDenied&&controllerWriteDenied?0:1);
+        const finder=spawnSync('/usr/bin/osascript',['-e','tell application "Finder" to get name'],{encoding:'utf8'});
+        const appleEventDenied=finder.status!==0;
+        process.exit(readDenied&&writeDenied&&controllerWriteDenied&&appleEventDenied?0:1);
       `],
       cwd: workspace,
       timeoutSeconds: 5,
@@ -307,9 +318,14 @@ export function probeProcessIsolation(): { ok: boolean; detail: string } {
 
 let cachedIsolationProbe: ReturnType<typeof probeProcessIsolation> | undefined;
 
-export function requireProcessIsolation(): void {
+export function processIsolationStatus(): ReturnType<typeof probeProcessIsolation> {
   cachedIsolationProbe ??= probeProcessIsolation();
-  if (!cachedIsolationProbe.ok) {
-    throw new Error(`AEC-S refuses Runtime execution without kernel process isolation: ${cachedIsolationProbe.detail}`);
+  return cachedIsolationProbe;
+}
+
+export function requireProcessIsolation(): void {
+  const isolation = processIsolationStatus();
+  if (!isolation.ok) {
+    throw new Error(`AEC-S refuses Runtime execution without kernel process isolation: ${isolation.detail}`);
   }
 }
